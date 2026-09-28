@@ -1987,6 +1987,10 @@ mod tests {
             .env("USER", username)
             .env("LOGNAME", username)
             .env("SHELL", shell)
+            // the server resolves the session user through getpwnam, so its
+            // identity files would come from the real /etc/passwd home; point
+            // it at the fixture home instead (unix_util honors this override)
+            .env("SSH3_USER_HOME", home_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_log))
             .kill_on_drop(true)
