@@ -1,0 +1,8 @@
+# Clippy configuration of the SSH3 Rust workspace.
+#
+# The settings below keep the linter aligned with the crates of the workspace;
+# no lint group is disabled here.
+#
+# `msrv` mirrors the `rust-version` of the crates (edition 2024 needs 1.85),
+# so that clippy does not suggest APIs that the minimum toolchain lacks.
+msrv = "1.85"
