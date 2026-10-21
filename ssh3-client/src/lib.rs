@@ -21,23 +21,24 @@ use rustls::{RootCertStore, pki_types::CertificateDer};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use ssh3_auth::{
-    AuthError, bearer_authorization_value, build_bearer_token, conversation_id_base64,
+    Ssh3AuthError, bearer_authorization_value, build_bearer_token, conversation_id_base64,
     load_private_key,
 };
-use ssh3_core::{Channel, ChannelError, Conversation};
+use ssh3_core::{Ssh3Channel, Ssh3ChannelError, Ssh3Conversation};
 use ssh3_h3::{
-    BuildConnectRequestError, ClientControlStream, ClientConversationError, ConversationIdError,
-    EstablishedClientConversation, SSH3_USER_HEADER, SSH3_VERSION_STRING, SendRequest,
-    generate_conversation_id, new_client, response_server_header,
+    SSH3_USER_HEADER, SSH3_VERSION_STRING, Ssh3BuildConnectRequestError, Ssh3ClientControlStream,
+    Ssh3ClientConversationError, Ssh3ConversationIdError, Ssh3EstablishedClientConversation,
+    Ssh3SendRequest, generate_conversation_id, new_client, response_server_header,
 };
 use ssh3_proto::{
-    ChannelRequest, ChannelRequestMessage, ExecRequest, ExitSignalRequest, Message, PtyRequest,
-    SSH_EXTENDED_DATA_NONE, SSH_EXTENDED_DATA_STDERR, SignalRequest, WindowChangeRequest,
+    SSH_EXTENDED_DATA_NONE, SSH_EXTENDED_DATA_STDERR, Ssh3ChannelRequest,
+    Ssh3ChannelRequestMessage, Ssh3ExecRequest, Ssh3ExitSignalRequest, Ssh3Message, Ssh3PtyRequest,
+    Ssh3SignalRequest, Ssh3WindowChangeRequest,
 };
 use ssh3_quinn::{
-    AcceptChannelError, ConfigError as QuinnConfigError, IncomingChannelRouter, OpenChannelError,
-    RouteAcceptedChannelError, client_config_insecure, client_config_with_roots,
-    client_config_with_webpki_roots, open_channel,
+    Ssh3AcceptChannelError, Ssh3ConfigError as QuinnConfigError, Ssh3IncomingChannelRouter,
+    Ssh3OpenChannelError, Ssh3RouteAcceptedChannelError, client_config_insecure,
+    client_config_with_roots, client_config_with_webpki_roots, open_channel,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
@@ -48,7 +49,7 @@ use url::Url;
 
 mod agent;
 
-pub use agent::AgentSelection;
+pub use agent::Ssh3AgentSelection;
 use agent::{build_agent_bearer_token, resolve_agent_socket_path};
 
 const DEFAULT_USER_AGENT: &str = SSH3_VERSION_STRING;
@@ -56,14 +57,14 @@ const DEFAULT_OIDC_SCOPE: &str = "openid email";
 const OIDC_CALLBACK_PATH: &str = "/ssh";
 
 #[derive(Clone, Debug)]
-pub enum TrustStrategy {
+pub enum Ssh3TrustStrategy {
     WebPkiRoots,
     Certificates(Vec<CertificateDer<'static>>),
     Insecure,
 }
 
 #[derive(Clone, Debug)]
-pub struct OidcConfig {
+pub struct Ssh3OidcConfig {
     pub issuer_url: String,
     pub client_id: String,
     pub client_secret: Option<String>,
@@ -71,24 +72,24 @@ pub struct OidcConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct ClientConfig {
+pub struct Ssh3ClientConfig {
     pub target_url: Uri,
     pub server_name: Option<String>,
     pub username: Option<String>,
     pub identity_file: Option<PathBuf>,
-    pub agent: Option<AgentSelection>,
+    pub agent: Option<Ssh3AgentSelection>,
     pub agent_socket: Option<PathBuf>,
     pub forward_agent: bool,
     pub password: Option<String>,
     pub bearer_token: Option<String>,
-    pub oidc: Option<OidcConfig>,
+    pub oidc: Option<Ssh3OidcConfig>,
     pub user_agent: String,
     pub max_packet_size: u64,
     pub default_datagrams_queue_size: usize,
-    pub trust: TrustStrategy,
+    pub trust: Ssh3TrustStrategy,
 }
 
-impl ClientConfig {
+impl Ssh3ClientConfig {
     pub fn new(target_url: Uri) -> Self {
         Self {
             target_url,
@@ -104,13 +105,13 @@ impl ClientConfig {
             user_agent: DEFAULT_USER_AGENT.to_string(),
             max_packet_size: 30_000,
             default_datagrams_queue_size: 10,
-            trust: TrustStrategy::WebPkiRoots,
+            trust: Ssh3TrustStrategy::WebPkiRoots,
         }
     }
 }
 
 #[derive(Clone, Debug)]
-pub enum SessionRequest {
+pub enum Ssh3SessionRequest {
     Shell,
     Exec(String),
 }
@@ -165,7 +166,7 @@ impl Drop for SessionRuntime {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CapturedSession {
+pub struct Ssh3CapturedSession {
     pub server_header: Option<String>,
     pub exit_status: i32,
     pub stdout: Vec<u8>,
@@ -173,7 +174,7 @@ pub struct CapturedSession {
 }
 
 #[derive(Debug)]
-pub enum OidcError {
+pub enum Ssh3OidcError {
     Io(io::Error),
     Reqwest(reqwest::Error),
     Url(url::ParseError),
@@ -181,7 +182,7 @@ pub enum OidcError {
     ProviderError(String),
 }
 
-impl fmt::Display for OidcError {
+impl fmt::Display for Ssh3OidcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "{err}"),
@@ -193,7 +194,7 @@ impl fmt::Display for OidcError {
     }
 }
 
-impl std::error::Error for OidcError {
+impl std::error::Error for Ssh3OidcError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
@@ -205,26 +206,26 @@ impl std::error::Error for OidcError {
     }
 }
 
-impl From<io::Error> for OidcError {
+impl From<io::Error> for Ssh3OidcError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
     }
 }
 
-impl From<reqwest::Error> for OidcError {
+impl From<reqwest::Error> for Ssh3OidcError {
     fn from(value: reqwest::Error) -> Self {
         Self::Reqwest(value)
     }
 }
 
-impl From<url::ParseError> for OidcError {
+impl From<url::ParseError> for Ssh3OidcError {
     fn from(value: url::ParseError) -> Self {
         Self::Url(value)
     }
 }
 
 #[derive(Debug)]
-pub enum ClientError {
+pub enum Ssh3ClientError {
     MissingHost,
     Resolve(io::Error),
     Endpoint(io::Error),
@@ -232,17 +233,17 @@ pub enum ClientError {
     Connection(ConnectionError),
     QuinnConfig(QuinnConfigError),
     H3Connection(h3::error::ConnectionError),
-    ConversationId(ConversationIdError),
-    BuildRequest(BuildConnectRequestError),
-    ClientConversation(ClientConversationError),
-    OpenChannel(OpenChannelError),
-    Channel(ChannelError),
+    ConversationId(Ssh3ConversationIdError),
+    BuildRequest(Ssh3BuildConnectRequestError),
+    ClientConversation(Ssh3ClientConversationError),
+    OpenChannel(Ssh3OpenChannelError),
+    Channel(Ssh3ChannelError),
     Io(io::Error),
     InvalidCertificateBundle,
     InvalidHeaderValue(http::header::InvalidHeaderValue),
     SshKey(ssh_key::Error),
-    Auth(AuthError),
-    Oidc(OidcError),
+    Auth(Ssh3AuthError),
+    Oidc(Ssh3OidcError),
     MissingUsernameForIdentity,
     MissingUsernameForAgent,
     MissingUsernameForPassword,
@@ -250,10 +251,10 @@ pub enum ClientError {
     AgentKeyNotFound,
     UnsupportedAgentKey(String),
     ConflictingAuthenticationMethods,
-    ExitSignal(ExitSignalRequest),
+    ExitSignal(Ssh3ExitSignalRequest),
 }
 
-impl fmt::Display for ClientError {
+impl fmt::Display for Ssh3ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingHost => write!(f, "target URL is missing a host"),
@@ -305,7 +306,7 @@ impl fmt::Display for ClientError {
     }
 }
 
-impl std::error::Error for ClientError {
+impl std::error::Error for Ssh3ClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::MissingHost => None,
@@ -338,73 +339,73 @@ impl std::error::Error for ClientError {
     }
 }
 
-impl From<QuinnConfigError> for ClientError {
+impl From<QuinnConfigError> for Ssh3ClientError {
     fn from(value: QuinnConfigError) -> Self {
         Self::QuinnConfig(value)
     }
 }
 
-impl From<h3::error::ConnectionError> for ClientError {
+impl From<h3::error::ConnectionError> for Ssh3ClientError {
     fn from(value: h3::error::ConnectionError) -> Self {
         Self::H3Connection(value)
     }
 }
 
-impl From<ConversationIdError> for ClientError {
-    fn from(value: ConversationIdError) -> Self {
+impl From<Ssh3ConversationIdError> for Ssh3ClientError {
+    fn from(value: Ssh3ConversationIdError) -> Self {
         Self::ConversationId(value)
     }
 }
 
-impl From<BuildConnectRequestError> for ClientError {
-    fn from(value: BuildConnectRequestError) -> Self {
+impl From<Ssh3BuildConnectRequestError> for Ssh3ClientError {
+    fn from(value: Ssh3BuildConnectRequestError) -> Self {
         Self::BuildRequest(value)
     }
 }
 
-impl From<AuthError> for ClientError {
-    fn from(value: AuthError) -> Self {
+impl From<Ssh3AuthError> for Ssh3ClientError {
+    fn from(value: Ssh3AuthError) -> Self {
         Self::Auth(value)
     }
 }
 
-impl From<ssh_key::Error> for ClientError {
+impl From<ssh_key::Error> for Ssh3ClientError {
     fn from(value: ssh_key::Error) -> Self {
         Self::SshKey(value)
     }
 }
 
-impl From<OidcError> for ClientError {
-    fn from(value: OidcError) -> Self {
+impl From<Ssh3OidcError> for Ssh3ClientError {
+    fn from(value: Ssh3OidcError) -> Self {
         Self::Oidc(value)
     }
 }
 
-impl From<ClientConversationError> for ClientError {
-    fn from(value: ClientConversationError) -> Self {
+impl From<Ssh3ClientConversationError> for Ssh3ClientError {
+    fn from(value: Ssh3ClientConversationError) -> Self {
         Self::ClientConversation(value)
     }
 }
 
-impl From<OpenChannelError> for ClientError {
-    fn from(value: OpenChannelError) -> Self {
+impl From<Ssh3OpenChannelError> for Ssh3ClientError {
+    fn from(value: Ssh3OpenChannelError) -> Self {
         Self::OpenChannel(value)
     }
 }
 
-impl From<ChannelError> for ClientError {
-    fn from(value: ChannelError) -> Self {
+impl From<Ssh3ChannelError> for Ssh3ClientError {
+    fn from(value: Ssh3ChannelError) -> Self {
         Self::Channel(value)
     }
 }
 
-impl From<io::Error> for ClientError {
+impl From<io::Error> for Ssh3ClientError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
     }
 }
 
-impl From<http::header::InvalidHeaderValue> for ClientError {
+impl From<http::header::InvalidHeaderValue> for Ssh3ClientError {
     fn from(value: http::header::InvalidHeaderValue) -> Self {
         Self::InvalidHeaderValue(value)
     }
@@ -418,9 +419,9 @@ struct ResolvedTarget {
 struct ActiveClient {
     endpoint: Endpoint,
     connection: Connection,
-    conversation: Arc<Conversation>,
-    _control_stream: ClientControlStream,
-    _send_request: SendRequest,
+    conversation: Arc<Ssh3Conversation>,
+    _control_stream: Ssh3ClientControlStream,
+    _send_request: Ssh3SendRequest,
     driver_task: tokio::task::JoinHandle<()>,
     incoming_channels_task: tokio::task::JoinHandle<()>,
     incoming_datagrams_task: tokio::task::JoinHandle<()>,
@@ -438,7 +439,7 @@ impl ActiveClient {
         self.endpoint.wait_idle().await;
     }
 
-    async fn open_session_channel(&self) -> Result<Arc<Channel>, ClientError> {
+    async fn open_session_channel(&self) -> Result<Arc<Ssh3Channel>, Ssh3ClientError> {
         open_channel(
             self.conversation.as_ref(),
             &self.connection,
@@ -447,21 +448,21 @@ impl ActiveClient {
             self.default_datagrams_queue_size,
         )
         .await
-        .map_err(ClientError::from)
+        .map_err(Ssh3ClientError::from)
     }
 }
 
 pub fn load_certificates(
     path: impl AsRef<Path>,
-) -> Result<Vec<CertificateDer<'static>>, ClientError> {
-    let bytes = std::fs::read(path).map_err(ClientError::Io)?;
+) -> Result<Vec<CertificateDer<'static>>, Ssh3ClientError> {
+    let bytes = std::fs::read(path).map_err(Ssh3ClientError::Io)?;
     if bytes.starts_with(b"-----BEGIN") {
         let mut reader = BufReader::new(bytes.as_slice());
         let certificates = rustls_pemfile::certs(&mut reader)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(ClientError::Io)?;
+            .map_err(Ssh3ClientError::Io)?;
         if certificates.is_empty() {
-            return Err(ClientError::InvalidCertificateBundle);
+            return Err(Ssh3ClientError::InvalidCertificateBundle);
         }
         Ok(certificates)
     } else {
@@ -470,24 +471,24 @@ pub fn load_certificates(
 }
 
 async fn send_initial_session_requests(
-    channel: &Channel,
-    request: &SessionRequest,
+    channel: &Ssh3Channel,
+    request: &Ssh3SessionRequest,
     terminal: Option<&LocalTerminalInfo>,
-) -> Result<(), ClientError> {
-    if matches!(request, SessionRequest::Shell)
+) -> Result<(), Ssh3ClientError> {
+    if matches!(request, Ssh3SessionRequest::Shell)
         && let Some(terminal) = terminal
     {
         send_pty_request(channel, terminal).await?;
     }
 
     let request = match request {
-        SessionRequest::Shell => ChannelRequestMessage {
+        Ssh3SessionRequest::Shell => Ssh3ChannelRequestMessage {
             want_reply: true,
-            request: ChannelRequest::Shell,
+            request: Ssh3ChannelRequest::Shell,
         },
-        SessionRequest::Exec(command) => ChannelRequestMessage {
+        Ssh3SessionRequest::Exec(command) => Ssh3ChannelRequestMessage {
             want_reply: true,
-            request: ChannelRequest::Exec(ExecRequest {
+            request: Ssh3ChannelRequest::Exec(Ssh3ExecRequest {
                 command: command.as_bytes().to_vec(),
             }),
         },
@@ -495,17 +496,17 @@ async fn send_initial_session_requests(
     channel
         .send_request(request)
         .await
-        .map_err(ClientError::from)
+        .map_err(Ssh3ClientError::from)
 }
 
 async fn send_pty_request(
-    channel: &Channel,
+    channel: &Ssh3Channel,
     terminal: &LocalTerminalInfo,
-) -> Result<(), ClientError> {
+) -> Result<(), Ssh3ClientError> {
     channel
-        .send_request(ChannelRequestMessage {
+        .send_request(Ssh3ChannelRequestMessage {
             want_reply: true,
-            request: ChannelRequest::Pty(PtyRequest {
+            request: Ssh3ChannelRequest::Pty(Ssh3PtyRequest {
                 term: terminal.term.clone().unwrap_or_default().into_bytes(),
                 char_width: terminal.size.char_width.into(),
                 char_height: terminal.size.char_height.into(),
@@ -515,25 +516,25 @@ async fn send_pty_request(
             }),
         })
         .await
-        .map_err(ClientError::from)
+        .map_err(Ssh3ClientError::from)
 }
 
-async fn send_forward_agent_request(channel: &Channel) -> Result<(), ClientError> {
+async fn send_forward_agent_request(channel: &Ssh3Channel) -> Result<(), Ssh3ClientError> {
     channel
         .write_data(b"forward-agent", SSH_EXTENDED_DATA_NONE)
         .await
         .map(|_| ())
-        .map_err(ClientError::from)
+        .map_err(Ssh3ClientError::from)
 }
 
 async fn send_window_change_request(
-    channel: &Channel,
+    channel: &Ssh3Channel,
     size: TerminalSize,
-) -> Result<(), ClientError> {
+) -> Result<(), Ssh3ClientError> {
     channel
-        .send_request(ChannelRequestMessage {
+        .send_request(Ssh3ChannelRequestMessage {
             want_reply: false,
-            request: ChannelRequest::WindowChange(WindowChangeRequest {
+            request: Ssh3ChannelRequest::WindowChange(Ssh3WindowChangeRequest {
                 char_width: size.char_width.into(),
                 char_height: size.char_height.into(),
                 pixel_width: size.pixel_width.into(),
@@ -541,23 +542,26 @@ async fn send_window_change_request(
             }),
         })
         .await
-        .map_err(ClientError::from)
+        .map_err(Ssh3ClientError::from)
 }
 
-async fn send_signal_request(channel: &Channel, signal_name: &str) -> Result<(), ClientError> {
+async fn send_signal_request(
+    channel: &Ssh3Channel,
+    signal_name: &str,
+) -> Result<(), Ssh3ClientError> {
     channel
-        .send_request(ChannelRequestMessage {
+        .send_request(Ssh3ChannelRequestMessage {
             want_reply: false,
-            request: ChannelRequest::Signal(SignalRequest {
+            request: Ssh3ChannelRequest::Signal(Ssh3SignalRequest {
                 signal_name_without_sig: signal_name.as_bytes().to_vec(),
             }),
         })
         .await
-        .map_err(ClientError::from)
+        .map_err(Ssh3ClientError::from)
 }
 
 #[cfg(unix)]
-fn detect_local_terminal() -> Result<Option<LocalTerminal>, ClientError> {
+fn detect_local_terminal() -> Result<Option<LocalTerminal>, Ssh3ClientError> {
     let stdin = std::io::stdin();
     let fd = stdin.as_raw_fd();
     let is_tty = unsafe { nix::libc::isatty(fd) } == 1;
@@ -575,16 +579,16 @@ fn detect_local_terminal() -> Result<Option<LocalTerminal>, ClientError> {
 }
 
 #[cfg(not(unix))]
-fn detect_local_terminal() -> Result<Option<LocalTerminal>, ClientError> {
+fn detect_local_terminal() -> Result<Option<LocalTerminal>, Ssh3ClientError> {
     Ok(None)
 }
 
 #[cfg(unix)]
-fn read_terminal_size(fd: RawFd) -> Result<TerminalSize, ClientError> {
+fn read_terminal_size(fd: RawFd) -> Result<TerminalSize, Ssh3ClientError> {
     let mut size = std::mem::MaybeUninit::<nix::libc::winsize>::zeroed();
     let result = unsafe { nix::libc::ioctl(fd, nix::libc::TIOCGWINSZ, size.as_mut_ptr()) };
     if result == -1 {
-        return Err(ClientError::Io(io::Error::last_os_error()));
+        return Err(Ssh3ClientError::Io(io::Error::last_os_error()));
     }
 
     let size = unsafe { size.assume_init() };
@@ -597,7 +601,7 @@ fn read_terminal_size(fd: RawFd) -> Result<TerminalSize, ClientError> {
 }
 
 #[cfg(unix)]
-fn enable_raw_mode(fd: RawFd) -> Result<RawModeGuard, ClientError> {
+fn enable_raw_mode(fd: RawFd) -> Result<RawModeGuard, Ssh3ClientError> {
     let fd = unsafe { BorrowedFd::borrow_raw(fd) };
     let mut termios_state = termios::tcgetattr(fd).map_err(io::Error::from)?;
     let original = termios_state.clone();
@@ -610,7 +614,7 @@ fn enable_raw_mode(fd: RawFd) -> Result<RawModeGuard, ClientError> {
 }
 
 #[cfg(unix)]
-fn spawn_resize_forwarder(channel: Arc<Channel>, fd: RawFd) -> tokio::task::JoinHandle<()> {
+fn spawn_resize_forwarder(channel: Arc<Ssh3Channel>, fd: RawFd) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut winsize_signal = match signal(SignalKind::window_change()) {
             Ok(signal) => signal,
@@ -633,7 +637,7 @@ fn spawn_resize_forwarder(channel: Arc<Channel>, fd: RawFd) -> tokio::task::Join
 }
 
 #[cfg(unix)]
-fn spawn_signal_forwarders(channel: Arc<Channel>) -> Vec<tokio::task::JoinHandle<()>> {
+fn spawn_signal_forwarders(channel: Arc<Ssh3Channel>) -> Vec<tokio::task::JoinHandle<()>> {
     [
         ("INT", SignalKind::interrupt()),
         ("TERM", SignalKind::terminate()),
@@ -659,17 +663,17 @@ fn spawn_signal_forwarders(channel: Arc<Channel>) -> Vec<tokio::task::JoinHandle
 }
 
 #[cfg(not(unix))]
-fn spawn_signal_forwarders(_channel: Arc<Channel>) -> Vec<tokio::task::JoinHandle<()>> {
+fn spawn_signal_forwarders(_channel: Arc<Ssh3Channel>) -> Vec<tokio::task::JoinHandle<()>> {
     Vec::new()
 }
 
 fn build_session_runtime(
     client: &ActiveClient,
-    config: &ClientConfig,
-    channel: Arc<Channel>,
-    request: &SessionRequest,
+    config: &Ssh3ClientConfig,
+    channel: Arc<Ssh3Channel>,
+    request: &Ssh3SessionRequest,
     terminal: Option<&LocalTerminal>,
-) -> Result<SessionRuntime, ClientError> {
+) -> Result<SessionRuntime, Ssh3ClientError> {
     let mut runtime = SessionRuntime {
         background_tasks: spawn_signal_forwarders(channel.clone()),
         #[cfg(unix)]
@@ -677,7 +681,7 @@ fn build_session_runtime(
     };
 
     #[cfg(unix)]
-    if matches!(request, SessionRequest::Shell)
+    if matches!(request, Ssh3SessionRequest::Shell)
         && let Some(terminal) = terminal
     {
         runtime.raw_mode_guard = Some(enable_raw_mode(terminal.fd)?);
@@ -694,7 +698,7 @@ fn build_session_runtime(
         ));
 
         #[cfg(not(unix))]
-        return Err(ClientError::AgentUnavailable);
+        return Err(Ssh3ClientError::AgentUnavailable);
     }
 
     Ok(runtime)
@@ -711,7 +715,7 @@ struct OidcTokenResponse {
     id_token: Option<String>,
 }
 
-fn auth_method_count(config: &ClientConfig) -> usize {
+fn auth_method_count(config: &Ssh3ClientConfig) -> usize {
     usize::from(config.identity_file.is_some())
         + usize::from(config.agent.is_some())
         + usize::from(config.password.is_some())
@@ -732,7 +736,7 @@ fn basic_authorization_value(username: &str, password: &str) -> String {
     )
 }
 
-fn default_browser_opener(url: String) -> Result<(), OidcError> {
+fn default_browser_opener(url: String) -> Result<(), Ssh3OidcError> {
     if try_open_browser(&url) {
         return Ok(());
     }
@@ -785,7 +789,7 @@ fn oidc_code_challenge(verifier: &str) -> String {
 
 async fn fetch_oidc_discovery_document(
     issuer_url: &str,
-) -> Result<OidcDiscoveryDocument, OidcError> {
+) -> Result<OidcDiscoveryDocument, Ssh3OidcError> {
     let client = reqwest::Client::new();
     let discovery_url = format!(
         "{}/.well-known/openid-configuration",
@@ -798,10 +802,10 @@ async fn fetch_oidc_discovery_document(
         .error_for_status()?
         .json::<OidcDiscoveryDocument>()
         .await
-        .map_err(OidcError::from)
+        .map_err(Ssh3OidcError::from)
 }
 
-async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Result<String, OidcError> {
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Result<String, Ssh3OidcError> {
     let mut buffer = Vec::new();
     loop {
         let mut chunk = [0u8; 1024];
@@ -821,7 +825,7 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Result<String,
 async fn wait_for_oidc_callback(
     listener: tokio::net::TcpListener,
     expected_state: &str,
-) -> Result<String, OidcError> {
+) -> Result<String, Ssh3OidcError> {
     fn callback_response(status_line: &str, body: &str) -> String {
         format!(
             "{status_line}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -829,60 +833,58 @@ async fn wait_for_oidc_callback(
         )
     }
 
-    loop {
-        let (mut stream, _) = listener.accept().await?;
-        let request = read_http_request(&mut stream).await?;
-        let target = request
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .ok_or(OidcError::InvalidResponse(
-                "malformed OIDC callback request",
-            ))?;
-        let callback_url = Url::parse(&format!("http://localhost{target}"))?;
-        let mut code = None;
-        let mut state = None;
-        let mut provider_error = None;
-        for (key, value) in callback_url.query_pairs() {
-            match key.as_ref() {
-                "code" => code = Some(value.into_owned()),
-                "state" => state = Some(value.into_owned()),
-                "error" => provider_error = Some(value.into_owned()),
-                _ => {}
-            }
+    let (mut stream, _) = listener.accept().await?;
+    let request = read_http_request(&mut stream).await?;
+    let target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or(Ssh3OidcError::InvalidResponse(
+            "malformed OIDC callback request",
+        ))?;
+    let callback_url = Url::parse(&format!("http://localhost{target}"))?;
+    let mut code = None;
+    let mut state = None;
+    let mut provider_error = None;
+    for (key, value) in callback_url.query_pairs() {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            "error" => provider_error = Some(value.into_owned()),
+            _ => {}
         }
-
-        if let Some(provider_error) = provider_error {
-            let response =
-                callback_response("HTTP/1.1 400 Bad Request", "OIDC authentication failed.\n");
-            let _ = stream.write_all(response.as_bytes()).await;
-            return Err(OidcError::ProviderError(provider_error));
-        }
-        if state.as_deref() != Some(expected_state) {
-            let response = callback_response("HTTP/1.1 400 Bad Request", "OIDC state mismatch.\n");
-            let _ = stream.write_all(response.as_bytes()).await;
-            return Err(OidcError::InvalidResponse("OIDC state mismatch"));
-        }
-        let Some(code) = code else {
-            let response =
-                callback_response("HTTP/1.1 400 Bad Request", "OIDC callback missing code.\n");
-            let _ = stream.write_all(response.as_bytes()).await;
-            return Err(OidcError::InvalidResponse("OIDC callback missing code"));
-        };
-
-        let response = callback_response("HTTP/1.1 200 OK", "you can now close this tab");
-        let _ = stream.write_all(response.as_bytes()).await;
-        return Ok(code);
     }
+
+    if let Some(provider_error) = provider_error {
+        let response =
+            callback_response("HTTP/1.1 400 Bad Request", "OIDC authentication failed.\n");
+        let _ = stream.write_all(response.as_bytes()).await;
+        return Err(Ssh3OidcError::ProviderError(provider_error));
+    }
+    if state.as_deref() != Some(expected_state) {
+        let response = callback_response("HTTP/1.1 400 Bad Request", "OIDC state mismatch.\n");
+        let _ = stream.write_all(response.as_bytes()).await;
+        return Err(Ssh3OidcError::InvalidResponse("OIDC state mismatch"));
+    }
+    let Some(code) = code else {
+        let response =
+            callback_response("HTTP/1.1 400 Bad Request", "OIDC callback missing code.\n");
+        let _ = stream.write_all(response.as_bytes()).await;
+        return Err(Ssh3OidcError::InvalidResponse("OIDC callback missing code"));
+    };
+
+    let response = callback_response("HTTP/1.1 200 OK", "you can now close this tab");
+    let _ = stream.write_all(response.as_bytes()).await;
+    Ok(code)
 }
 
 async fn exchange_oidc_code(
     token_endpoint: &str,
-    oidc: &OidcConfig,
+    oidc: &Ssh3OidcConfig,
     redirect_uri: &str,
     code: &str,
     code_verifier: Option<&str>,
-) -> Result<String, OidcError> {
+) -> Result<String, Ssh3OidcError> {
     let client = reqwest::Client::new();
     let mut form = vec![
         ("grant_type", "authorization_code".to_string()),
@@ -899,7 +901,7 @@ async fn exchange_oidc_code(
 
     let response = client.post(token_endpoint).form(&form).send().await?;
     if response.status() != HttpStatusCode::OK {
-        return Err(OidcError::ProviderError(format!(
+        return Err(Ssh3OidcError::ProviderError(format!(
             "OIDC token endpoint returned {}",
             response.status()
         )));
@@ -908,16 +910,16 @@ async fn exchange_oidc_code(
     token_response
         .id_token
         .filter(|token| !token.is_empty())
-        .ok_or(OidcError::InvalidResponse(
+        .ok_or(Ssh3OidcError::InvalidResponse(
             "OIDC token response did not include an id_token",
         ))
 }
 
 async fn authenticate_oidc_with_browser_opener(
-    oidc: &OidcConfig,
+    oidc: &Ssh3OidcConfig,
     expected_nonce: &str,
-    browser_opener: fn(String) -> Result<(), OidcError>,
-) -> Result<String, OidcError> {
+    browser_opener: fn(String) -> Result<(), Ssh3OidcError>,
+) -> Result<String, Ssh3OidcError> {
     let discovery = fetch_oidc_discovery_document(&oidc.issuer_url).await?;
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let redirect_uri = format!(
@@ -953,10 +955,10 @@ async fn authenticate_oidc_with_browser_opener(
 }
 
 async fn precomputed_authorization_header(
-    config: &ClientConfig,
-) -> Result<Option<String>, ClientError> {
+    config: &Ssh3ClientConfig,
+) -> Result<Option<String>, Ssh3ClientError> {
     if auth_method_count(config) > 1 {
-        return Err(ClientError::ConflictingAuthenticationMethods);
+        return Err(Ssh3ClientError::ConflictingAuthenticationMethods);
     }
 
     if let Some(token) = config
@@ -972,7 +974,7 @@ async fn precomputed_authorization_header(
         let username = config
             .username
             .as_deref()
-            .ok_or(ClientError::MissingUsernameForPassword)?;
+            .ok_or(Ssh3ClientError::MissingUsernameForPassword)?;
         return Ok(Some(basic_authorization_value(username, password)));
     }
 
@@ -982,13 +984,13 @@ async fn precomputed_authorization_header(
 fn activate_client(
     endpoint: Endpoint,
     connection: Connection,
-    send_request: SendRequest,
+    send_request: Ssh3SendRequest,
     driver_task: tokio::task::JoinHandle<()>,
-    established: EstablishedClientConversation,
+    established: Ssh3EstablishedClientConversation,
     max_packet_size: u64,
     default_datagrams_queue_size: usize,
 ) -> ActiveClient {
-    let channel_router = Arc::new(IncomingChannelRouter::new());
+    let channel_router = Arc::new(Ssh3IncomingChannelRouter::new());
     channel_router.register_conversation(established.conversation.clone());
     let incoming_channels_task = tokio::spawn({
         let channel_router = channel_router.clone();
@@ -999,7 +1001,7 @@ fn activate_client(
                 .await
                 && !is_benign_route_error(&err)
             {
-                eprintln!("ssh3-client incoming channel error: {err}");
+                eprintln!("ssh3-rust-client incoming channel error: {err}");
             }
         }
     });
@@ -1010,7 +1012,7 @@ fn activate_client(
             if let Err(err) = ssh3_h3::dispatch_datagrams_forever(conversation, connection).await
                 && !is_benign_datagram_dispatch_error(&err)
             {
-                eprintln!("ssh3-client incoming datagram error: {err}");
+                eprintln!("ssh3-rust-client incoming datagram error: {err}");
             }
         }
     });
@@ -1031,14 +1033,14 @@ fn activate_client(
 }
 
 pub async fn run_exec_capture(
-    config: &ClientConfig,
+    config: &Ssh3ClientConfig,
     command: impl AsRef<str>,
-) -> Result<CapturedSession, ClientError> {
+) -> Result<Ssh3CapturedSession, Ssh3ClientError> {
     let client = connect_client(config).await?;
     let result = run_capture_on_client(
         &client,
         config,
-        SessionRequest::Exec(command.as_ref().to_string()),
+        Ssh3SessionRequest::Exec(command.as_ref().to_string()),
     )
     .await;
     client.shutdown().await;
@@ -1047,15 +1049,15 @@ pub async fn run_exec_capture(
 
 #[cfg(test)]
 async fn run_exec_capture_with_browser_opener(
-    config: &ClientConfig,
+    config: &Ssh3ClientConfig,
     command: impl AsRef<str>,
-    browser_opener: fn(String) -> Result<(), OidcError>,
-) -> Result<CapturedSession, ClientError> {
+    browser_opener: fn(String) -> Result<(), Ssh3OidcError>,
+) -> Result<Ssh3CapturedSession, Ssh3ClientError> {
     let client = connect_client_with_browser_opener(config, browser_opener).await?;
     let result = run_capture_on_client(
         &client,
         config,
-        SessionRequest::Exec(command.as_ref().to_string()),
+        Ssh3SessionRequest::Exec(command.as_ref().to_string()),
     )
     .await;
     client.shutdown().await;
@@ -1063,35 +1065,35 @@ async fn run_exec_capture_with_browser_opener(
 }
 
 pub async fn run_session_stdio(
-    config: &ClientConfig,
-    request: SessionRequest,
-) -> Result<i32, ClientError> {
+    config: &Ssh3ClientConfig,
+    request: Ssh3SessionRequest,
+) -> Result<i32, Ssh3ClientError> {
     let client = connect_client(config).await?;
     let result = run_stdio_on_client(&client, config, request).await;
     client.shutdown().await;
     result
 }
 
-async fn connect_client(config: &ClientConfig) -> Result<ActiveClient, ClientError> {
+async fn connect_client(config: &Ssh3ClientConfig) -> Result<ActiveClient, Ssh3ClientError> {
     connect_client_with_browser_opener(config, default_browser_opener).await
 }
 
 async fn connect_client_with_browser_opener(
-    config: &ClientConfig,
-    browser_opener: fn(String) -> Result<(), OidcError>,
-) -> Result<ActiveClient, ClientError> {
+    config: &Ssh3ClientConfig,
+    browser_opener: fn(String) -> Result<(), Ssh3OidcError>,
+) -> Result<ActiveClient, Ssh3ClientError> {
     let precomputed_authorization = precomputed_authorization_header(config).await?;
 
     let resolved = resolve_target(&config.target_url, config.server_name.as_deref()).await?;
     let bind_addr = client_bind_addr(resolved.remote_addr);
-    let mut endpoint = Endpoint::client(bind_addr).map_err(ClientError::Endpoint)?;
+    let mut endpoint = Endpoint::client(bind_addr).map_err(Ssh3ClientError::Endpoint)?;
     endpoint.set_default_client_config(client_quinn_config(&config.trust)?);
 
     let connection = endpoint
         .connect(resolved.remote_addr, &resolved.server_name)
-        .map_err(ClientError::Connect)?
+        .map_err(Ssh3ClientError::Connect)?
         .await
-        .map_err(ClientError::Connection)?;
+        .map_err(Ssh3ClientError::Connection)?;
 
     let (mut driver, mut send_request) = new_client(connection.clone()).await?;
     let driver_task = tokio::spawn(async move {
@@ -1125,7 +1127,7 @@ async fn connect_client_with_browser_opener(
         let username = config
             .username
             .as_deref()
-            .ok_or(ClientError::MissingUsernameForIdentity)?;
+            .ok_or(Ssh3ClientError::MissingUsernameForIdentity)?;
         let private_key = load_private_key(identity_path)?;
         let token = build_bearer_token(&private_key, username, &conversation_id)?;
         request.headers_mut().insert(
@@ -1136,7 +1138,7 @@ async fn connect_client_with_browser_opener(
         let username = config
             .username
             .as_deref()
-            .ok_or(ClientError::MissingUsernameForAgent)?;
+            .ok_or(Ssh3ClientError::MissingUsernameForAgent)?;
         let config = config.clone();
         let agent_selection = agent_selection.clone();
         let username = username.to_string();
@@ -1144,7 +1146,7 @@ async fn connect_client_with_browser_opener(
             build_agent_bearer_token(&config, &agent_selection, &username, &conversation_id)
         })
         .await
-        .map_err(|err| ClientError::Io(io::Error::other(err.to_string())))??;
+        .map_err(|err| Ssh3ClientError::Io(io::Error::other(err.to_string())))??;
         request.headers_mut().insert(
             http::header::AUTHORIZATION,
             HeaderValue::from_str(&bearer_authorization_value(&token))?,
@@ -1170,32 +1172,34 @@ async fn connect_client_with_browser_opener(
     ))
 }
 
-fn client_quinn_config(trust: &TrustStrategy) -> Result<quinn::ClientConfig, ClientError> {
+fn client_quinn_config(trust: &Ssh3TrustStrategy) -> Result<quinn::ClientConfig, Ssh3ClientError> {
     match trust {
-        TrustStrategy::WebPkiRoots => client_config_with_webpki_roots().map_err(ClientError::from),
-        TrustStrategy::Certificates(certificates) => {
+        Ssh3TrustStrategy::WebPkiRoots => {
+            client_config_with_webpki_roots().map_err(Ssh3ClientError::from)
+        }
+        Ssh3TrustStrategy::Certificates(certificates) => {
             let mut roots = RootCertStore::empty();
             let (added, _) = roots.add_parsable_certificates(certificates.iter().cloned());
             if added == 0 {
-                return Err(ClientError::InvalidCertificateBundle);
+                return Err(Ssh3ClientError::InvalidCertificateBundle);
             }
-            client_config_with_roots(roots).map_err(ClientError::from)
+            client_config_with_roots(roots).map_err(Ssh3ClientError::from)
         }
-        TrustStrategy::Insecure => client_config_insecure().map_err(ClientError::from),
+        Ssh3TrustStrategy::Insecure => client_config_insecure().map_err(Ssh3ClientError::from),
     }
 }
 
 async fn resolve_target(
     uri: &Uri,
     server_name_override: Option<&str>,
-) -> Result<ResolvedTarget, ClientError> {
-    let host = uri.host().ok_or(ClientError::MissingHost)?;
+) -> Result<ResolvedTarget, Ssh3ClientError> {
+    let host = uri.host().ok_or(Ssh3ClientError::MissingHost)?;
     let remote_addr = tokio::net::lookup_host((host, uri.port_u16().unwrap_or(443)))
         .await
-        .map_err(ClientError::Resolve)?
+        .map_err(Ssh3ClientError::Resolve)?
         .next()
         .ok_or_else(|| {
-            ClientError::Resolve(io::Error::new(
+            Ssh3ClientError::Resolve(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
                 "target host did not resolve to an address",
             ))
@@ -1216,9 +1220,9 @@ fn client_bind_addr(remote_addr: SocketAddr) -> SocketAddr {
 
 async fn run_capture_on_client(
     client: &ActiveClient,
-    config: &ClientConfig,
-    request: SessionRequest,
-) -> Result<CapturedSession, ClientError> {
+    config: &Ssh3ClientConfig,
+    request: Ssh3SessionRequest,
+) -> Result<Ssh3CapturedSession, Ssh3ClientError> {
     let channel = client.open_session_channel().await?;
     if config.forward_agent {
         send_forward_agent_request(channel.as_ref()).await?;
@@ -1234,21 +1238,23 @@ async fn run_capture_on_client(
 
     let result = loop {
         match channel.next_message().await? {
-            Message::Data(data) => match data.data_type {
+            Ssh3Message::Data(data) => match data.data_type {
                 SSH_EXTENDED_DATA_NONE => stdout.extend_from_slice(&data.data),
                 SSH_EXTENDED_DATA_STDERR => stderr.extend_from_slice(&data.data),
                 _ => {}
             },
-            Message::ChannelRequest(message) => match message.request {
-                ChannelRequest::ExitStatus(status) => {
-                    break Ok(CapturedSession {
+            Ssh3Message::ChannelRequest(message) => match message.request {
+                Ssh3ChannelRequest::ExitStatus(status) => {
+                    break Ok(Ssh3CapturedSession {
                         server_header: client.server_header.clone(),
                         exit_status: status.exit_status as i32,
                         stdout,
                         stderr,
                     });
                 }
-                ChannelRequest::ExitSignal(signal) => break Err(ClientError::ExitSignal(signal)),
+                Ssh3ChannelRequest::ExitSignal(signal) => {
+                    break Err(Ssh3ClientError::ExitSignal(signal));
+                }
                 _ => {}
             },
             _ => {}
@@ -1260,9 +1266,9 @@ async fn run_capture_on_client(
 
 async fn run_stdio_on_client(
     client: &ActiveClient,
-    config: &ClientConfig,
-    request: SessionRequest,
-) -> Result<i32, ClientError> {
+    config: &Ssh3ClientConfig,
+    request: Ssh3SessionRequest,
+) -> Result<i32, Ssh3ClientError> {
     let channel = client.open_session_channel().await?;
     let terminal = detect_local_terminal()?;
     if config.forward_agent {
@@ -1312,7 +1318,7 @@ async fn run_stdio_on_client(
 
     let result = loop {
         match channel.next_message().await? {
-            Message::Data(data) => match data.data_type {
+            Ssh3Message::Data(data) => match data.data_type {
                 SSH_EXTENDED_DATA_NONE => {
                     stdout.write_all(&data.data).await?;
                     stdout.flush().await?;
@@ -1323,12 +1329,12 @@ async fn run_stdio_on_client(
                 }
                 _ => {}
             },
-            Message::ChannelRequest(message) => match message.request {
-                ChannelRequest::ExitStatus(status) => {
+            Ssh3Message::ChannelRequest(message) => match message.request {
+                Ssh3ChannelRequest::ExitStatus(status) => {
                     break Ok(status.exit_status as i32);
                 }
-                ChannelRequest::ExitSignal(signal) => {
-                    break Err(ClientError::ExitSignal(signal));
+                Ssh3ChannelRequest::ExitSignal(signal) => {
+                    break Err(Ssh3ClientError::ExitSignal(signal));
                 }
                 _ => {}
             },
@@ -1377,42 +1383,42 @@ fn is_benign_io_error(error: &io::Error) -> bool {
         || message.contains("connection closed")
 }
 
-fn is_benign_channel_error(error: &ChannelError) -> bool {
-    matches!(error, ChannelError::Io(error) if is_benign_io_error(error))
+fn is_benign_channel_error(error: &Ssh3ChannelError) -> bool {
+    matches!(error, Ssh3ChannelError::Io(error) if is_benign_io_error(error))
 }
 
-fn is_benign_open_channel_error(error: &OpenChannelError) -> bool {
-    matches!(error, OpenChannelError::Connection(error) if is_benign_connection_error(error))
+fn is_benign_open_channel_error(error: &Ssh3OpenChannelError) -> bool {
+    matches!(error, Ssh3OpenChannelError::Connection(error) if is_benign_connection_error(error))
 }
 
-fn is_benign_client_error(error: &ClientError) -> bool {
+fn is_benign_client_error(error: &Ssh3ClientError) -> bool {
     match error {
-        ClientError::Connection(error) => is_benign_connection_error(error),
-        ClientError::OpenChannel(error) => is_benign_open_channel_error(error),
-        ClientError::Channel(error) => is_benign_channel_error(error),
-        ClientError::Io(error) => is_benign_io_error(error),
+        Ssh3ClientError::Connection(error) => is_benign_connection_error(error),
+        Ssh3ClientError::OpenChannel(error) => is_benign_open_channel_error(error),
+        Ssh3ClientError::Channel(error) => is_benign_channel_error(error),
+        Ssh3ClientError::Io(error) => is_benign_io_error(error),
         _ => false,
     }
 }
 
-fn is_benign_route_error(error: &RouteAcceptedChannelError) -> bool {
+fn is_benign_route_error(error: &Ssh3RouteAcceptedChannelError) -> bool {
     matches!(
         error,
-        RouteAcceptedChannelError::Accept(AcceptChannelError::Connection(error))
+        Ssh3RouteAcceptedChannelError::Accept(Ssh3AcceptChannelError::Connection(error))
             if is_benign_connection_error(error)
     )
 }
 
-fn is_benign_datagram_dispatch_error(error: &ssh3_h3::DatagramDispatchError) -> bool {
+fn is_benign_datagram_dispatch_error(error: &ssh3_h3::Ssh3DatagramDispatchError) -> bool {
     matches!(
         error,
-        ssh3_h3::DatagramDispatchError::Connection(error) if is_benign_connection_error(error)
+        ssh3_h3::Ssh3DatagramDispatchError::Connection(error) if is_benign_connection_error(error)
     )
 }
 
 #[cfg(unix)]
 fn spawn_agent_forwarder(
-    conversation: Arc<Conversation>,
+    conversation: Arc<Ssh3Conversation>,
     agent_socket: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1430,7 +1436,7 @@ fn spawn_agent_forwarder(
                 if is_benign_client_error(&err) {
                     continue;
                 }
-                eprintln!("ssh3-client agent forwarding error: {err}");
+                eprintln!("ssh3-rust-client agent forwarding error: {err}");
                 return;
             }
         }
@@ -1439,9 +1445,9 @@ fn spawn_agent_forwarder(
 
 #[cfg(unix)]
 async fn forward_agent_channel(
-    channel: Arc<Channel>,
+    channel: Arc<Ssh3Channel>,
     agent_socket: &Path,
-) -> Result<(), ClientError> {
+) -> Result<(), Ssh3ClientError> {
     let stream = UnixStream::connect(agent_socket).await?;
     let (mut reader, mut writer) = stream.into_split();
 
@@ -1450,7 +1456,7 @@ async fn forward_agent_channel(
         async move {
             loop {
                 let message = channel.next_message().await?;
-                if let Message::Data(data) = message
+                if let Ssh3Message::Data(data) = message
                     && data.data_type == SSH_EXTENDED_DATA_NONE
                 {
                     writer.write_all(&data.data).await?;
@@ -1458,7 +1464,7 @@ async fn forward_agent_channel(
                 }
             }
             #[allow(unreachable_code)]
-            Ok::<(), ClientError>(())
+            Ok::<(), Ssh3ClientError>(())
         }
     });
 
@@ -1475,7 +1481,7 @@ async fn forward_agent_channel(
                 let n = reader.read(&mut buf).await?;
                 if n == 0 {
                     let _ = channel.close().await;
-                    return Ok::<(), ClientError>(());
+                    return Ok::<(), Ssh3ClientError>(());
                 }
                 channel
                     .write_data(&buf[..n], SSH_EXTENDED_DATA_NONE)
@@ -1488,18 +1494,29 @@ async fn forward_agent_channel(
         result = &mut to_agent => {
             from_agent.abort();
             let _ = channel.close().await;
-            result.map_err(|err| ClientError::Io(io::Error::other(err.to_string())))?
+            result.map_err(|err| Ssh3ClientError::Io(io::Error::other(err.to_string())))?
         }
         result = &mut from_agent => {
             to_agent.abort();
             let _ = channel.close().await;
-            result.map_err(|err| ClientError::Io(io::Error::other(err.to_string())))?
+            result.map_err(|err| Ssh3ClientError::Io(io::Error::other(err.to_string())))?
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // The interop scenarios of this module are written for clarity, not for
+    // the linter: they keep the diagnostic lock of the harness across await
+    // points, they build the client configuration field by field and they
+    // match a single variant in a few places. The production code of the
+    // crate stays free of these lints.
+    #![allow(
+        clippy::await_holding_lock,
+        clippy::field_reassign_with_default,
+        clippy::single_match
+    )]
+
     use std::fs;
     #[cfg(unix)]
     use std::fs::File as StdFile;
@@ -1536,18 +1553,18 @@ mod tests {
     use ssh_key::private::{EcdsaKeypair, Ed25519Keypair, KeypairData, RsaKeypair};
     use ssh_key::{Algorithm, HashAlg, Signature};
     use ssh3_auth::bearer_authorization_value;
-    use ssh3_core::Channel;
+    use ssh3_core::Ssh3Channel;
     use ssh3_h3::{
         SSH3_USER_HEADER, SSH3_VERSION_STRING, accept_server_conversation, build_connect_request,
         establish_client_conversation, generate_conversation_id, is_ssh3_connect, new_client,
         new_server, response_with_server_header,
     };
-    use ssh3_proto::{ChannelRequest, Message, SSH_EXTENDED_DATA_NONE};
+    use ssh3_proto::{SSH_EXTENDED_DATA_NONE, Ssh3ChannelRequest, Ssh3Message};
     use ssh3_quinn::{
         accept_bi_channel, open_tcp_forwarding_channel, open_udp_forwarding_channel,
         self_signed_server_config,
     };
-    use ssh3_server::{ServerConfig, serve_connection};
+    use ssh3_server::{Ssh3ServerConfig, serve_connection};
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     #[cfg(unix)]
@@ -1561,17 +1578,20 @@ mod tests {
     use url::Url;
 
     use super::{
-        CapturedSession, ClientConfig, ClientError, LocalTerminalInfo, OidcConfig, OidcError,
-        SessionRequest, TerminalSize, TrustStrategy, activate_client, build_session_runtime,
-        client_bind_addr, client_quinn_config, connect_client, conversation_id_base64,
-        resolve_target, run_capture_on_client, run_exec_capture,
+        LocalTerminalInfo, Ssh3CapturedSession, Ssh3ClientConfig, Ssh3ClientError, Ssh3OidcConfig,
+        Ssh3OidcError, Ssh3SessionRequest, Ssh3TrustStrategy, TerminalSize, activate_client,
+        build_session_runtime, client_bind_addr, client_quinn_config, connect_client,
+        conversation_id_base64, resolve_target, run_capture_on_client, run_exec_capture,
         run_exec_capture_with_browser_opener, send_forward_agent_request,
         send_initial_session_requests, send_signal_request, send_window_change_request,
     };
 
     async fn setup_request_capture_harness(
         expected_messages: usize,
-    ) -> (super::ActiveClient, tokio::task::JoinHandle<Vec<Message>>) {
+    ) -> (
+        super::ActiveClient,
+        tokio::task::JoinHandle<Vec<Ssh3Message>>,
+    ) {
         let (server_config, server_certificate) =
             self_signed_server_config(vec!["localhost".to_string()]).unwrap();
         let server_endpoint = quinn::Endpoint::server(
@@ -1630,30 +1650,30 @@ mod tests {
             messages
         });
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!("https://localhost:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
         let client = connect_client(&config).await.unwrap();
         (client, server_task)
     }
 
     async fn connect_client_with_authorization_builder(
-        config: &ClientConfig,
+        config: &Ssh3ClientConfig,
         authorization_builder: impl FnOnce(&[u8; 32]) -> String,
-    ) -> Result<super::ActiveClient, ClientError> {
+    ) -> Result<super::ActiveClient, Ssh3ClientError> {
         let resolved = resolve_target(&config.target_url, config.server_name.as_deref()).await?;
         let bind_addr = client_bind_addr(resolved.remote_addr);
-        let mut endpoint = Endpoint::client(bind_addr).map_err(ClientError::Endpoint)?;
+        let mut endpoint = Endpoint::client(bind_addr).map_err(Ssh3ClientError::Endpoint)?;
         endpoint.set_default_client_config(client_quinn_config(&config.trust)?);
 
         let connection = endpoint
             .connect(resolved.remote_addr, &resolved.server_name)
-            .map_err(ClientError::Connect)?
+            .map_err(Ssh3ClientError::Connect)?
             .await
-            .map_err(ClientError::Connection)?;
+            .map_err(Ssh3ClientError::Connection)?;
 
         let (mut driver, mut send_request) = new_client(connection.clone()).await?;
         let driver_task = tokio::spawn(async move {
@@ -1756,9 +1776,122 @@ mod tests {
             .unwrap()
     }
 
+    /// Reason reported when the Go reference implementation cannot be built.
     #[cfg(unix)]
-    fn build_go_binary(package: &str, output_path: &Path) {
-        let build_output = StdCommand::new("go")
+    const GO_REPO_UNAVAILABLE: &str =
+        "the Go reference repository is not available (set SSH3_GO_REPO)";
+
+    /// Reason why the Go reference implementation is unavailable.
+    ///
+    /// The first reason wins: every scenario that needs the Go peers reports
+    /// the same cause, so the log stays consistent.
+    #[cfg(unix)]
+    static GO_UNAVAILABLE_REASON: Mutex<Option<String>> = Mutex::new(None);
+
+    /// Serializes the interop diagnostic writes.
+    #[cfg(unix)]
+    static INTEROP_LOG_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Writes a diagnostic line straight to the stderr handle.
+    ///
+    /// The test harness captures `eprintln!` output and keeps it hidden while
+    /// a test passes, so interop diagnostics bypass the capture to stay
+    /// visible in the test log. The write is serialized so that lines from
+    /// concurrently running scenarios do not interleave.
+    #[cfg(unix)]
+    fn log_interop(message: &str) {
+        let mut line = String::with_capacity(message.len() + 1);
+        line.push_str(message);
+        line.push('\n');
+        let _guard = INTEROP_LOG_LOCK.lock().unwrap();
+        let mut stderr = std::io::stderr();
+        let _ = stderr.write_all(line.as_bytes());
+        let _ = stderr.flush();
+    }
+
+    /// Records why the Go reference implementation cannot be used.
+    #[cfg(unix)]
+    fn set_go_unavailable(reason: impl Into<String>) {
+        let mut guard = GO_UNAVAILABLE_REASON.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(reason.into());
+        }
+    }
+
+    /// Returns the recorded reason why the Go reference implementation is
+    /// unavailable, if one was recorded.
+    #[cfg(unix)]
+    fn recorded_go_unavailable_reason() -> Option<String> {
+        GO_UNAVAILABLE_REASON.lock().unwrap().clone()
+    }
+
+    /// Returns the reason why the Go reference implementation is unavailable.
+    #[cfg(unix)]
+    fn go_unavailable_reason() -> String {
+        recorded_go_unavailable_reason().unwrap_or_else(|| GO_REPO_UNAVAILABLE.to_string())
+    }
+
+    /// Reports that a cross-implementation scenario was skipped.
+    ///
+    /// Every early return of an interop scenario goes through this function,
+    /// so a scenario that did not run is always visible in the test log and
+    /// can never be mistaken for a scenario that really passed.
+    #[cfg(unix)]
+    fn skip_interop(scenario: &str) {
+        log_interop(&format!(
+            "skipping: {scenario}: {}",
+            go_unavailable_reason()
+        ));
+    }
+
+    /// Root of the Go reference repository that the cross-implementation
+    /// suite builds its peers from.
+    ///
+    /// The location comes from `SSH3_GO_REPO`. When that is unset, the
+    /// canonical `ssh3-go` checkout is probed next to this workspace; a
+    /// directory named `ssh3` is not probed automatically because that name
+    /// is ambiguous with the pre-split monorepo, so such a checkout has to be
+    /// named explicitly through `SSH3_GO_REPO`. `None` means the Go
+    /// repository is not available, and the interop scenarios skip instead of
+    /// failing.
+    #[cfg(unix)]
+    fn go_repo_root() -> Option<PathBuf> {
+        if let Ok(configured) = std::env::var("SSH3_GO_REPO") {
+            let path = PathBuf::from(configured);
+            if path.join("go.mod").is_file() {
+                return Some(path.canonicalize().unwrap_or(path));
+            }
+            set_go_unavailable(format!(
+                "SSH3_GO_REPO={} does not look like the Go repository (no go.mod)",
+                path.display()
+            ));
+            return None;
+        }
+        let workspace = repo_root();
+        let candidates = [
+            workspace.join("ssh3-go"),
+            workspace.join("../ssh3-go"),
+            workspace.join("../../ssh3-go"),
+        ];
+        let found = candidates.into_iter().find_map(|candidate| {
+            let candidate = candidate.canonicalize().ok()?;
+            (candidate.join("go.mod").is_file() && candidate.join("cmd/ssh3").is_dir())
+                .then_some(candidate)
+        });
+        if found.is_none() {
+            set_go_unavailable(GO_REPO_UNAVAILABLE);
+        }
+        found
+    }
+
+    /// Builds a Go binary from the reference repository.
+    ///
+    /// Returns `false` when the build could not be performed or failed; the
+    /// cause is recorded so the interop scenarios can report it instead of
+    /// failing with an opaque panic.
+    #[cfg(unix)]
+    fn build_go_binary(go_root: &Path, package: &str, output_path: &Path) -> bool {
+        let build_output = match StdCommand::new("go")
             .arg("build")
             .arg("-mod=mod")
             .arg("-tags")
@@ -1766,57 +1899,82 @@ mod tests {
             .arg("-o")
             .arg(output_path)
             .arg(package)
-            .current_dir(repo_root())
+            .current_dir(go_root)
             .output()
-            .unwrap();
+        {
+            Ok(output) => output,
+            Err(err) => {
+                set_go_unavailable(format!("the Go toolchain is not usable: {err}"));
+                return false;
+            }
+        };
         if !build_output.status.success() {
-            panic!(
-                "go build {} failed\nstdout:\n{}\nstderr:\n{}",
-                package,
-                String::from_utf8_lossy(&build_output.stdout),
-                String::from_utf8_lossy(&build_output.stderr),
-            );
+            set_go_unavailable(format!(
+                "go build {package} failed: {}",
+                String::from_utf8_lossy(&build_output.stderr).trim()
+            ));
+            return false;
         }
+        true
     }
 
     #[cfg(unix)]
-    fn go_interop_binaries() -> &'static GoInteropBinaries {
-        static BINARIES: OnceLock<GoInteropBinaries> = OnceLock::new();
-        BINARIES.get_or_init(|| {
-            let dir = repo_root().join("target/go-interop");
-            fs::create_dir_all(&dir).unwrap();
-            let client = dir.join("ssh3-go-interop-client");
-            let server = dir.join("ssh3-go-interop-server");
-            build_go_binary("./internal/interop/go_client", &client);
-            build_go_binary("./internal/interop/go_server", &server);
-            GoInteropBinaries { client, server }
-        })
+    fn go_interop_binaries() -> Option<&'static GoInteropBinaries> {
+        static BINARIES: OnceLock<Option<GoInteropBinaries>> = OnceLock::new();
+        BINARIES
+            .get_or_init(|| {
+                let go_root = go_repo_root()?;
+                let dir = repo_root().join("target/go-interop");
+                fs::create_dir_all(&dir).unwrap();
+                let client = dir.join("ssh3-go-interop-client");
+                let server = dir.join("ssh3-go-interop-server");
+                if !build_go_binary(&go_root, "./internal/interop/go_client", &client) {
+                    return None;
+                }
+                if !build_go_binary(&go_root, "./internal/interop/go_server", &server) {
+                    return None;
+                }
+                Some(GoInteropBinaries { client, server })
+            })
+            .as_ref()
     }
 
     #[cfg(unix)]
-    fn go_cli_binaries() -> &'static GoCliBinaries {
-        static BINARIES: OnceLock<GoCliBinaries> = OnceLock::new();
-        BINARIES.get_or_init(|| {
-            let dir = repo_root().join("target/go-interop");
-            fs::create_dir_all(&dir).unwrap();
-            let client = dir.join("ssh3-go-cli");
-            let server = dir.join("ssh3-go-server");
-            build_go_binary("./cmd/ssh3", &client);
-            build_go_binary("./cmd/ssh3-server", &server);
-            GoCliBinaries { client, server }
-        })
+    fn go_cli_binaries() -> Option<&'static GoCliBinaries> {
+        static BINARIES: OnceLock<Option<GoCliBinaries>> = OnceLock::new();
+        BINARIES
+            .get_or_init(|| {
+                let go_root = go_repo_root()?;
+                let dir = repo_root().join("target/go-interop");
+                fs::create_dir_all(&dir).unwrap();
+                let client = dir.join("ssh3-go-cli");
+                let server = dir.join("ssh3-go-server");
+                if !build_go_binary(&go_root, "./cmd/ssh3", &client) {
+                    return None;
+                }
+                if !build_go_binary(&go_root, "./cmd/ssh3-server", &server) {
+                    return None;
+                }
+                Some(GoCliBinaries { client, server })
+            })
+            .as_ref()
     }
 
     #[cfg(unix)]
-    fn go_agent_probe_binary() -> &'static GoAgentProbeBinary {
-        static BINARY: OnceLock<GoAgentProbeBinary> = OnceLock::new();
-        BINARY.get_or_init(|| {
-            let dir = repo_root().join("target/go-interop");
-            fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("ssh3-agent-probe");
-            build_go_binary("./internal/interop/agent_probe", &path);
-            GoAgentProbeBinary { path }
-        })
+    fn go_agent_probe_binary() -> Option<&'static GoAgentProbeBinary> {
+        static BINARY: OnceLock<Option<GoAgentProbeBinary>> = OnceLock::new();
+        BINARY
+            .get_or_init(|| {
+                let go_root = go_repo_root()?;
+                let dir = repo_root().join("target/go-interop");
+                fs::create_dir_all(&dir).unwrap();
+                let path = dir.join("ssh3-agent-probe");
+                if !build_go_binary(&go_root, "./internal/interop/agent_probe", &path) {
+                    return None;
+                }
+                Some(GoAgentProbeBinary { path })
+            })
+            .as_ref()
     }
 
     #[cfg(unix)]
@@ -1887,8 +2045,8 @@ mod tests {
         authorized_identity_path: &Path,
         cert_path: &Path,
         key_path: &Path,
-    ) -> (tokio::process::Child, SocketAddr) {
-        let binaries = go_interop_binaries();
+    ) -> Option<(tokio::process::Child, SocketAddr)> {
+        let binaries = go_interop_binaries()?;
         let mut child = TokioCommand::new(&binaries.server)
             .arg("--bind")
             .arg(bind_addr)
@@ -1927,7 +2085,7 @@ mod tests {
             panic!("invalid go interop server bind address {bind_addr}: {err}")
         });
         drop(reader);
-        (child, bind_addr)
+        Some((child, bind_addr))
     }
 
     #[cfg(unix)]
@@ -1936,27 +2094,29 @@ mod tests {
         username: &str,
         private_key_path: &Path,
         command: &str,
-    ) -> std::process::Output {
-        let binaries = go_interop_binaries();
-        timeout(
-            Duration::from_secs(20),
-            TokioCommand::new(&binaries.client)
-                .arg("--url")
-                .arg(url)
-                .arg("--user")
-                .arg(username)
-                .arg("--privkey")
-                .arg(private_key_path)
-                .arg("--insecure")
-                .arg(command)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output(),
+    ) -> Option<std::process::Output> {
+        let binaries = go_interop_binaries()?;
+        Some(
+            timeout(
+                Duration::from_secs(20),
+                TokioCommand::new(&binaries.client)
+                    .arg("--url")
+                    .arg(url)
+                    .arg("--user")
+                    .arg(username)
+                    .arg("--privkey")
+                    .arg(private_key_path)
+                    .arg("--insecure")
+                    .arg(command)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
         )
-        .await
-        .unwrap()
-        .unwrap()
     }
 
     #[cfg(unix)]
@@ -1967,8 +2127,8 @@ mod tests {
         cert_path: &Path,
         key_path: &Path,
         log_path: &Path,
-    ) -> tokio::process::Child {
-        let binaries = go_cli_binaries();
+    ) -> Option<tokio::process::Child> {
+        let binaries = go_cli_binaries()?;
         fs::create_dir_all(home_dir).unwrap();
         let stderr_log = fs::File::create(log_path).unwrap();
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -2018,7 +2178,7 @@ mod tests {
         .await
         .unwrap();
 
-        child
+        Some(child)
     }
 
     #[cfg(unix)]
@@ -2029,8 +2189,8 @@ mod tests {
         local_port: u16,
         remote_addr: SocketAddr,
         log_path: &Path,
-    ) -> tokio::process::Child {
-        let binaries = go_cli_binaries();
+    ) -> Option<tokio::process::Child> {
+        let binaries = go_cli_binaries()?;
         fs::create_dir_all(home_dir.join(".ssh")).unwrap();
         fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
         let stderr_log = fs::File::create(log_path).unwrap();
@@ -2072,7 +2232,7 @@ mod tests {
         .await
         .unwrap();
 
-        child
+        Some(child)
     }
 
     #[cfg(unix)]
@@ -2083,8 +2243,8 @@ mod tests {
         local_port: u16,
         remote_addr: SocketAddr,
         log_path: &Path,
-    ) -> tokio::process::Child {
-        let binaries = go_cli_binaries();
+    ) -> Option<tokio::process::Child> {
+        let binaries = go_cli_binaries()?;
         fs::create_dir_all(home_dir.join(".ssh")).unwrap();
         fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
         let stderr_log = fs::File::create(log_path).unwrap();
@@ -2130,7 +2290,7 @@ mod tests {
         .await
         .unwrap();
 
-        child
+        Some(child)
     }
 
     #[cfg(unix)]
@@ -2139,27 +2299,29 @@ mod tests {
         url: &str,
         private_key_path: &Path,
         command: &[&str],
-    ) -> std::process::Output {
-        let binaries = go_cli_binaries();
+    ) -> Option<std::process::Output> {
+        let binaries = go_cli_binaries()?;
         fs::create_dir_all(home_dir.join(".ssh")).unwrap();
         fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
-        timeout(
-            Duration::from_secs(20),
-            TokioCommand::new(&binaries.client)
-                .arg("-insecure")
-                .arg("-privkey")
-                .arg(private_key_path)
-                .arg(url)
-                .args(command)
-                .env("HOME", home_dir)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output(),
+        Some(
+            timeout(
+                Duration::from_secs(20),
+                TokioCommand::new(&binaries.client)
+                    .arg("-insecure")
+                    .arg("-privkey")
+                    .arg(private_key_path)
+                    .arg(url)
+                    .args(command)
+                    .env("HOME", home_dir)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
         )
-        .await
-        .unwrap()
-        .unwrap()
     }
 
     #[cfg(unix)]
@@ -2169,8 +2331,8 @@ mod tests {
         private_key_path: &Path,
         agent_socket: &Path,
         command: &[&str],
-    ) -> std::process::Output {
-        let binaries = go_cli_binaries();
+    ) -> Option<std::process::Output> {
+        let binaries = go_cli_binaries()?;
         fs::create_dir_all(home_dir.join(".ssh")).unwrap();
         fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
         let mut child = TokioCommand::new(&binaries.client)
@@ -2202,7 +2364,7 @@ mod tests {
             buf
         });
 
-        match timeout(Duration::from_secs(30), child.wait()).await {
+        Some(match timeout(Duration::from_secs(30), child.wait()).await {
             Ok(status) => std::process::Output {
                 status: status.unwrap(),
                 stdout: stdout_task.await.unwrap(),
@@ -2223,7 +2385,7 @@ mod tests {
                     String::from_utf8_lossy(&output.stderr),
                 );
             }
-        }
+        })
     }
 
     #[cfg(unix)]
@@ -2233,8 +2395,8 @@ mod tests {
         issuer_url: &str,
         oidc_config_path: &Path,
         command: &[&str],
-    ) -> std::process::Output {
-        let binaries = go_cli_binaries();
+    ) -> Option<std::process::Output> {
+        let binaries = go_cli_binaries()?;
         let browser_dir = home_dir.join("browser-bin");
         fs::create_dir_all(home_dir.join(".ssh")).unwrap();
         fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
@@ -2283,7 +2445,7 @@ mod tests {
             buf
         });
 
-        match timeout(Duration::from_secs(20), child.wait()).await {
+        Some(match timeout(Duration::from_secs(20), child.wait()).await {
             Ok(status) => std::process::Output {
                 status: status.unwrap(),
                 stdout: stdout_task.await.unwrap(),
@@ -2304,7 +2466,7 @@ mod tests {
                     String::from_utf8_lossy(&output.stderr),
                 );
             }
-        }
+        })
     }
 
     #[cfg(unix)]
@@ -2313,8 +2475,8 @@ mod tests {
         url: &str,
         password: &str,
         command: &[&str],
-    ) -> std::process::Output {
-        let binaries = go_cli_binaries();
+    ) -> Option<std::process::Output> {
+        let binaries = go_cli_binaries()?;
         fs::create_dir_all(home_dir.join(".ssh")).unwrap();
         fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
 
@@ -2347,10 +2509,12 @@ mod tests {
             .unwrap();
         drop(stdin);
 
-        timeout(Duration::from_secs(20), child.wait_with_output())
-            .await
-            .unwrap()
-            .unwrap()
+        Some(
+            timeout(Duration::from_secs(20), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
     }
 
     #[cfg(unix)]
@@ -2455,8 +2619,8 @@ mod tests {
         url: &str,
         private_key_path: &Path,
         initial_size: TerminalSize,
-    ) -> GoCliPtySession {
-        let binaries = go_cli_binaries();
+    ) -> Option<GoCliPtySession> {
+        let binaries = go_cli_binaries()?;
         fs::create_dir_all(home_dir.join(".ssh")).unwrap();
         fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
 
@@ -2520,13 +2684,13 @@ mod tests {
             }
         });
 
-        GoCliPtySession {
+        Some(GoCliPtySession {
             child,
             writer,
             controller: master,
             output,
             output_task,
-        }
+        })
     }
 
     #[cfg(unix)]
@@ -2535,8 +2699,8 @@ mod tests {
         url: &str,
         private_key_path: &Path,
         input: &str,
-    ) -> std::process::Output {
-        let binaries = go_cli_binaries();
+    ) -> Option<std::process::Output> {
+        let binaries = go_cli_binaries()?;
         fs::create_dir_all(home_dir.join(".ssh")).unwrap();
         fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
 
@@ -2564,10 +2728,12 @@ mod tests {
         stdin.write_all(input.as_bytes()).await.unwrap();
         drop(stdin);
 
-        timeout(Duration::from_secs(20), child.wait_with_output())
-            .await
-            .unwrap()
-            .unwrap()
+        Some(
+            timeout(Duration::from_secs(20), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
     }
 
     async fn run_shell_capture_with_resize_on_client(
@@ -2576,18 +2742,18 @@ mod tests {
         resized_terminal: TerminalSize,
         shell_input_prefix: &str,
         shell_input_suffix: &str,
-    ) -> Result<CapturedSession, ClientError> {
+    ) -> Result<Ssh3CapturedSession, Ssh3ClientError> {
         let channel = client.open_session_channel().await?;
         send_initial_session_requests(
             channel.as_ref(),
-            &SessionRequest::Shell,
+            &Ssh3SessionRequest::Shell,
             Some(&initial_terminal),
         )
         .await?;
         channel
             .write_data(shell_input_prefix.as_bytes(), SSH_EXTENDED_DATA_NONE)
             .await
-            .map_err(ClientError::from)?;
+            .map_err(Ssh3ClientError::from)?;
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -2602,7 +2768,7 @@ mod tests {
                 .await
                 .unwrap()?
             {
-                Message::Data(data) => {
+                Ssh3Message::Data(data) => {
                     match data.data_type {
                         SSH_EXTENDED_DATA_NONE => stdout.extend_from_slice(&data.data),
                         ssh3_proto::SSH_EXTENDED_DATA_STDERR => {
@@ -2617,21 +2783,21 @@ mod tests {
                         channel
                             .write_data(shell_input_suffix.as_bytes(), SSH_EXTENDED_DATA_NONE)
                             .await
-                            .map_err(ClientError::from)?;
+                            .map_err(Ssh3ClientError::from)?;
                         resize_sent = true;
                     }
                 }
-                Message::ChannelRequest(message) => match message.request {
-                    ChannelRequest::ExitStatus(status) => {
-                        return Ok(CapturedSession {
+                Ssh3Message::ChannelRequest(message) => match message.request {
+                    Ssh3ChannelRequest::ExitStatus(status) => {
+                        return Ok(Ssh3CapturedSession {
                             server_header: client.server_header.clone(),
                             exit_status: status.exit_status as i32,
                             stdout,
                             stderr,
                         });
                     }
-                    ChannelRequest::ExitSignal(signal) => {
-                        return Err(ClientError::ExitSignal(signal));
+                    Ssh3ChannelRequest::ExitSignal(signal) => {
+                        return Err(Ssh3ClientError::ExitSignal(signal));
                     }
                     _ => {}
                 },
@@ -2644,7 +2810,7 @@ mod tests {
         client: &super::ActiveClient,
         remote_addr: SocketAddr,
         payload: &[u8],
-    ) -> Result<Vec<u8>, ClientError> {
+    ) -> Result<Vec<u8>, Ssh3ClientError> {
         let channel = open_tcp_forwarding_channel(
             client.conversation.as_ref(),
             &client.connection,
@@ -2653,18 +2819,18 @@ mod tests {
             remote_addr,
         )
         .await
-        .map_err(ClientError::from)?;
+        .map_err(Ssh3ClientError::from)?;
         channel
             .write_data(payload, SSH_EXTENDED_DATA_NONE)
             .await
-            .map_err(ClientError::from)?;
+            .map_err(Ssh3ClientError::from)?;
 
         loop {
             match timeout(Duration::from_secs(10), channel.next_message())
                 .await
                 .unwrap()?
             {
-                Message::Data(data) if data.data_type == SSH_EXTENDED_DATA_NONE => {
+                Ssh3Message::Data(data) if data.data_type == SSH_EXTENDED_DATA_NONE => {
                     let _ = channel.close().await;
                     return Ok(data.data);
                 }
@@ -2677,7 +2843,7 @@ mod tests {
         client: &super::ActiveClient,
         remote_addr: SocketAddr,
         payload: &[u8],
-    ) -> Result<Vec<u8>, ClientError> {
+    ) -> Result<Vec<u8>, Ssh3ClientError> {
         let channel = open_udp_forwarding_channel(
             client.conversation.as_ref(),
             &client.connection,
@@ -2686,11 +2852,11 @@ mod tests {
             remote_addr,
         )
         .await
-        .map_err(ClientError::from)?;
+        .map_err(Ssh3ClientError::from)?;
         channel
             .send_datagram(payload.to_vec())
             .await
-            .map_err(ClientError::from)?;
+            .map_err(Ssh3ClientError::from)?;
         let echoed = timeout(Duration::from_secs(10), channel.receive_datagram())
             .await
             .unwrap();
@@ -2738,6 +2904,27 @@ mod tests {
     #[cfg(unix)]
     fn lock_go_binary_tests() -> std::sync::MutexGuard<'static, ()> {
         go_binary_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(unix)]
+    fn agent_socket_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Serializes the scenarios that make the Rust server open an agent
+    /// forwarding socket.
+    ///
+    /// The server names that socket after the process id and a timestamp, so
+    /// two of these scenarios running at the same time can ask for the same
+    /// path and the second one fails with "File exists". The scenarios are
+    /// serialized so that they cannot overlap; what each one checks is
+    /// unchanged.
+    #[cfg(unix)]
+    fn lock_agent_socket_tests() -> std::sync::MutexGuard<'static, ()> {
+        agent_socket_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -3048,25 +3235,25 @@ mod tests {
         Ok(RsaBigUint::from_bytes_be(bytes))
     }
 
-    async fn read_stdout_line(channel: &Arc<Channel>) -> Result<String, ClientError> {
+    async fn read_stdout_line(channel: &Arc<Ssh3Channel>) -> Result<String, Ssh3ClientError> {
         let mut stdout = Vec::new();
         loop {
             match channel.next_message().await? {
-                Message::Data(data) if data.data_type == SSH_EXTENDED_DATA_NONE => {
+                Ssh3Message::Data(data) if data.data_type == SSH_EXTENDED_DATA_NONE => {
                     stdout.extend_from_slice(&data.data);
                     if let Some(newline) = stdout.iter().position(|byte| *byte == b'\n') {
                         return Ok(String::from_utf8_lossy(&stdout[..newline]).to_string());
                     }
                 }
-                Message::ChannelRequest(message) => match message.request {
-                    ChannelRequest::ExitStatus(status) => {
-                        return Err(ClientError::Io(io::Error::other(format!(
+                Ssh3Message::ChannelRequest(message) => match message.request {
+                    Ssh3ChannelRequest::ExitStatus(status) => {
+                        return Err(Ssh3ClientError::Io(io::Error::other(format!(
                             "session exited before producing stdout line: {}",
                             status.exit_status
                         ))));
                     }
-                    ChannelRequest::ExitSignal(signal) => {
-                        return Err(ClientError::ExitSignal(signal));
+                    Ssh3ChannelRequest::ExitSignal(signal) => {
+                        return Err(Ssh3ClientError::ExitSignal(signal));
                     }
                     _ => {}
                 },
@@ -3267,7 +3454,7 @@ mod tests {
         response
     }
 
-    fn mock_browser_opener(url: String) -> Result<(), OidcError> {
+    fn mock_browser_opener(url: String) -> Result<(), Ssh3OidcError> {
         tokio::spawn(async move {
             let _ = reqwest::Client::new().get(url).send().await;
         });
@@ -3459,6 +3646,119 @@ mod tests {
         }
     }
 
+    /// The Go peer accessors that the interop scenarios depend on.
+    ///
+    /// Every one of them yields an `Option`, so a scenario that needs the Go
+    /// peers cannot continue without them: it has to take the skip path and
+    /// announce it.
+    #[cfg(unix)]
+    const GO_PEER_ACCESSORS: &[&str] = &[
+        "spawn_go_interop_server",
+        "run_go_interop_client",
+        "spawn_go_cli_server",
+        "spawn_go_cli_tcp_forwarder",
+        "spawn_go_cli_udp_forwarder",
+        "run_go_cli_client",
+        "run_go_cli_client_with_forwarded_agent",
+        "run_go_cli_client_with_oidc",
+        "run_go_cli_client_with_password",
+        "spawn_go_cli_shell_with_pty",
+        "run_go_cli_shell",
+        "go_agent_probe_binary",
+    ];
+
+    /// Guards the interop skip protocol.
+    ///
+    /// A scenario that needs the Go peers must not report success when they
+    /// are unavailable: it has to take the skip path, which prints a
+    /// `skipping:` line. This test checks that every site that consumes a Go
+    /// peer is paired with such a skip, so a scenario that forgets it is
+    /// caught here instead of silently passing.
+    #[cfg(unix)]
+    #[test]
+    fn interop_scenarios_report_their_skip() {
+        // The scan below looks at this file, so the guards themselves must
+        // not be mistaken for interop scenarios. The marker is assembled at
+        // runtime so that this test does not match its own source.
+        let source = include_str!("lib.rs");
+        let marker = format!("// --- {} scenarios ---", "interop");
+        let scenarios = source
+            .split(&marker)
+            .nth(1)
+            .expect("the interop scenarios are marked in this file");
+
+        let mut peer_sites = 0usize;
+        let mut skip_sites = 0usize;
+        for accessor in GO_PEER_ACCESSORS {
+            for (index, _) in scenarios.match_indices(&format!("= {accessor}(")) {
+                peer_sites += 1;
+                // The skip of the enclosing `let ... else` block follows the
+                // call within a few lines.
+                let block = &scenarios[index..(index + 600).min(scenarios.len())];
+                assert!(
+                    block.contains("skip_interop("),
+                    "the Go peer `{accessor}` is consumed without a skip path",
+                );
+            }
+        }
+        for (index, _) in scenarios.match_indices("skip_interop(") {
+            // The declaration of the helper itself is not a call site.
+            if scenarios[..index].ends_with("fn ") {
+                continue;
+            }
+            // The scenario name follows the call, possibly on the next line.
+            let rest = &scenarios[index + "skip_interop(".len()..];
+            assert!(
+                rest.trim_start().starts_with('"'),
+                "a skip announcement must name its scenario",
+            );
+            skip_sites += 1;
+        }
+        assert!(peer_sites > 0, "no interop scenario consumes the Go peers",);
+        assert_eq!(
+            peer_sites, skip_sites,
+            "every Go peer access must be paired with a skip announcement",
+        );
+    }
+
+    /// Reports whether each set of Go peers could be prepared.
+    #[cfg(unix)]
+    fn go_peers_available() -> (bool, bool, bool) {
+        (
+            go_interop_binaries().is_some(),
+            go_cli_binaries().is_some(),
+            go_agent_probe_binary().is_some(),
+        )
+    }
+
+    /// Checks that the Go peers resolve consistently.
+    ///
+    /// All three peer sets come from the same checkout, so they must be
+    /// available together. A mismatch would let some scenarios run against
+    /// the Go peers while others silently skip.
+    #[cfg(unix)]
+    #[test]
+    fn go_peers_resolve_consistently() {
+        let (interop, cli, probe) = go_peers_available();
+        assert_eq!(
+            interop, cli,
+            "the interop and the CLI peers must be available together",
+        );
+        assert_eq!(
+            cli, probe,
+            "the CLI peers and the agent probe must be available together",
+        );
+        if !interop {
+            // No peers: the scenarios must have recorded why they skipped.
+            assert!(
+                recorded_go_unavailable_reason().is_some(),
+                "the skip reason must be recorded so the log explains itself",
+            );
+        }
+    }
+
+    // --- interop scenarios ---
+
     #[tokio::test]
     async fn exec_capture_round_trips_against_the_rust_server() {
         let (server_config, server_certificate) =
@@ -3481,19 +3781,19 @@ mod tests {
                 .unwrap();
             tokio::time::timeout(
                 Duration::from_secs(10),
-                serve_connection(connection, ServerConfig::default()),
+                serve_connection(connection, Ssh3ServerConfig::default()),
             )
             .await
             .unwrap()
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!("https://localhost:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
 
         let session = tokio::time::timeout(
             Duration::from_secs(10),
@@ -3505,7 +3805,7 @@ mod tests {
 
         assert_eq!(
             session,
-            CapturedSession {
+            Ssh3CapturedSession {
                 server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"hello from client\n".to_vec(),
@@ -3525,21 +3825,25 @@ mod tests {
         let cert_path = tempdir.path().join("cert.pem");
         let key_path = tempdir.path().join("key.pem");
 
-        let (mut server, bind_addr) = spawn_go_interop_server(
+        let Some((mut server, bind_addr)) = spawn_go_interop_server(
             "127.0.0.1:0",
             &fixture.username,
             &fixture.authorized_identities_path,
             &cert_path,
             &key_path,
         )
-        .await;
+        .await
+        else {
+            skip_interop("rust_client_exec_capture_round_trips_against_the_go_server");
+            return;
+        };
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!("https://127.0.0.1:{}/ssh3-term", bind_addr.port())
                 .parse()
                 .unwrap(),
         );
-        config.trust = TrustStrategy::Insecure;
+        config.trust = Ssh3TrustStrategy::Insecure;
         config.username = Some(fixture.username.clone());
         config.identity_file = Some(fixture.private_key_path.clone());
 
@@ -3585,7 +3889,7 @@ mod tests {
         let key_path = tempdir.path().join("key.pem");
         let log_path = tempdir.path().join("go-server.log");
 
-        let mut server = spawn_go_cli_server(
+        let Some(mut server) = spawn_go_cli_server(
             &bind_addr,
             &fixture.username,
             &home_dir,
@@ -3593,9 +3897,13 @@ mod tests {
             &key_path,
             &log_path,
         )
-        .await;
+        .await
+        else {
+            skip_interop("rust_client_exec_capture_round_trips_against_the_real_go_server");
+            return;
+        };
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!(
                 "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
                 fixture.username
@@ -3603,7 +3911,7 @@ mod tests {
             .parse()
             .unwrap(),
         );
-        config.trust = TrustStrategy::Insecure;
+        config.trust = Ssh3TrustStrategy::Insecure;
         config.username = Some(fixture.username.clone());
         config.identity_file = Some(fixture.private_key_path.clone());
 
@@ -3655,7 +3963,7 @@ mod tests {
             let key_path = tempdir.path().join("key.pem");
             let log_path = tempdir.path().join("go-server.log");
 
-            let mut server = spawn_go_cli_server(
+            let Some(mut server) = spawn_go_cli_server(
                 &bind_addr,
                 &fixture.username,
                 &home_dir,
@@ -3663,9 +3971,15 @@ mod tests {
                 &key_path,
                 &log_path,
             )
-            .await;
+            .await
+            else {
+                skip_interop(
+                    "rust_client_exec_capture_round_trips_with_extra_pubkey_algorithms_against_the_real_go_server",
+                );
+                return;
+            };
 
-            let mut config = ClientConfig::new(
+            let mut config = Ssh3ClientConfig::new(
                 format!(
                     "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
                     fixture.username
@@ -3673,7 +3987,7 @@ mod tests {
                 .parse()
                 .unwrap(),
             );
-            config.trust = TrustStrategy::Insecure;
+            config.trust = Ssh3TrustStrategy::Insecure;
             config.username = Some(fixture.username.clone());
             config.identity_file = Some(fixture.private_key_path.clone());
 
@@ -3725,7 +4039,7 @@ mod tests {
         let key_path = tempdir.path().join("key.pem");
         let log_path = tempdir.path().join("go-server.log");
 
-        let mut server = spawn_go_cli_server(
+        let Some(mut server) = spawn_go_cli_server(
             &bind_addr,
             &fixture.username,
             &home_dir,
@@ -3733,9 +4047,13 @@ mod tests {
             &key_path,
             &log_path,
         )
-        .await;
+        .await
+        else {
+            skip_interop("rust_client_exec_round_trips_with_oidc_against_the_real_go_server");
+            return;
+        };
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!(
                 "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
                 fixture.username
@@ -3743,9 +4061,9 @@ mod tests {
             .parse()
             .unwrap(),
         );
-        config.trust = TrustStrategy::Insecure;
+        config.trust = Ssh3TrustStrategy::Insecure;
         config.username = Some(fixture.username.clone());
-        config.oidc = Some(OidcConfig {
+        config.oidc = Some(Ssh3OidcConfig {
             issuer_url: fixture.issuer_url.clone(),
             client_id: fixture.client_id.clone(),
             client_secret: None,
@@ -3806,19 +4124,19 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
             serve_connection(connection, config).await.unwrap();
         });
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!("https://localhost:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
         config.identity_file = Some(private_key_path);
 
@@ -3832,7 +4150,7 @@ mod tests {
 
         assert_eq!(
             session,
-            CapturedSession {
+            Ssh3CapturedSession {
                 server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated client\n".to_vec(),
@@ -3872,19 +4190,19 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
             serve_connection(connection, config).await.unwrap();
         });
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!("https://localhost:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
         config.identity_file = Some(private_key_path);
 
@@ -3898,7 +4216,7 @@ mod tests {
 
         assert_eq!(
             session,
-            CapturedSession {
+            Ssh3CapturedSession {
                 server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated via p256\n".to_vec(),
@@ -3938,7 +4256,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
@@ -3951,12 +4269,12 @@ mod tests {
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!("https://localhost:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
         config.identity_file = Some(private_key_path);
 
@@ -3970,7 +4288,7 @@ mod tests {
 
         assert_eq!(
             session,
-            CapturedSession {
+            Ssh3CapturedSession {
                 server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated via rsa\n".to_vec(),
@@ -4007,7 +4325,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
@@ -4020,13 +4338,17 @@ mod tests {
             .unwrap();
         });
 
-        let output = run_go_interop_client(
+        let Some(output) = run_go_interop_client(
             &format!("https://localhost:{}/ssh3-term", server_addr.port()),
             &username,
             &private_key_path,
             "printf 'hello from go to rust\\n'",
         )
-        .await;
+        .await
+        else {
+            skip_interop("go_client_exec_round_trips_against_the_rust_server");
+            return;
+        };
 
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         assert_eq!(output.stdout, b"hello from go to rust\n".to_vec());
@@ -4063,7 +4385,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
@@ -4071,13 +4393,17 @@ mod tests {
         });
 
         let tempdir = TempDir::new().unwrap();
-        let output = run_go_cli_client(
+        let Some(output) = run_go_cli_client(
             tempdir.path(),
             &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
             &private_key_path,
             &["echo", "hello from real go cli"],
         )
-        .await;
+        .await
+        else {
+            skip_interop("real_go_client_exec_round_trips_against_the_rust_server");
+            return;
+        };
 
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
@@ -4121,7 +4447,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
@@ -4138,14 +4464,18 @@ mod tests {
         )
         .unwrap();
 
-        let output = run_go_cli_client_with_oidc(
+        let Some(output) = run_go_cli_client_with_oidc(
             tempdir.path(),
             &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
             &issuer_url,
             &oidc_config_path,
             &["echo", "hello from real go oidc"],
         )
-        .await;
+        .await
+        else {
+            skip_interop("real_go_client_exec_round_trips_with_oidc_against_the_rust_server");
+            return;
+        };
 
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
@@ -4189,7 +4519,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.enable_password_login = true;
             config.password_verifier =
                 Some(Arc::new(move |candidate_username, candidate_password| {
@@ -4201,13 +4531,17 @@ mod tests {
         });
 
         let tempdir = TempDir::new().unwrap();
-        let output = run_go_cli_client_with_password(
+        let Some(output) = run_go_cli_client_with_password(
             tempdir.path(),
             &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
             &password,
             &["echo", "hello from real go password"],
         )
-        .await;
+        .await
+        else {
+            skip_interop("real_go_client_exec_round_trips_with_password_against_the_rust_server");
+            return;
+        };
 
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
@@ -4245,7 +4579,7 @@ mod tests {
         let key_path = tempdir.path().join("key.pem");
         let log_path = tempdir.path().join("go-server.log");
 
-        let mut server = spawn_go_cli_server(
+        let Some(mut server) = spawn_go_cli_server(
             &bind_addr,
             &fixture.username,
             &home_dir,
@@ -4253,9 +4587,13 @@ mod tests {
             &key_path,
             &log_path,
         )
-        .await;
+        .await
+        else {
+            skip_interop("rust_client_shell_with_pty_round_trips_against_the_real_go_server");
+            return;
+        };
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!(
                 "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
                 fixture.username
@@ -4263,7 +4601,7 @@ mod tests {
             .parse()
             .unwrap(),
         );
-        config.trust = TrustStrategy::Insecure;
+        config.trust = Ssh3TrustStrategy::Insecure;
         config.username = Some(fixture.username.clone());
         config.identity_file = Some(fixture.private_key_path.clone());
 
@@ -4342,7 +4680,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
@@ -4350,13 +4688,17 @@ mod tests {
         });
 
         let tempdir = TempDir::new().unwrap();
-        let output = run_go_cli_shell(
+        let Some(output) = run_go_cli_shell(
             tempdir.path(),
             &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
             &private_key_path,
             "printf '__SSH3_PTY_GO_CLIENT_OK__:%s\\n' \"$TERM\"\nexit\n",
         )
-        .await;
+        .await
+        else {
+            skip_interop("real_go_client_shell_with_pty_round_trips_against_the_rust_server");
+            return;
+        };
 
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
@@ -4402,7 +4744,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
@@ -4410,7 +4752,7 @@ mod tests {
         });
 
         let tempdir = TempDir::new().unwrap();
-        let session = spawn_go_cli_shell_with_pty(
+        let Some(session) = spawn_go_cli_shell_with_pty(
             tempdir.path(),
             &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
             &private_key_path,
@@ -4421,7 +4763,11 @@ mod tests {
                 pixel_height: 480,
             },
         )
-        .await;
+        .await
+        else {
+            skip_interop("real_go_client_window_change_round_trips_against_the_rust_server");
+            return;
+        };
         session.write_all("stty size\n").await;
         session.wait_for_output_fragment("24 80").await;
         session
@@ -4477,7 +4823,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
@@ -4485,7 +4831,7 @@ mod tests {
         });
 
         let tempdir = TempDir::new().unwrap();
-        let session = spawn_go_cli_shell_with_pty(
+        let Some(session) = spawn_go_cli_shell_with_pty(
             tempdir.path(),
             &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
             &private_key_path,
@@ -4496,7 +4842,11 @@ mod tests {
                 pixel_height: 480,
             },
         )
-        .await;
+        .await
+        else {
+            skip_interop("real_go_client_signal_round_trips_against_the_rust_server");
+            return;
+        };
         session.write_all("stty size\n").await;
         session.wait_for_output_fragment("24 80").await;
         session
@@ -4543,7 +4893,7 @@ mod tests {
         let log_path = tempdir.path().join("go-server.log");
         let (remote_addr, echo_task) = spawn_tcp_echo_server().await;
 
-        let mut server = spawn_go_cli_server(
+        let Some(mut server) = spawn_go_cli_server(
             &bind_addr,
             &fixture.username,
             &home_dir,
@@ -4551,9 +4901,13 @@ mod tests {
             &key_path,
             &log_path,
         )
-        .await;
+        .await
+        else {
+            skip_interop("rust_client_tcp_forwarding_round_trips_against_the_real_go_server");
+            return;
+        };
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!(
                 "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
                 fixture.username
@@ -4561,7 +4915,7 @@ mod tests {
             .parse()
             .unwrap(),
         );
-        config.trust = TrustStrategy::Insecure;
+        config.trust = Ssh3TrustStrategy::Insecure;
         config.username = Some(fixture.username.clone());
         config.identity_file = Some(fixture.private_key_path.clone());
 
@@ -4610,7 +4964,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
@@ -4620,7 +4974,7 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let local_port = reserve_tcp_port();
         let log_path = tempdir.path().join("go-client-forward.log");
-        let mut forwarder = spawn_go_cli_tcp_forwarder(
+        let Some(mut forwarder) = spawn_go_cli_tcp_forwarder(
             tempdir.path(),
             &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
             &private_key_path,
@@ -4628,7 +4982,11 @@ mod tests {
             remote_addr,
             &log_path,
         )
-        .await;
+        .await
+        else {
+            skip_interop("real_go_client_tcp_forwarding_round_trips_against_the_rust_server");
+            return;
+        };
 
         let mut stream = TcpStream::connect(SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::LOCALHOST,
@@ -4683,7 +5041,7 @@ mod tests {
         let log_path = tempdir.path().join("go-server.log");
         let (remote_addr, echo_task) = spawn_udp_echo_server().await;
 
-        let mut server = spawn_go_cli_server(
+        let Some(mut server) = spawn_go_cli_server(
             &bind_addr,
             &fixture.username,
             &home_dir,
@@ -4691,9 +5049,13 @@ mod tests {
             &key_path,
             &log_path,
         )
-        .await;
+        .await
+        else {
+            skip_interop("rust_client_udp_forwarding_round_trips_against_the_real_go_server");
+            return;
+        };
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!(
                 "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
                 fixture.username
@@ -4701,7 +5063,7 @@ mod tests {
             .parse()
             .unwrap(),
         );
-        config.trust = TrustStrategy::Insecure;
+        config.trust = Ssh3TrustStrategy::Insecure;
         config.username = Some(fixture.username.clone());
         config.identity_file = Some(fixture.private_key_path.clone());
 
@@ -4750,7 +5112,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
@@ -4760,7 +5122,7 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let local_port = reserve_udp_port();
         let log_path = tempdir.path().join("go-client-forward.log");
-        let mut forwarder = spawn_go_cli_udp_forwarder(
+        let Some(mut forwarder) = spawn_go_cli_udp_forwarder(
             tempdir.path(),
             &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
             &private_key_path,
@@ -4768,7 +5130,11 @@ mod tests {
             remote_addr,
             &log_path,
         )
-        .await;
+        .await
+        else {
+            skip_interop("real_go_client_udp_forwarding_round_trips_against_the_rust_server");
+            return;
+        };
 
         let socket =
             TokioUdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
@@ -4831,7 +5197,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
@@ -4844,14 +5210,14 @@ mod tests {
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!("https://localhost:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
-        config.agent = Some(super::AgentSelection::First);
+        config.agent = Some(super::Ssh3AgentSelection::First);
         config.agent_socket = Some(agent.socket_path.clone());
 
         let session = tokio::time::timeout(
@@ -4864,7 +5230,7 @@ mod tests {
 
         assert_eq!(
             session,
-            CapturedSession {
+            Ssh3CapturedSession {
                 server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated via agent\n".to_vec(),
@@ -4903,7 +5269,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
@@ -4916,14 +5282,14 @@ mod tests {
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!("https://localhost:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
-        config.agent = Some(super::AgentSelection::PublicKey(private_key_path));
+        config.agent = Some(super::Ssh3AgentSelection::PublicKey(private_key_path));
         config.agent_socket = Some(agent.socket_path.clone());
 
         let session = tokio::time::timeout(
@@ -4936,7 +5302,7 @@ mod tests {
 
         assert_eq!(
             session,
-            CapturedSession {
+            Ssh3CapturedSession {
                 server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated via rsa agent\n".to_vec(),
@@ -4951,6 +5317,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn forward_agent_exposes_remote_ssh_auth_sock_and_proxies_requests() {
+        let _agent_socket_guard = lock_agent_socket_tests();
         let agent = spawn_mock_agent(auth_private_key(AuthKeyAlgorithm::Ed25519)).await;
         let (server_config, server_certificate) =
             self_signed_server_config(vec!["localhost".to_string()]).unwrap();
@@ -4972,26 +5339,26 @@ mod tests {
                 .unwrap();
             tokio::time::timeout(
                 Duration::from_secs(10),
-                serve_connection(connection, ServerConfig::default()),
+                serve_connection(connection, Ssh3ServerConfig::default()),
             )
             .await
             .unwrap()
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!("https://localhost:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
         config.forward_agent = true;
         config.agent_socket = Some(agent.socket_path.clone());
 
         let client = connect_client(&config).await.unwrap();
         let channel = client.open_session_channel().await.unwrap();
         let request =
-            SessionRequest::Exec("printf '%s\\n' \"$SSH_AUTH_SOCK\"; sleep 2".to_string());
+            Ssh3SessionRequest::Exec("printf '%s\\n' \"$SSH_AUTH_SOCK\"; sleep 2".to_string());
         send_forward_agent_request(channel.as_ref()).await.unwrap();
         let session_runtime =
             build_session_runtime(&client, &config, channel.clone(), &request, None).unwrap();
@@ -5013,12 +5380,12 @@ mod tests {
 
         loop {
             match channel.next_message().await.unwrap() {
-                Message::ChannelRequest(message) => match message.request {
-                    ChannelRequest::ExitStatus(status) => {
+                Ssh3Message::ChannelRequest(message) => match message.request {
+                    Ssh3ChannelRequest::ExitStatus(status) => {
                         assert_eq!(status.exit_status, 0);
                         break;
                     }
-                    ChannelRequest::ExitSignal(signal) => {
+                    Ssh3ChannelRequest::ExitSignal(signal) => {
                         panic!("unexpected exit signal: {signal:?}")
                     }
                     _ => {}
@@ -5035,6 +5402,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn forward_agent_survives_multiple_remote_connections_in_one_session() {
+        let _agent_socket_guard = lock_agent_socket_tests();
         let agent = spawn_mock_agent(auth_private_key(AuthKeyAlgorithm::Ed25519)).await;
         let (server_config, server_certificate) =
             self_signed_server_config(vec!["localhost".to_string()]).unwrap();
@@ -5056,26 +5424,26 @@ mod tests {
                 .unwrap();
             tokio::time::timeout(
                 Duration::from_secs(10),
-                serve_connection(connection, ServerConfig::default()),
+                serve_connection(connection, Ssh3ServerConfig::default()),
             )
             .await
             .unwrap()
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!("https://localhost:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
         config.forward_agent = true;
         config.agent_socket = Some(agent.socket_path.clone());
 
         let client = connect_client(&config).await.unwrap();
         let channel = client.open_session_channel().await.unwrap();
         let request =
-            SessionRequest::Exec("printf '%s\\n' \"$SSH_AUTH_SOCK\"; sleep 3".to_string());
+            Ssh3SessionRequest::Exec("printf '%s\\n' \"$SSH_AUTH_SOCK\"; sleep 3".to_string());
         send_forward_agent_request(channel.as_ref()).await.unwrap();
         let session_runtime =
             build_session_runtime(&client, &config, channel.clone(), &request, None).unwrap();
@@ -5104,12 +5472,12 @@ mod tests {
 
         loop {
             match channel.next_message().await.unwrap() {
-                Message::ChannelRequest(message) => match message.request {
-                    ChannelRequest::ExitStatus(status) => {
+                Ssh3Message::ChannelRequest(message) => match message.request {
+                    Ssh3ChannelRequest::ExitStatus(status) => {
                         assert_eq!(status.exit_status, 0);
                         break;
                     }
-                    ChannelRequest::ExitSignal(signal) => {
+                    Ssh3ChannelRequest::ExitSignal(signal) => {
                         panic!("unexpected exit signal: {signal:?}")
                     }
                     _ => {}
@@ -5144,7 +5512,7 @@ mod tests {
         let key_path = tempdir.path().join("key.pem");
         let log_path = tempdir.path().join("go-server.log");
 
-        let mut server = spawn_go_cli_server(
+        let Some(mut server) = spawn_go_cli_server(
             &bind_addr,
             &fixture.username,
             &home_dir,
@@ -5152,9 +5520,13 @@ mod tests {
             &key_path,
             &log_path,
         )
-        .await;
+        .await
+        else {
+            skip_interop("rust_client_forward_agent_round_trips_against_the_real_go_server");
+            return;
+        };
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!(
                 "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
                 fixture.username
@@ -5162,7 +5534,7 @@ mod tests {
             .parse()
             .unwrap(),
         );
-        config.trust = TrustStrategy::Insecure;
+        config.trust = Ssh3TrustStrategy::Insecure;
         config.username = Some(fixture.username.clone());
         config.identity_file = Some(fixture.private_key_path.clone());
         config.forward_agent = true;
@@ -5171,7 +5543,7 @@ mod tests {
         let client = connect_client(&config).await.unwrap();
         let channel = client.open_session_channel().await.unwrap();
         let request =
-            SessionRequest::Exec("printf '%s\\n' \"$SSH_AUTH_SOCK\"; sleep 2".to_string());
+            Ssh3SessionRequest::Exec("printf '%s\\n' \"$SSH_AUTH_SOCK\"; sleep 2".to_string());
         send_forward_agent_request(channel.as_ref()).await.unwrap();
         let session_runtime =
             build_session_runtime(&client, &config, channel.clone(), &request, None).unwrap();
@@ -5184,13 +5556,13 @@ mod tests {
             Ok(Err(err)) => {
                 let logs = fs::read_to_string(&log_path).unwrap_or_default();
                 panic!(
-                    "failed to read forwarded SSH_AUTH_SOCK from real Go server: {err}\nlogs:\n{logs}"
+                    "failed to read forwarded SSH_AUTH_SOCK from the real Go counterpart server: {err}\nlogs:\n{logs}"
                 );
             }
             Err(_) => {
                 let logs = fs::read_to_string(&log_path).unwrap_or_default();
                 panic!(
-                    "timed out reading forwarded SSH_AUTH_SOCK from real Go server\nlogs:\n{logs}"
+                    "timed out reading forwarded SSH_AUTH_SOCK from the real Go counterpart server\nlogs:\n{logs}"
                 );
             }
         };
@@ -5205,12 +5577,12 @@ mod tests {
 
         loop {
             match channel.next_message().await.unwrap() {
-                Message::ChannelRequest(message) => match message.request {
-                    ChannelRequest::ExitStatus(status) => {
+                Ssh3Message::ChannelRequest(message) => match message.request {
+                    Ssh3ChannelRequest::ExitStatus(status) => {
                         assert_eq!(status.exit_status, 0);
                         break;
                     }
-                    ChannelRequest::ExitSignal(signal) => {
+                    Ssh3ChannelRequest::ExitSignal(signal) => {
                         panic!("unexpected exit signal: {signal:?}")
                     }
                     _ => {}
@@ -5230,7 +5602,10 @@ mod tests {
     async fn go_agent_probe_talks_to_mock_agent_locally() {
         let _guard = lock_go_binary_tests();
         let agent = spawn_mock_agent(auth_private_key(AuthKeyAlgorithm::Ed25519)).await;
-        let probe = go_agent_probe_binary();
+        let Some(probe) = go_agent_probe_binary() else {
+            skip_interop("go_agent_probe_talks_to_mock_agent_locally");
+            return;
+        };
 
         let output = timeout(
             Duration::from_secs(10),
@@ -5258,8 +5633,12 @@ mod tests {
     #[tokio::test]
     async fn real_go_client_forward_agent_round_trips_against_the_rust_server() {
         let _guard = lock_go_binary_tests();
+        let _agent_socket_guard = lock_agent_socket_tests();
         let agent = spawn_mock_agent(auth_private_key(AuthKeyAlgorithm::Ed25519)).await;
-        let probe = go_agent_probe_binary();
+        let Some(probe) = go_agent_probe_binary() else {
+            skip_interop("real_go_client_forward_agent_round_trips_against_the_rust_server");
+            return;
+        };
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let authorized_identities_path = fixture.authorized_identities_path.clone();
         let username = fixture.username.clone();
@@ -5282,7 +5661,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
@@ -5290,14 +5669,18 @@ mod tests {
         });
 
         let tempdir = TempDir::new().unwrap();
-        let output = run_go_cli_client_with_forwarded_agent(
+        let Some(output) = run_go_cli_client_with_forwarded_agent(
             tempdir.path(),
             &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
             &private_key_path,
             agent.socket_path.as_path(),
             &[probe.path.to_string_lossy().as_ref()],
         )
-        .await;
+        .await
+        else {
+            skip_interop("real_go_client_forward_agent_round_trips_against_the_rust_server");
+            return;
+        };
 
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -5342,7 +5725,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
@@ -5355,12 +5738,12 @@ mod tests {
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!("https://localhost:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
         let client = connect_client_with_authorization_builder(&config, |conversation_id| {
             bearer_authorization_value(
@@ -5374,7 +5757,7 @@ mod tests {
             run_capture_on_client(
                 &client,
                 &config,
-                SessionRequest::Exec("printf 'authenticated via oidc\\n'".to_string()),
+                Ssh3SessionRequest::Exec("printf 'authenticated via oidc\\n'".to_string()),
             ),
         )
         .await
@@ -5384,7 +5767,7 @@ mod tests {
 
         assert_eq!(
             session,
-            CapturedSession {
+            Ssh3CapturedSession {
                 server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated via oidc\n".to_vec(),
@@ -5420,7 +5803,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.require_authentication = true;
             config.authorized_identity_paths = vec![authorized_identities_path.clone()];
             config.default_user = Some("does-not-exist".to_string());
@@ -5433,14 +5816,14 @@ mod tests {
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!("https://localhost:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
-        config.oidc = Some(OidcConfig {
+        config.oidc = Some(Ssh3OidcConfig {
             issuer_url,
             client_id,
             client_secret: None,
@@ -5461,7 +5844,7 @@ mod tests {
 
         assert_eq!(
             session,
-            CapturedSession {
+            Ssh3CapturedSession {
                 server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated via oidc login\n".to_vec(),
@@ -5505,7 +5888,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
+            let mut config = Ssh3ServerConfig::default();
             config.enable_password_login = true;
             config.default_user = Some("does-not-exist".to_string());
             config.password_verifier =
@@ -5522,12 +5905,12 @@ mod tests {
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
+        let mut config = Ssh3ClientConfig::new(
             format!("https://localhost:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
         config.password = Some(password);
 
@@ -5541,7 +5924,7 @@ mod tests {
 
         assert_eq!(
             session,
-            CapturedSession {
+            Ssh3CapturedSession {
                 server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated via password\n".to_vec(),
@@ -5558,7 +5941,7 @@ mod tests {
         let channel = client.open_session_channel().await.unwrap();
         send_initial_session_requests(
             channel.as_ref(),
-            &SessionRequest::Shell,
+            &Ssh3SessionRequest::Shell,
             Some(&LocalTerminalInfo {
                 term: Some("xterm-256color".to_string()),
                 size: TerminalSize {
@@ -5574,8 +5957,8 @@ mod tests {
 
         let messages = server_task.await.unwrap();
         match &messages[0] {
-            Message::ChannelRequest(message) => match &message.request {
-                ChannelRequest::Pty(request) => {
+            Ssh3Message::ChannelRequest(message) => match &message.request {
+                Ssh3ChannelRequest::Pty(request) => {
                     assert_eq!(request.term, b"xterm-256color".to_vec());
                     assert_eq!(request.char_width, 80);
                     assert_eq!(request.char_height, 24);
@@ -5587,8 +5970,8 @@ mod tests {
             other => panic!("expected channel request, got {other:?}"),
         }
         match &messages[1] {
-            Message::ChannelRequest(message) => {
-                assert!(matches!(message.request, ChannelRequest::Shell));
+            Ssh3Message::ChannelRequest(message) => {
+                assert!(matches!(message.request, Ssh3ChannelRequest::Shell));
             }
             other => panic!("expected channel request, got {other:?}"),
         }
@@ -5614,8 +5997,8 @@ mod tests {
 
         let messages = server_task.await.unwrap();
         match &messages[0] {
-            Message::ChannelRequest(message) => match &message.request {
-                ChannelRequest::WindowChange(request) => {
+            Ssh3Message::ChannelRequest(message) => match &message.request {
+                Ssh3ChannelRequest::WindowChange(request) => {
                     assert_eq!(request.char_width, 101);
                     assert_eq!(request.char_height, 33);
                 }
@@ -5635,8 +6018,8 @@ mod tests {
 
         let messages = server_task.await.unwrap();
         match &messages[0] {
-            Message::ChannelRequest(message) => match &message.request {
-                ChannelRequest::Signal(request) => {
+            Ssh3Message::ChannelRequest(message) => match &message.request {
+                Ssh3ChannelRequest::Signal(request) => {
                     assert_eq!(request.signal_name_without_sig, b"TERM".to_vec());
                 }
                 other => panic!("expected signal request, got {other:?}"),

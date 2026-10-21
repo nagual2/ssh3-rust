@@ -3,14 +3,14 @@ use std::io;
 use async_trait::async_trait;
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendDatagramError, VarInt, WriteError};
-use ssh3_core::{DatagramSender, ReceiveStream, SendStream};
+use ssh3_core::{Ssh3DatagramSender, Ssh3ReceiveStream, Ssh3SendStream};
 
 #[derive(Clone, Debug)]
-pub struct QuinnDatagramSender {
+pub struct Ssh3QuinnDatagramSender {
     connection: Connection,
 }
 
-impl QuinnDatagramSender {
+impl Ssh3QuinnDatagramSender {
     pub fn new(connection: Connection) -> Self {
         Self { connection }
     }
@@ -21,7 +21,7 @@ impl QuinnDatagramSender {
 }
 
 #[async_trait]
-impl DatagramSender for QuinnDatagramSender {
+impl Ssh3DatagramSender for Ssh3QuinnDatagramSender {
     async fn send_datagram(&self, datagram: Vec<u8>) -> io::Result<()> {
         self.connection
             .send_datagram_wait(Bytes::from(datagram))
@@ -31,11 +31,11 @@ impl DatagramSender for QuinnDatagramSender {
 }
 
 #[derive(Debug)]
-pub struct QuinnReceiveStream {
+pub struct Ssh3QuinnReceiveStream {
     inner: RecvStream,
 }
 
-impl QuinnReceiveStream {
+impl Ssh3QuinnReceiveStream {
     pub fn new(inner: RecvStream) -> Self {
         Self { inner }
     }
@@ -50,7 +50,7 @@ impl QuinnReceiveStream {
 }
 
 #[async_trait]
-impl ReceiveStream for QuinnReceiveStream {
+impl Ssh3ReceiveStream for Ssh3QuinnReceiveStream {
     async fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
         self.inner
             .read_exact(buf)
@@ -65,11 +65,11 @@ impl ReceiveStream for QuinnReceiveStream {
 }
 
 #[derive(Debug)]
-pub struct QuinnSendStream {
+pub struct Ssh3QuinnSendStream {
     inner: quinn::SendStream,
 }
 
-impl QuinnSendStream {
+impl Ssh3QuinnSendStream {
     pub fn new(inner: quinn::SendStream) -> Self {
         Self { inner }
     }
@@ -84,7 +84,7 @@ impl QuinnSendStream {
 }
 
 #[async_trait]
-impl SendStream for QuinnSendStream {
+impl Ssh3SendStream for Ssh3QuinnSendStream {
     async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         self.inner.write_all(buf).await.map_err(io::Error::from)
     }

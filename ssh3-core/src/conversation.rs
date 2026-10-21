@@ -1,3 +1,9 @@
+//! The conversation: the registry of the channels of one SSH3 session.
+//!
+//! A conversation owns the channels that were opened on it, confirms the
+//! channels the peer opens and routes the datagrams to the channel they
+//! belong to.
+
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Cursor;
@@ -6,22 +12,30 @@ use std::sync::{Arc, Mutex};
 
 use ssh3_proto::{append_var_int, build_forwarding_additional_bytes, read_var_int};
 
-use crate::channel::{AcceptedChannel, Channel, ChannelError};
-use crate::queue::{AcceptQueue, DatagramQueue};
-use crate::transport::{DatagramSender, ReceiveStream, SendStream};
+use crate::channel::{Ssh3AcceptedChannel, Ssh3Channel, Ssh3ChannelError};
+use crate::queue::{Ssh3AcceptQueue, Ssh3DatagramQueue};
+use crate::transport::{Ssh3DatagramSender, Ssh3ReceiveStream, Ssh3SendStream};
 
-pub type ConversationId = [u8; 32];
+/// Identifier of a conversation: 32 bytes chosen by the client.
+pub type Ssh3ConversationId = [u8; 32];
 
 const DANGLING_DATAGRAM_QUEUE_SIZE: usize = 10;
 
+/// Everything that can fail while a conversation is used.
 #[derive(Debug)]
-pub enum ConversationError {
-    Channel(ChannelError),
-    Proto(ssh3_proto::Error),
-    ChannelNotFound { channel_id: u64 },
+pub enum Ssh3ConversationError {
+    /// The channel failed.
+    Channel(Ssh3ChannelError),
+    /// The peer sent a message that could not be decoded.
+    Proto(ssh3_proto::Ssh3Error),
+    /// A datagram arrived for a channel that does not exist.
+    ChannelNotFound {
+        /// Id of the channel the datagram was addressed to.
+        channel_id: u64,
+    },
 }
 
-impl fmt::Display for ConversationError {
+impl fmt::Display for Ssh3ConversationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Channel(err) => write!(f, "{err}"),
@@ -31,7 +45,7 @@ impl fmt::Display for ConversationError {
     }
 }
 
-impl std::error::Error for ConversationError {
+impl std::error::Error for Ssh3ConversationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Channel(err) => Some(err),
@@ -41,30 +55,36 @@ impl std::error::Error for ConversationError {
     }
 }
 
-impl From<ChannelError> for ConversationError {
-    fn from(value: ChannelError) -> Self {
+impl From<Ssh3ChannelError> for Ssh3ConversationError {
+    fn from(value: Ssh3ChannelError) -> Self {
         Self::Channel(value)
     }
 }
 
-impl From<ssh3_proto::Error> for ConversationError {
-    fn from(value: ssh3_proto::Error) -> Self {
+impl From<ssh3_proto::Ssh3Error> for Ssh3ConversationError {
+    fn from(value: ssh3_proto::Ssh3Error) -> Self {
         Self::Proto(value)
     }
 }
 
+/// Sends the datagrams of a single channel of a conversation.
+///
+/// Every datagram is prefixed with the id of the conversation stream and the
+/// id of the channel, so that the peer can route it to the right channel.
 #[derive(Clone)]
-pub struct ConversationDatagramSender {
+pub struct Ssh3ConversationDatagramSender {
     control_stream_id: u64,
     channel_id: u64,
-    message_sender: Arc<dyn DatagramSender>,
+    message_sender: Arc<dyn Ssh3DatagramSender>,
 }
 
-impl ConversationDatagramSender {
+impl Ssh3ConversationDatagramSender {
+    /// Creates a sender for the channel `channel_id` of the conversation
+    /// `control_stream_id`.
     pub fn new(
         control_stream_id: u64,
         channel_id: u64,
-        message_sender: Arc<dyn DatagramSender>,
+        message_sender: Arc<dyn Ssh3DatagramSender>,
     ) -> Self {
         Self {
             control_stream_id,
@@ -73,6 +93,7 @@ impl ConversationDatagramSender {
         }
     }
 
+    /// Sends one datagram, prefixed with the addresses of the channel.
     pub async fn send(&self, datagram: Vec<u8>) -> std::io::Result<()> {
         let mut buf = Vec::new();
         append_var_int(&mut buf, self.control_stream_id);
@@ -82,23 +103,33 @@ impl ConversationDatagramSender {
     }
 }
 
-pub struct Conversation {
+/// The set of channels that belong to one SSH3 session.
+///
+/// The conversation opens the channels of the local side, accepts and
+/// confirms the channels opened by the peer, and dispatches the datagrams
+/// to the channel they are addressed to.
+pub struct Ssh3Conversation {
     control_stream_id: u64,
-    conversation_id: ConversationId,
+    conversation_id: Ssh3ConversationId,
     max_packet_size: u64,
     default_datagrams_queue_size: usize,
-    message_sender: Arc<dyn DatagramSender>,
+    message_sender: Arc<dyn Ssh3DatagramSender>,
     channels_manager: ChannelsManager,
-    channels_accept_queue: AcceptQueue<AcceptedChannel>,
+    channels_accept_queue: Ssh3AcceptQueue<Ssh3AcceptedChannel>,
 }
 
-impl Conversation {
+impl Ssh3Conversation {
+    /// Creates a conversation.
+    ///
+    /// `max_packet_size` is the size announced to the peer when a channel is
+    /// confirmed, `default_datagrams_queue_size` the capacity of the datagram
+    /// queue of a channel that does not request one.
     pub fn new(
         control_stream_id: u64,
-        conversation_id: ConversationId,
+        conversation_id: Ssh3ConversationId,
         max_packet_size: u64,
         default_datagrams_queue_size: usize,
-        message_sender: Arc<dyn DatagramSender>,
+        message_sender: Arc<dyn Ssh3DatagramSender>,
     ) -> Self {
         Self {
             control_stream_id,
@@ -107,10 +138,14 @@ impl Conversation {
             default_datagrams_queue_size,
             message_sender,
             channels_manager: ChannelsManager::new(),
-            channels_accept_queue: AcceptQueue::new(),
+            channels_accept_queue: Ssh3AcceptQueue::new(),
         }
     }
 
+    /// Opens a channel of the local side.
+    ///
+    /// The channel is registered immediately and is not confirmed: the
+    /// confirmation is sent by the caller.
     pub fn open_channel<R, W>(
         &self,
         stream_id: u64,
@@ -119,12 +154,12 @@ impl Conversation {
         datagrams_queue_size: usize,
         recv: R,
         send: W,
-    ) -> Arc<Channel>
+    ) -> Arc<Ssh3Channel>
     where
-        R: ReceiveStream + 'static,
-        W: SendStream + 'static,
+        R: Ssh3ReceiveStream + 'static,
+        W: Ssh3SendStream + 'static,
     {
-        let channel = Arc::new(Channel::new(
+        let channel = Arc::new(Ssh3Channel::new(
             self.control_stream_id,
             self.conversation_id,
             stream_id,
@@ -143,14 +178,22 @@ impl Conversation {
         channel
     }
 
-    pub fn datagram_sender_for_channel(&self, channel_id: u64) -> Arc<ConversationDatagramSender> {
-        Arc::new(ConversationDatagramSender::new(
+    /// Returns the datagram sender of the channel `channel_id`.
+    pub fn datagram_sender_for_channel(
+        &self,
+        channel_id: u64,
+    ) -> Arc<Ssh3ConversationDatagramSender> {
+        Arc::new(Ssh3ConversationDatagramSender::new(
             self.control_stream_id,
             channel_id,
             self.message_sender.clone(),
         ))
     }
 
+    /// Opens a channel that forwards datagrams to `remote_addr`.
+    ///
+    /// The target address is written into the channel header and the header is
+    /// sent immediately.
     pub async fn open_udp_forwarding_channel<R, W>(
         &self,
         stream_id: u64,
@@ -159,12 +202,12 @@ impl Conversation {
         remote_addr: SocketAddr,
         recv: R,
         send: W,
-    ) -> Result<Arc<Channel>, ConversationError>
+    ) -> Result<Arc<Ssh3Channel>, Ssh3ConversationError>
     where
-        R: ReceiveStream + 'static,
-        W: SendStream + 'static,
+        R: Ssh3ReceiveStream + 'static,
+        W: Ssh3SendStream + 'static,
     {
-        let channel = Arc::new(Channel::new(
+        let channel = Arc::new(Ssh3Channel::new(
             self.control_stream_id,
             self.conversation_id,
             stream_id,
@@ -187,6 +230,10 @@ impl Conversation {
         Ok(channel)
     }
 
+    /// Opens a channel that forwards a byte stream to `remote_addr`.
+    ///
+    /// The target address is written into the channel header and the header is
+    /// sent immediately.
     pub async fn open_tcp_forwarding_channel<R, W>(
         &self,
         stream_id: u64,
@@ -195,12 +242,12 @@ impl Conversation {
         remote_addr: SocketAddr,
         recv: R,
         send: W,
-    ) -> Result<Arc<Channel>, ConversationError>
+    ) -> Result<Arc<Ssh3Channel>, Ssh3ConversationError>
     where
-        R: ReceiveStream + 'static,
-        W: SendStream + 'static,
+        R: Ssh3ReceiveStream + 'static,
+        W: Ssh3SendStream + 'static,
     {
-        let channel = Arc::new(Channel::new(
+        let channel = Arc::new(Ssh3Channel::new(
             self.control_stream_id,
             self.conversation_id,
             stream_id,
@@ -223,29 +270,42 @@ impl Conversation {
         Ok(channel)
     }
 
-    pub fn queue_incoming_channel(&self, channel: Arc<Channel>) {
+    /// Queues a channel that the peer opened, without metadata.
+    pub fn queue_incoming_channel(&self, channel: Arc<Ssh3Channel>) {
         self.queue_incoming_accepted_channel(channel.into());
     }
 
-    pub fn queue_incoming_accepted_channel(&self, channel: AcceptedChannel) {
+    /// Queues a channel that the peer opened.
+    ///
+    /// The channel is confirmed when it is accepted.
+    pub fn queue_incoming_accepted_channel(&self, channel: Ssh3AcceptedChannel) {
         self.channels_accept_queue.add(channel);
     }
 
-    pub async fn accept_channel(&self) -> Result<Arc<Channel>, ConversationError> {
+    /// Waits for a channel opened by the peer and confirms it.
+    pub async fn accept_channel(&self) -> Result<Arc<Ssh3Channel>, Ssh3ConversationError> {
         Ok(self.accept_channel_with_metadata().await?.into_channel())
     }
 
-    pub async fn accept_channel_with_metadata(&self) -> Result<AcceptedChannel, ConversationError> {
-        loop {
-            if let Some(channel) = self.channels_accept_queue.next() {
-                return self.confirm_and_register_channel(channel).await;
-            }
-            let channel = self.channels_accept_queue.wait_next().await;
+    /// Waits for a channel opened by the peer, confirms it and returns the
+    /// metadata of the channel.
+    pub async fn accept_channel_with_metadata(
+        &self,
+    ) -> Result<Ssh3AcceptedChannel, Ssh3ConversationError> {
+        if let Some(channel) = self.channels_accept_queue.next() {
             return self.confirm_and_register_channel(channel).await;
         }
+        let channel = self.channels_accept_queue.wait_next().await;
+        self.confirm_and_register_channel(channel).await
     }
 
-    pub async fn add_datagram(&self, datagram: &[u8]) -> Result<(), ConversationError> {
+    /// Routes a datagram to the channel it is addressed to.
+    ///
+    /// The datagram starts with the id of the channel. When the channel is
+    /// not known yet, the datagram is parked in a dangling queue and handed
+    /// over as soon as the channel appears; the error
+    /// [`Ssh3ConversationError::ChannelNotFound`] is returned in that case.
+    pub async fn add_datagram(&self, datagram: &[u8]) -> Result<(), Ssh3ConversationError> {
         let mut cursor = Cursor::new(datagram);
         let channel_id = read_var_int(&mut cursor)?;
         let offset = cursor.position() as usize;
@@ -256,29 +316,32 @@ impl Conversation {
             return Ok(());
         }
 
-        let queue = Arc::new(DatagramQueue::new(DANGLING_DATAGRAM_QUEUE_SIZE));
+        let queue = Arc::new(Ssh3DatagramQueue::new(DANGLING_DATAGRAM_QUEUE_SIZE));
         let _ = queue.add(payload);
         self.channels_manager
             .add_dangling_datagrams_queue(channel_id, queue);
-        Err(ConversationError::ChannelNotFound { channel_id })
+        Err(Ssh3ConversationError::ChannelNotFound { channel_id })
     }
 
+    /// Returns the id of the stream the conversation runs on.
     pub fn control_stream_id(&self) -> u64 {
         self.control_stream_id
     }
 
-    pub fn conversation_id(&self) -> ConversationId {
+    /// Returns the id of the conversation.
+    pub fn conversation_id(&self) -> Ssh3ConversationId {
         self.conversation_id
     }
 
+    /// Returns the capacity of the datagram queue used for new channels.
     pub fn default_datagrams_queue_size(&self) -> usize {
         self.default_datagrams_queue_size
     }
 
     async fn confirm_and_register_channel(
         &self,
-        channel: AcceptedChannel,
-    ) -> Result<AcceptedChannel, ConversationError> {
+        channel: Ssh3AcceptedChannel,
+    ) -> Result<Ssh3AcceptedChannel, Ssh3ConversationError> {
         let inner = channel.channel().clone();
         inner.confirm_channel(self.max_packet_size).await?;
         self.channels_manager.add_channel(inner);
@@ -288,8 +351,8 @@ impl Conversation {
 
 #[derive(Default)]
 struct ChannelsState {
-    channels: HashMap<u64, Arc<Channel>>,
-    dangling_datagram_queues: HashMap<u64, Arc<DatagramQueue>>,
+    channels: HashMap<u64, Arc<Ssh3Channel>>,
+    dangling_datagram_queues: HashMap<u64, Arc<Ssh3DatagramQueue>>,
 }
 
 struct ChannelsManager {
@@ -303,7 +366,7 @@ impl ChannelsManager {
         }
     }
 
-    fn add_channel(&self, channel: Arc<Channel>) {
+    fn add_channel(&self, channel: Arc<Ssh3Channel>) {
         let pending_queue = {
             let mut state = self.state.lock().unwrap();
             let pending_queue = state.dangling_datagram_queues.remove(&channel.channel_id());
@@ -316,7 +379,7 @@ impl ChannelsManager {
         }
     }
 
-    fn add_dangling_datagrams_queue(&self, channel_id: u64, queue: Arc<DatagramQueue>) {
+    fn add_dangling_datagrams_queue(&self, channel_id: u64, queue: Arc<Ssh3DatagramQueue>) {
         let existing_channel = {
             let mut state = self.state.lock().unwrap();
             if let Some(channel) = state.channels.get(&channel_id) {
@@ -336,7 +399,7 @@ impl ChannelsManager {
         }
     }
 
-    fn get_channel(&self, channel_id: u64) -> Option<Arc<Channel>> {
+    fn get_channel(&self, channel_id: u64) -> Option<Arc<Ssh3Channel>> {
         self.state
             .lock()
             .unwrap()
@@ -351,10 +414,10 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::sync::Arc;
 
-    use ssh3_proto::{ChannelOpenConfirmationMessage, Message};
+    use ssh3_proto::{Ssh3ChannelOpenConfirmationMessage, Ssh3Message};
 
-    use super::{Conversation, ConversationError};
-    use crate::channel::{AcceptedChannel, Channel};
+    use super::{Ssh3Conversation, Ssh3ConversationError};
+    use crate::channel::{Ssh3AcceptedChannel, Ssh3Channel};
     use crate::transport::testutil::{
         BytesReceiveStream, RecordingDatagramSender, RecordingSendStream,
     };
@@ -366,10 +429,10 @@ mod tests {
     #[tokio::test]
     async fn accept_channel_confirms_and_registers_channel() {
         let sender = Arc::new(RecordingDatagramSender::default());
-        let conversation = Conversation::new(10, conversation_id(), 2048, 8, sender);
+        let conversation = Ssh3Conversation::new(10, conversation_id(), 2048, 8, sender);
         let (recv, _) = BytesReceiveStream::new(Vec::new());
         let (send, handle) = RecordingSendStream::new();
-        let incoming = Arc::new(Channel::new(
+        let incoming = Arc::new(Ssh3Channel::new(
             10,
             conversation_id(),
             42,
@@ -391,7 +454,7 @@ mod tests {
         assert!(Arc::ptr_eq(&accepted, &incoming));
         assert_eq!(
             handle.bytes(),
-            Message::ChannelOpenConfirmation(ChannelOpenConfirmationMessage {
+            Ssh3Message::ChannelOpenConfirmation(Ssh3ChannelOpenConfirmationMessage {
                 max_packet_size: 2048,
             })
             .to_vec()
@@ -401,10 +464,10 @@ mod tests {
     #[tokio::test]
     async fn accept_channel_with_metadata_preserves_udp_forwarding_target() {
         let sender = Arc::new(RecordingDatagramSender::default());
-        let conversation = Conversation::new(10, conversation_id(), 2048, 8, sender);
+        let conversation = Ssh3Conversation::new(10, conversation_id(), 2048, 8, sender);
         let (recv, _) = BytesReceiveStream::new(Vec::new());
         let (send, handle) = RecordingSendStream::new();
-        let incoming = Arc::new(Channel::new(
+        let incoming = Arc::new(Ssh3Channel::new(
             10,
             conversation_id(),
             42,
@@ -421,14 +484,14 @@ mod tests {
         ));
         let remote_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 443));
 
-        conversation.queue_incoming_accepted_channel(AcceptedChannel::UdpForwarding {
+        conversation.queue_incoming_accepted_channel(Ssh3AcceptedChannel::UdpForwarding {
             channel: incoming.clone(),
             remote_addr,
         });
         let accepted = conversation.accept_channel_with_metadata().await.unwrap();
 
         match accepted {
-            AcceptedChannel::UdpForwarding {
+            Ssh3AcceptedChannel::UdpForwarding {
                 channel,
                 remote_addr: accepted_remote_addr,
             } => {
@@ -439,7 +502,7 @@ mod tests {
         }
         assert_eq!(
             handle.bytes(),
-            Message::ChannelOpenConfirmation(ChannelOpenConfirmationMessage {
+            Ssh3Message::ChannelOpenConfirmation(Ssh3ChannelOpenConfirmationMessage {
                 max_packet_size: 2048,
             })
             .to_vec()
@@ -449,10 +512,10 @@ mod tests {
     #[tokio::test]
     async fn accept_channel_with_metadata_preserves_tcp_forwarding_target() {
         let sender = Arc::new(RecordingDatagramSender::default());
-        let conversation = Conversation::new(10, conversation_id(), 2048, 8, sender);
+        let conversation = Ssh3Conversation::new(10, conversation_id(), 2048, 8, sender);
         let (recv, _) = BytesReceiveStream::new(Vec::new());
         let (send, handle) = RecordingSendStream::new();
-        let incoming = Arc::new(Channel::new(
+        let incoming = Arc::new(Ssh3Channel::new(
             10,
             conversation_id(),
             42,
@@ -469,14 +532,14 @@ mod tests {
         ));
         let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 25)), 22);
 
-        conversation.queue_incoming_accepted_channel(AcceptedChannel::TcpForwarding {
+        conversation.queue_incoming_accepted_channel(Ssh3AcceptedChannel::TcpForwarding {
             channel: incoming.clone(),
             remote_addr,
         });
         let accepted = conversation.accept_channel_with_metadata().await.unwrap();
 
         match accepted {
-            AcceptedChannel::TcpForwarding {
+            Ssh3AcceptedChannel::TcpForwarding {
                 channel,
                 remote_addr: accepted_remote_addr,
             } => {
@@ -487,7 +550,7 @@ mod tests {
         }
         assert_eq!(
             handle.bytes(),
-            Message::ChannelOpenConfirmation(ChannelOpenConfirmationMessage {
+            Ssh3Message::ChannelOpenConfirmation(Ssh3ChannelOpenConfirmationMessage {
                 max_packet_size: 2048,
             })
             .to_vec()
@@ -497,14 +560,16 @@ mod tests {
     #[tokio::test]
     async fn dangling_datagrams_are_delivered_when_channel_is_added() {
         let sender = Arc::new(RecordingDatagramSender::default());
-        let conversation = Conversation::new(10, conversation_id(), 2048, 8, sender);
+        let conversation = Ssh3Conversation::new(10, conversation_id(), 2048, 8, sender);
 
         let mut datagram = Vec::new();
         ssh3_proto::append_var_int(&mut datagram, 42);
         datagram.extend_from_slice(&[1, 2, 3]);
 
         match conversation.add_datagram(&datagram).await {
-            Err(ConversationError::ChannelNotFound { channel_id }) => assert_eq!(channel_id, 42),
+            Err(Ssh3ConversationError::ChannelNotFound { channel_id }) => {
+                assert_eq!(channel_id, 42)
+            }
             other => panic!("expected missing channel error, got {other:?}"),
         }
 
@@ -518,7 +583,7 @@ mod tests {
     #[tokio::test]
     async fn udp_forwarding_channels_send_prefixed_datagrams() {
         let sender = Arc::new(RecordingDatagramSender::default());
-        let conversation = Conversation::new(10, conversation_id(), 2048, 8, sender.clone());
+        let conversation = Ssh3Conversation::new(10, conversation_id(), 2048, 8, sender.clone());
         let (recv, _) = BytesReceiveStream::new(Vec::new());
         let (send, _) = RecordingSendStream::new();
 
@@ -546,7 +611,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_forwarding_channels_write_forwarding_headers_immediately() {
         let sender = Arc::new(RecordingDatagramSender::default());
-        let conversation = Conversation::new(10, conversation_id(), 2048, 8, sender);
+        let conversation = Ssh3Conversation::new(10, conversation_id(), 2048, 8, sender);
         let (recv, _) = BytesReceiveStream::new(Vec::new());
         let (send, handle) = RecordingSendStream::new();
 
@@ -562,7 +627,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = ssh3_proto::ChannelHeader {
+        let expected = ssh3_proto::Ssh3ChannelHeader {
             conversation_stream_id: 10,
             channel_type: b"direct-tcp".to_vec(),
             max_packet_size: 1024,

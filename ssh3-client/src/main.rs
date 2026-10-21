@@ -4,13 +4,13 @@ use std::process::ExitCode;
 use clap::{ArgGroup, CommandFactory, Parser, ValueHint, error::ErrorKind};
 use http::Uri;
 use ssh3_client::{
-    AgentSelection, ClientConfig, OidcConfig, SessionRequest, TrustStrategy, load_certificates,
-    run_session_stdio,
+    Ssh3AgentSelection, Ssh3ClientConfig, Ssh3OidcConfig, Ssh3SessionRequest, Ssh3TrustStrategy,
+    load_certificates, run_session_stdio,
 };
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "ssh3-client",
+    name = "ssh3-rust-client",
     version,
     about = "Connects to an SSH3 server over QUIC/HTTP3. If COMMAND is omitted, requests a shell.",
     group(
@@ -148,15 +148,15 @@ fn read_secret_file(path: &Path, label: &str) -> Result<String, clap::Error> {
         .map_err(|err| cli_error(ErrorKind::Io, format!("failed to read {label}: {err}")))
 }
 
-fn build_config(cli: Cli) -> Result<(ClientConfig, SessionRequest), clap::Error> {
-    let mut config = ClientConfig::new(cli.url);
+fn build_config(cli: Cli) -> Result<(Ssh3ClientConfig, Ssh3SessionRequest), clap::Error> {
+    let mut config = Ssh3ClientConfig::new(cli.url);
     config.server_name = cli.server_name;
     config.username = cli.user;
     config.identity_file = cli.identity;
     config.agent = if cli.agent {
-        Some(AgentSelection::First)
+        Some(Ssh3AgentSelection::First)
     } else {
-        cli.agent_key.map(AgentSelection::PublicKey)
+        cli.agent_key.map(Ssh3AgentSelection::PublicKey)
     };
     config.agent_socket = cli.agent_socket;
     config.forward_agent = cli.forward_agent;
@@ -173,7 +173,7 @@ fn build_config(cli: Cli) -> Result<(ClientConfig, SessionRequest), clap::Error>
         (Some(_), Some(_)) => unreachable!("clap enforces bearer token conflicts"),
     };
     config.oidc = match (cli.oidc_issuer_url, cli.oidc_client_id) {
-        (Some(issuer_url), Some(client_id)) => Some(OidcConfig {
+        (Some(issuer_url), Some(client_id)) => Some(Ssh3OidcConfig {
             issuer_url,
             client_id,
             client_secret: match (cli.oidc_client_secret, cli.oidc_client_secret_file) {
@@ -188,27 +188,27 @@ fn build_config(cli: Cli) -> Result<(ClientConfig, SessionRequest), clap::Error>
         (Some(_), None) | (None, Some(_)) => unreachable!("clap enforces OIDC requirements"),
     };
     config.trust = if cli.insecure {
-        TrustStrategy::Insecure
+        Ssh3TrustStrategy::Insecure
     } else if let Some(path) = cli.ca_cert {
-        TrustStrategy::Certificates(load_certificates(&path).map_err(|err| {
+        Ssh3TrustStrategy::Certificates(load_certificates(&path).map_err(|err| {
             cli_error(
                 ErrorKind::ValueValidation,
                 format!("failed to load CA certificate: {err}"),
             )
         })?)
     } else {
-        TrustStrategy::WebPkiRoots
+        Ssh3TrustStrategy::WebPkiRoots
     };
 
     let request = if cli.command.is_empty() {
-        SessionRequest::Shell
+        Ssh3SessionRequest::Shell
     } else {
-        SessionRequest::Exec(cli.command.join(" "))
+        Ssh3SessionRequest::Exec(cli.command.join(" "))
     };
     Ok((config, request))
 }
 
-fn parse_args() -> Result<(ClientConfig, SessionRequest), clap::Error> {
+fn parse_args() -> Result<(Ssh3ClientConfig, Ssh3SessionRequest), clap::Error> {
     build_config(Cli::try_parse()?)
 }
 
@@ -229,7 +229,7 @@ async fn main() -> ExitCode {
     match run_session_stdio(&config, request).await {
         Ok(status) => ExitCode::from(status as u8),
         Err(err) => {
-            eprintln!("ssh3-client failed: {err}");
+            eprintln!("ssh3-rust-client failed: {err}");
             ExitCode::FAILURE
         }
     }
@@ -247,7 +247,7 @@ mod tests {
         std::fs::write(&password_file, "secret-password\n").unwrap();
 
         let cli = Cli::try_parse_from([
-            "ssh3-client",
+            "ssh3-rust-client",
             "--user",
             "alice",
             "--password-file",
@@ -267,7 +267,7 @@ mod tests {
         std::fs::write(&secret_file, "client-secret\r\n").unwrap();
 
         let cli = Cli::try_parse_from([
-            "ssh3-client",
+            "ssh3-rust-client",
             "--use-oidc",
             "https://issuer.example",
             "--oidc-client-id",
@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn clap_rejects_multiple_auth_methods() {
         let err = Cli::try_parse_from([
-            "ssh3-client",
+            "ssh3-rust-client",
             "--identity",
             "/tmp/id",
             "--bearer-token-file",

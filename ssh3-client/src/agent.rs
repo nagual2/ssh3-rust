@@ -5,9 +5,9 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use ssh_key::{Algorithm, HashAlg, PrivateKey, PublicKey, Signature};
-use ssh3_auth::{JwtAlgorithm, build_bearer_token_with_signer};
+use ssh3_auth::{Ssh3JwtAlgorithm, build_bearer_token_with_signer};
 
-use crate::{ClientConfig, ClientError};
+use crate::{Ssh3ClientConfig, Ssh3ClientError};
 
 const SSH_AGENT_FAILURE: u8 = 5;
 const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
@@ -17,7 +17,7 @@ const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
 const SSH_AGENT_RSA_SHA2_256: u32 = 2;
 
 #[derive(Clone, Debug)]
-pub enum AgentSelection {
+pub enum Ssh3AgentSelection {
     First,
     PublicKey(PathBuf),
 }
@@ -35,11 +35,11 @@ struct SshAgentClient {
 }
 
 pub fn build_agent_bearer_token(
-    config: &ClientConfig,
-    selection: &AgentSelection,
+    config: &Ssh3ClientConfig,
+    selection: &Ssh3AgentSelection,
     username: &str,
     conversation_id: &[u8; 32],
-) -> Result<String, ClientError> {
+) -> Result<String, Ssh3ClientError> {
     #[cfg(unix)]
     {
         let socket_path = resolve_agent_socket_path(config)?;
@@ -58,57 +58,60 @@ pub fn build_agent_bearer_token(
                 jwt_signature_from_agent_signature(jwt_algorithm, &signature)
             },
         )
-        .map_err(ClientError::from)
     }
 
     #[cfg(not(unix))]
     {
         let _ = (config, selection, username, conversation_id);
-        Err(ClientError::AgentUnavailable)
+        Err(Ssh3ClientError::AgentUnavailable)
     }
 }
 
 #[cfg(unix)]
-pub(crate) fn resolve_agent_socket_path(config: &ClientConfig) -> Result<PathBuf, ClientError> {
+pub(crate) fn resolve_agent_socket_path(
+    config: &Ssh3ClientConfig,
+) -> Result<PathBuf, Ssh3ClientError> {
     config
         .agent_socket
         .clone()
         .or_else(|| env::var_os("SSH_AUTH_SOCK").map(PathBuf::from))
-        .ok_or(ClientError::AgentUnavailable)
+        .ok_or(Ssh3ClientError::AgentUnavailable)
 }
 
 #[cfg(not(unix))]
-pub(crate) fn resolve_agent_socket_path(_config: &ClientConfig) -> Result<PathBuf, ClientError> {
-    Err(ClientError::AgentUnavailable)
+pub(crate) fn resolve_agent_socket_path(
+    _config: &Ssh3ClientConfig,
+) -> Result<PathBuf, Ssh3ClientError> {
+    Err(Ssh3ClientError::AgentUnavailable)
 }
 
 #[cfg(unix)]
 impl SshAgentClient {
-    fn connect(path: &Path) -> Result<Self, ClientError> {
+    fn connect(path: &Path) -> Result<Self, Ssh3ClientError> {
         Ok(Self {
-            stream: UnixStream::connect(path).map_err(ClientError::Io)?,
+            stream: UnixStream::connect(path).map_err(Ssh3ClientError::Io)?,
         })
     }
 
     fn select_identity(
         &mut self,
-        selection: &AgentSelection,
-    ) -> Result<AgentIdentity, ClientError> {
+        selection: &Ssh3AgentSelection,
+    ) -> Result<AgentIdentity, Ssh3ClientError> {
         let identities = self.list_identities()?;
         match selection {
-            AgentSelection::First => identities
+            Ssh3AgentSelection::First => identities
                 .into_iter()
                 .find(|identity| is_supported_agent_key(&identity.public_key))
-                .ok_or(ClientError::AgentKeyNotFound),
-            AgentSelection::PublicKey(path) => {
+                .ok_or(Ssh3ClientError::AgentKeyNotFound),
+            Ssh3AgentSelection::PublicKey(path) => {
                 let expected = load_agent_public_key(path)?;
-                let expected_blob = expected.to_bytes().map_err(ClientError::SshKey)?;
+                let expected_blob = expected.to_bytes().map_err(Ssh3ClientError::SshKey)?;
                 let identity = identities
                     .into_iter()
                     .find(|identity| identity.key_blob == expected_blob)
-                    .ok_or(ClientError::AgentKeyNotFound)?;
+                    .ok_or(Ssh3ClientError::AgentKeyNotFound)?;
                 if !is_supported_agent_key(&identity.public_key) {
-                    return Err(ClientError::UnsupportedAgentKey(
+                    return Err(Ssh3ClientError::UnsupportedAgentKey(
                         identity.public_key.algorithm().as_str().to_string(),
                     ));
                 }
@@ -117,7 +120,7 @@ impl SshAgentClient {
         }
     }
 
-    fn list_identities(&mut self) -> Result<Vec<AgentIdentity>, ClientError> {
+    fn list_identities(&mut self) -> Result<Vec<AgentIdentity>, Ssh3ClientError> {
         self.write_message(&[SSH_AGENTC_REQUEST_IDENTITIES])?;
         let response = self.read_message()?;
         let mut cursor = response.as_slice();
@@ -130,27 +133,32 @@ impl SshAgentClient {
                     let _comment = read_ssh_string(&mut cursor)?;
                     identities.push(AgentIdentity {
                         public_key: PublicKey::from_bytes(&key_blob)
-                            .map_err(ClientError::SshKey)?,
+                            .map_err(Ssh3ClientError::SshKey)?,
                         key_blob,
                     });
                 }
                 if !cursor.is_empty() {
-                    return Err(ClientError::Io(io::Error::new(
+                    return Err(Ssh3ClientError::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "trailing bytes in SSH agent identities reply",
                     )));
                 }
                 Ok(identities)
             }
-            SSH_AGENT_FAILURE => Err(ClientError::AgentKeyNotFound),
-            other => Err(ClientError::Io(io::Error::new(
+            SSH_AGENT_FAILURE => Err(Ssh3ClientError::AgentKeyNotFound),
+            other => Err(Ssh3ClientError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unexpected SSH agent reply type {other}"),
             ))),
         }
     }
 
-    fn sign(&mut self, key_blob: &[u8], data: &[u8], flags: u32) -> Result<Signature, ClientError> {
+    fn sign(
+        &mut self,
+        key_blob: &[u8],
+        data: &[u8],
+        flags: u32,
+    ) -> Result<Signature, Ssh3ClientError> {
         let mut payload = vec![SSH_AGENTC_SIGN_REQUEST];
         append_ssh_string(&mut payload, key_blob);
         append_ssh_string(&mut payload, data);
@@ -163,48 +171,50 @@ impl SshAgentClient {
             SSH_AGENT_SIGN_RESPONSE => {
                 let signature_blob = read_ssh_string(&mut cursor)?;
                 if !cursor.is_empty() {
-                    return Err(ClientError::Io(io::Error::new(
+                    return Err(Ssh3ClientError::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "trailing bytes in SSH agent sign reply",
                     )));
                 }
-                Signature::try_from(signature_blob.as_slice()).map_err(ClientError::SshKey)
+                Signature::try_from(signature_blob.as_slice()).map_err(Ssh3ClientError::SshKey)
             }
-            SSH_AGENT_FAILURE => Err(ClientError::AgentKeyNotFound),
-            other => Err(ClientError::Io(io::Error::new(
+            SSH_AGENT_FAILURE => Err(Ssh3ClientError::AgentKeyNotFound),
+            other => Err(Ssh3ClientError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unexpected SSH agent sign reply type {other}"),
             ))),
         }
     }
 
-    fn write_message(&mut self, payload: &[u8]) -> Result<(), ClientError> {
+    fn write_message(&mut self, payload: &[u8]) -> Result<(), Ssh3ClientError> {
         let len = u32::try_from(payload.len()).map_err(|_| {
-            ClientError::Io(io::Error::new(
+            Ssh3ClientError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "SSH agent payload exceeds u32 length",
             ))
         })?;
         self.stream
             .write_all(&len.to_be_bytes())
-            .map_err(ClientError::Io)?;
-        self.stream.write_all(payload).map_err(ClientError::Io)
+            .map_err(Ssh3ClientError::Io)?;
+        self.stream.write_all(payload).map_err(Ssh3ClientError::Io)
     }
 
-    fn read_message(&mut self) -> Result<Vec<u8>, ClientError> {
+    fn read_message(&mut self) -> Result<Vec<u8>, Ssh3ClientError> {
         let mut len = [0u8; 4];
-        self.stream.read_exact(&mut len).map_err(ClientError::Io)?;
+        self.stream
+            .read_exact(&mut len)
+            .map_err(Ssh3ClientError::Io)?;
         let len = u32::from_be_bytes(len) as usize;
         let mut payload = vec![0u8; len];
         self.stream
             .read_exact(&mut payload)
-            .map_err(ClientError::Io)?;
+            .map_err(Ssh3ClientError::Io)?;
         Ok(payload)
     }
 }
 
 #[cfg(unix)]
-fn load_agent_public_key(path: &Path) -> Result<PublicKey, ClientError> {
+fn load_agent_public_key(path: &Path) -> Result<PublicKey, Ssh3ClientError> {
     PublicKey::read_openssh_file(path)
         .or_else(|_| {
             PrivateKey::read_openssh_file(path).map(|private_key| private_key.public_key().clone())
@@ -213,7 +223,7 @@ fn load_agent_public_key(path: &Path) -> Result<PublicKey, ClientError> {
             let pub_path = PathBuf::from(format!("{}.pub", path.display()));
             PublicKey::read_openssh_file(&pub_path)
         })
-        .map_err(ClientError::SshKey)
+        .map_err(Ssh3ClientError::SshKey)
 }
 
 #[cfg(unix)]
@@ -225,11 +235,11 @@ fn is_supported_agent_key(public_key: &PublicKey) -> bool {
 }
 
 #[cfg(unix)]
-fn agent_sign_flags(jwt_algorithm: JwtAlgorithm) -> Result<u32, ClientError> {
+fn agent_sign_flags(jwt_algorithm: Ssh3JwtAlgorithm) -> Result<u32, Ssh3ClientError> {
     match jwt_algorithm {
-        JwtAlgorithm::EdDsa => Ok(0),
-        JwtAlgorithm::Rs256 => Ok(SSH_AGENT_RSA_SHA2_256),
-        JwtAlgorithm::Es256 => Err(ClientError::UnsupportedAgentKey(
+        Ssh3JwtAlgorithm::EdDsa => Ok(0),
+        Ssh3JwtAlgorithm::Rs256 => Ok(SSH_AGENT_RSA_SHA2_256),
+        Ssh3JwtAlgorithm::Es256 => Err(Ssh3ClientError::UnsupportedAgentKey(
             "ecdsa-sha2-nistp256".to_string(),
         )),
     }
@@ -237,33 +247,33 @@ fn agent_sign_flags(jwt_algorithm: JwtAlgorithm) -> Result<u32, ClientError> {
 
 #[cfg(unix)]
 fn jwt_signature_from_agent_signature(
-    jwt_algorithm: JwtAlgorithm,
+    jwt_algorithm: Ssh3JwtAlgorithm,
     signature: &Signature,
-) -> Result<Vec<u8>, ClientError> {
+) -> Result<Vec<u8>, Ssh3ClientError> {
     match jwt_algorithm {
-        JwtAlgorithm::EdDsa => {
+        Ssh3JwtAlgorithm::EdDsa => {
             if signature.algorithm() != Algorithm::Ed25519 {
-                return Err(ClientError::Io(io::Error::new(
+                return Err(Ssh3ClientError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SSH agent returned the wrong Ed25519 signature algorithm",
                 )));
             }
             Ok(signature.as_bytes().to_vec())
         }
-        JwtAlgorithm::Rs256 => {
+        Ssh3JwtAlgorithm::Rs256 => {
             if signature.algorithm()
                 != (Algorithm::Rsa {
                     hash: Some(HashAlg::Sha256),
                 })
             {
-                return Err(ClientError::Io(io::Error::new(
+                return Err(Ssh3ClientError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SSH agent returned the wrong RSA signature algorithm",
                 )));
             }
             Ok(signature.as_bytes().to_vec())
         }
-        JwtAlgorithm::Es256 => Err(ClientError::UnsupportedAgentKey(
+        Ssh3JwtAlgorithm::Es256 => Err(Ssh3ClientError::UnsupportedAgentKey(
             "ecdsa-sha2-nistp256".to_string(),
         )),
     }
@@ -276,9 +286,9 @@ fn append_ssh_string(buf: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 #[cfg(unix)]
-fn read_byte(cursor: &mut &[u8]) -> Result<u8, ClientError> {
+fn read_byte(cursor: &mut &[u8]) -> Result<u8, Ssh3ClientError> {
     let Some((&byte, rest)) = cursor.split_first() else {
-        return Err(ClientError::Io(io::Error::new(
+        return Err(Ssh3ClientError::Io(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "truncated SSH agent message",
         )));
@@ -288,9 +298,9 @@ fn read_byte(cursor: &mut &[u8]) -> Result<u8, ClientError> {
 }
 
 #[cfg(unix)]
-fn read_u32(cursor: &mut &[u8]) -> Result<u32, ClientError> {
+fn read_u32(cursor: &mut &[u8]) -> Result<u32, Ssh3ClientError> {
     if cursor.len() < 4 {
-        return Err(ClientError::Io(io::Error::new(
+        return Err(Ssh3ClientError::Io(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "truncated SSH agent u32",
         )));
@@ -301,10 +311,10 @@ fn read_u32(cursor: &mut &[u8]) -> Result<u32, ClientError> {
 }
 
 #[cfg(unix)]
-fn read_ssh_string(cursor: &mut &[u8]) -> Result<Vec<u8>, ClientError> {
+fn read_ssh_string(cursor: &mut &[u8]) -> Result<Vec<u8>, Ssh3ClientError> {
     let len = read_u32(cursor)? as usize;
     if cursor.len() < len {
-        return Err(ClientError::Io(io::Error::new(
+        return Err(Ssh3ClientError::Io(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "truncated SSH agent string",
         )));

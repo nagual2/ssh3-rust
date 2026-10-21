@@ -1,14 +1,21 @@
+//! Queues used by the conversation runtime: the accept queue of incoming
+//! channels and the bounded queue of the datagrams of a channel.
+
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use tokio::sync::Notify;
 
-pub struct AcceptQueue<T> {
+/// An unbounded FIFO queue that can be awaited by a single consumer.
+///
+/// Used to hand the channels opened by the peer over to the accepting task.
+pub struct Ssh3AcceptQueue<T> {
     queue: Mutex<VecDeque<T>>,
     notify: Notify,
 }
 
-impl<T> AcceptQueue<T> {
+impl<T> Ssh3AcceptQueue<T> {
+    /// Creates an empty queue.
     pub fn new() -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
@@ -16,15 +23,18 @@ impl<T> AcceptQueue<T> {
         }
     }
 
+    /// Appends an item and wakes up a waiting consumer.
     pub fn add(&self, item: T) {
         self.queue.lock().unwrap().push_back(item);
         self.notify.notify_one();
     }
 
+    /// Removes the oldest item, if there is one.
     pub fn next(&self) -> Option<T> {
         self.queue.lock().unwrap().pop_front()
     }
 
+    /// Waits for an item and returns it.
     pub async fn wait_next(&self) -> T {
         loop {
             let notified = self.notify.notified();
@@ -36,20 +46,25 @@ impl<T> AcceptQueue<T> {
     }
 }
 
-impl<T> Default for AcceptQueue<T> {
+impl<T> Default for Ssh3AcceptQueue<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-pub struct DatagramQueue {
+/// A bounded FIFO queue of datagrams.
+///
+/// The queue applies back pressure: producers that use
+/// [`Ssh3DatagramQueue::wait_add`] are suspended while the queue is full.
+pub struct Ssh3DatagramQueue {
     queue: Mutex<VecDeque<Vec<u8>>>,
     capacity: usize,
     not_empty: Notify,
     not_full: Notify,
 }
 
-impl DatagramQueue {
+impl Ssh3DatagramQueue {
+    /// Creates a queue that holds at most `capacity` datagrams.
     pub fn new(capacity: usize) -> Self {
         Self {
             queue: Mutex::new(VecDeque::with_capacity(capacity)),
@@ -59,6 +74,9 @@ impl DatagramQueue {
         }
     }
 
+    /// Appends a datagram without waiting.
+    ///
+    /// Returns `false` when the queue is full and the datagram was dropped.
     pub fn add(&self, datagram: Vec<u8>) -> bool {
         let mut queue = self.queue.lock().unwrap();
         if queue.len() >= self.capacity {
@@ -70,6 +88,7 @@ impl DatagramQueue {
         true
     }
 
+    /// Appends a datagram, waiting until the queue has room again.
     pub async fn wait_add(&self, datagram: Vec<u8>) {
         let mut datagram = Some(datagram);
         loop {
@@ -87,6 +106,7 @@ impl DatagramQueue {
         }
     }
 
+    /// Removes the oldest datagram, if there is one.
     pub fn next(&self) -> Option<Vec<u8>> {
         let datagram = self.queue.lock().unwrap().pop_front();
         if datagram.is_some() {
@@ -95,6 +115,7 @@ impl DatagramQueue {
         datagram
     }
 
+    /// Waits for a datagram and returns it.
     pub async fn wait_next(&self) -> Vec<u8> {
         loop {
             let notified = self.not_empty.notified();
@@ -108,11 +129,11 @@ impl DatagramQueue {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcceptQueue, DatagramQueue};
+    use super::{Ssh3AcceptQueue, Ssh3DatagramQueue};
 
     #[tokio::test]
     async fn accept_queue_delivers_items_in_order() {
-        let queue = AcceptQueue::new();
+        let queue = Ssh3AcceptQueue::new();
         queue.add(1);
         queue.add(2);
 
@@ -122,7 +143,7 @@ mod tests {
 
     #[tokio::test]
     async fn datagram_queue_blocks_until_space_and_preserves_order() {
-        let queue = DatagramQueue::new(1);
+        let queue = Ssh3DatagramQueue::new(1);
         assert!(queue.add(vec![1]));
         assert!(!queue.add(vec![2]));
 

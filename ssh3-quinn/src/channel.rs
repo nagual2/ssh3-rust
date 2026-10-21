@@ -6,29 +6,29 @@ use std::sync::Mutex;
 
 use quinn::{Connection, ConnectionError, RecvStream};
 use ssh3_core::{
-    AcceptedChannel, Channel, Conversation, ConversationDatagramSender, ConversationError,
-    ConversationId,
+    Ssh3AcceptedChannel, Ssh3Channel, Ssh3Conversation, Ssh3ConversationDatagramSender,
+    Ssh3ConversationError, Ssh3ConversationId,
 };
-use ssh3_proto::{ChannelHeader, ForwardingAddressFamily, SSH_FRAME_TYPE};
+use ssh3_proto::{SSH_FRAME_TYPE, Ssh3ChannelHeader, Ssh3ForwardingAddressFamily};
 
-use crate::{QuinnReceiveStream, QuinnSendStream, read_exact_error_to_io};
+use crate::{Ssh3QuinnReceiveStream, Ssh3QuinnSendStream, read_exact_error_to_io};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IncomingChannel {
+pub struct Ssh3IncomingChannel {
     pub stream_id: u64,
-    pub header: ChannelHeader,
+    pub header: Ssh3ChannelHeader,
     pub forwarding_target: Option<SocketAddr>,
 }
 
-impl IncomingChannel {
+impl Ssh3IncomingChannel {
     pub fn into_accepted_channel(
         self,
-        conversation_id: ConversationId,
+        conversation_id: Ssh3ConversationId,
         recv: quinn::RecvStream,
         send: quinn::SendStream,
-        datagram_sender: Option<Arc<ConversationDatagramSender>>,
+        datagram_sender: Option<Arc<Ssh3ConversationDatagramSender>>,
         datagrams_queue_size: usize,
-    ) -> AcceptedChannel {
+    ) -> Ssh3AcceptedChannel {
         let stream_id = self.stream_id;
         let forwarding_target = self.forwarding_target;
         let channel_type = self.header.channel_type.clone();
@@ -37,14 +37,14 @@ impl IncomingChannel {
         } else {
             None
         };
-        let channel = Arc::new(Channel::new(
+        let channel = Arc::new(Ssh3Channel::new(
             self.header.conversation_stream_id,
             conversation_id,
             stream_id,
             self.header.channel_type,
             self.header.max_packet_size,
-            QuinnReceiveStream::new(recv),
-            QuinnSendStream::new(send),
+            Ssh3QuinnReceiveStream::new(recv),
+            Ssh3QuinnSendStream::new(send),
             datagram_sender,
             false,
             false,
@@ -54,24 +54,24 @@ impl IncomingChannel {
         ));
 
         match (channel_type.as_slice(), forwarding_target) {
-            (b"direct-udp", Some(remote_addr)) => AcceptedChannel::UdpForwarding {
+            (b"direct-udp", Some(remote_addr)) => Ssh3AcceptedChannel::UdpForwarding {
                 channel,
                 remote_addr,
             },
-            (b"direct-tcp", Some(remote_addr)) => AcceptedChannel::TcpForwarding {
+            (b"direct-tcp", Some(remote_addr)) => Ssh3AcceptedChannel::TcpForwarding {
                 channel,
                 remote_addr,
             },
-            _ => AcceptedChannel::Channel(channel),
+            _ => Ssh3AcceptedChannel::Channel(channel),
         }
     }
 
     pub fn into_accepted_channel_for_conversation(
         self,
-        conversation: &Conversation,
+        conversation: &Ssh3Conversation,
         recv: quinn::RecvStream,
         send: quinn::SendStream,
-    ) -> AcceptedChannel {
+    ) -> Ssh3AcceptedChannel {
         let datagram_sender = (self.header.channel_type.as_slice() == b"direct-udp")
             .then(|| conversation.datagram_sender_for_channel(self.stream_id));
         self.into_accepted_channel(
@@ -85,12 +85,12 @@ impl IncomingChannel {
 
     pub fn into_channel(
         self,
-        conversation_id: ConversationId,
+        conversation_id: Ssh3ConversationId,
         recv: quinn::RecvStream,
         send: quinn::SendStream,
-        datagram_sender: Option<Arc<ConversationDatagramSender>>,
+        datagram_sender: Option<Arc<Ssh3ConversationDatagramSender>>,
         datagrams_queue_size: usize,
-    ) -> Arc<Channel> {
+    ) -> Arc<Ssh3Channel> {
         self.into_accepted_channel(
             conversation_id,
             recv,
@@ -103,30 +103,30 @@ impl IncomingChannel {
 }
 
 #[derive(Default)]
-pub struct IncomingChannelRouter {
-    conversations: Mutex<std::collections::HashMap<u64, Arc<Conversation>>>,
+pub struct Ssh3IncomingChannelRouter {
+    conversations: Mutex<std::collections::HashMap<u64, Arc<Ssh3Conversation>>>,
 }
 
-impl IncomingChannelRouter {
+impl Ssh3IncomingChannelRouter {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn register_conversation(&self, conversation: Arc<Conversation>) {
+    pub fn register_conversation(&self, conversation: Arc<Ssh3Conversation>) {
         self.conversations
             .lock()
             .unwrap()
             .insert(conversation.control_stream_id(), conversation);
     }
 
-    pub fn unregister_conversation(&self, control_stream_id: u64) -> Option<Arc<Conversation>> {
+    pub fn unregister_conversation(&self, control_stream_id: u64) -> Option<Arc<Ssh3Conversation>> {
         self.conversations
             .lock()
             .unwrap()
             .remove(&control_stream_id)
     }
 
-    pub fn conversation(&self, control_stream_id: u64) -> Option<Arc<Conversation>> {
+    pub fn conversation(&self, control_stream_id: u64) -> Option<Arc<Ssh3Conversation>> {
         self.conversations
             .lock()
             .unwrap()
@@ -136,14 +136,14 @@ impl IncomingChannelRouter {
 
     pub fn route_incoming_channel(
         &self,
-        incoming: IncomingChannel,
+        incoming: Ssh3IncomingChannel,
         send: quinn::SendStream,
         recv: quinn::RecvStream,
-    ) -> Result<Arc<Conversation>, RouteIncomingChannelError> {
+    ) -> Result<Arc<Ssh3Conversation>, Ssh3RouteIncomingChannelError> {
         let control_stream_id = incoming.header.conversation_stream_id;
         let channel_id = incoming.stream_id;
         let Some(conversation) = self.conversation(control_stream_id) else {
-            return Err(RouteIncomingChannelError::UnknownConversation {
+            return Err(Ssh3RouteIncomingChannelError::UnknownConversation {
                 control_stream_id,
                 channel_id,
             });
@@ -158,16 +158,16 @@ impl IncomingChannelRouter {
     pub async fn accept_and_route_channel(
         &self,
         connection: &Connection,
-    ) -> Result<Arc<Conversation>, RouteAcceptedChannelError> {
+    ) -> Result<Arc<Ssh3Conversation>, Ssh3RouteAcceptedChannelError> {
         let (incoming, send, recv) = accept_bi_channel(connection).await?;
         self.route_incoming_channel(incoming, send, recv)
-            .map_err(RouteAcceptedChannelError::Route)
+            .map_err(Ssh3RouteAcceptedChannelError::Route)
     }
 
     pub async fn accept_and_route_channels_forever(
         self: Arc<Self>,
         connection: Connection,
-    ) -> Result<(), RouteAcceptedChannelError> {
+    ) -> Result<(), Ssh3RouteAcceptedChannelError> {
         loop {
             self.accept_and_route_channel(&connection).await?;
         }
@@ -175,13 +175,13 @@ impl IncomingChannelRouter {
 }
 
 #[derive(Debug)]
-pub enum ChannelSetupError {
+pub enum Ssh3ChannelSetupError {
     Io(io::Error),
-    Proto(ssh3_proto::Error),
+    Proto(ssh3_proto::Ssh3Error),
     UnexpectedFrameType { frame_type: u64 },
 }
 
-impl fmt::Display for ChannelSetupError {
+impl fmt::Display for Ssh3ChannelSetupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "{err}"),
@@ -193,7 +193,7 @@ impl fmt::Display for ChannelSetupError {
     }
 }
 
-impl std::error::Error for ChannelSetupError {
+impl std::error::Error for Ssh3ChannelSetupError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
@@ -203,25 +203,25 @@ impl std::error::Error for ChannelSetupError {
     }
 }
 
-impl From<io::Error> for ChannelSetupError {
+impl From<io::Error> for Ssh3ChannelSetupError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
     }
 }
 
-impl From<ssh3_proto::Error> for ChannelSetupError {
-    fn from(value: ssh3_proto::Error) -> Self {
+impl From<ssh3_proto::Ssh3Error> for Ssh3ChannelSetupError {
+    fn from(value: ssh3_proto::Ssh3Error) -> Self {
         Self::Proto(value)
     }
 }
 
 #[derive(Debug)]
-pub enum AcceptChannelError {
+pub enum Ssh3AcceptChannelError {
     Connection(ConnectionError),
-    Setup(ChannelSetupError),
+    Setup(Ssh3ChannelSetupError),
 }
 
-impl fmt::Display for AcceptChannelError {
+impl fmt::Display for Ssh3AcceptChannelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Connection(err) => write!(f, "{err}"),
@@ -230,7 +230,7 @@ impl fmt::Display for AcceptChannelError {
     }
 }
 
-impl std::error::Error for AcceptChannelError {
+impl std::error::Error for Ssh3AcceptChannelError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Connection(err) => Some(err),
@@ -239,25 +239,25 @@ impl std::error::Error for AcceptChannelError {
     }
 }
 
-impl From<ConnectionError> for AcceptChannelError {
+impl From<ConnectionError> for Ssh3AcceptChannelError {
     fn from(value: ConnectionError) -> Self {
         Self::Connection(value)
     }
 }
 
-impl From<ChannelSetupError> for AcceptChannelError {
-    fn from(value: ChannelSetupError) -> Self {
+impl From<Ssh3ChannelSetupError> for Ssh3AcceptChannelError {
+    fn from(value: Ssh3ChannelSetupError) -> Self {
         Self::Setup(value)
     }
 }
 
 #[derive(Debug)]
-pub enum OpenChannelError {
+pub enum Ssh3OpenChannelError {
     Connection(ConnectionError),
-    Conversation(ConversationError),
+    Conversation(Ssh3ConversationError),
 }
 
-impl fmt::Display for OpenChannelError {
+impl fmt::Display for Ssh3OpenChannelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Connection(err) => write!(f, "{err}"),
@@ -266,7 +266,7 @@ impl fmt::Display for OpenChannelError {
     }
 }
 
-impl std::error::Error for OpenChannelError {
+impl std::error::Error for Ssh3OpenChannelError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Connection(err) => Some(err),
@@ -275,27 +275,27 @@ impl std::error::Error for OpenChannelError {
     }
 }
 
-impl From<ConnectionError> for OpenChannelError {
+impl From<ConnectionError> for Ssh3OpenChannelError {
     fn from(value: ConnectionError) -> Self {
         Self::Connection(value)
     }
 }
 
-impl From<ConversationError> for OpenChannelError {
-    fn from(value: ConversationError) -> Self {
+impl From<Ssh3ConversationError> for Ssh3OpenChannelError {
+    fn from(value: Ssh3ConversationError) -> Self {
         Self::Conversation(value)
     }
 }
 
 #[derive(Debug)]
-pub enum RouteIncomingChannelError {
+pub enum Ssh3RouteIncomingChannelError {
     UnknownConversation {
         control_stream_id: u64,
         channel_id: u64,
     },
 }
 
-impl fmt::Display for RouteIncomingChannelError {
+impl fmt::Display for Ssh3RouteIncomingChannelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownConversation {
@@ -310,15 +310,15 @@ impl fmt::Display for RouteIncomingChannelError {
     }
 }
 
-impl std::error::Error for RouteIncomingChannelError {}
+impl std::error::Error for Ssh3RouteIncomingChannelError {}
 
 #[derive(Debug)]
-pub enum RouteAcceptedChannelError {
-    Accept(AcceptChannelError),
-    Route(RouteIncomingChannelError),
+pub enum Ssh3RouteAcceptedChannelError {
+    Accept(Ssh3AcceptChannelError),
+    Route(Ssh3RouteIncomingChannelError),
 }
 
-impl fmt::Display for RouteAcceptedChannelError {
+impl fmt::Display for Ssh3RouteAcceptedChannelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Accept(err) => write!(f, "{err}"),
@@ -327,7 +327,7 @@ impl fmt::Display for RouteAcceptedChannelError {
     }
 }
 
-impl std::error::Error for RouteAcceptedChannelError {
+impl std::error::Error for Ssh3RouteAcceptedChannelError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Accept(err) => Some(err),
@@ -336,15 +336,15 @@ impl std::error::Error for RouteAcceptedChannelError {
     }
 }
 
-impl From<AcceptChannelError> for RouteAcceptedChannelError {
-    fn from(value: AcceptChannelError) -> Self {
+impl From<Ssh3AcceptChannelError> for Ssh3RouteAcceptedChannelError {
+    fn from(value: Ssh3AcceptChannelError) -> Self {
         Self::Accept(value)
     }
 }
 
 pub async fn accept_bi_channel(
     connection: &Connection,
-) -> Result<(IncomingChannel, quinn::SendStream, quinn::RecvStream), AcceptChannelError> {
+) -> Result<(Ssh3IncomingChannel, quinn::SendStream, quinn::RecvStream), Ssh3AcceptChannelError> {
     let (send, mut recv) = connection.accept_bi().await?;
     let incoming = read_incoming_channel(&mut recv).await?;
     Ok((incoming, send, recv))
@@ -352,13 +352,13 @@ pub async fn accept_bi_channel(
 
 pub async fn read_incoming_channel(
     recv: &mut RecvStream,
-) -> Result<IncomingChannel, ChannelSetupError> {
+) -> Result<Ssh3IncomingChannel, Ssh3ChannelSetupError> {
     let frame_type = read_var_int(recv).await?;
     if frame_type != SSH_FRAME_TYPE {
-        return Err(ChannelSetupError::UnexpectedFrameType { frame_type });
+        return Err(Ssh3ChannelSetupError::UnexpectedFrameType { frame_type });
     }
 
-    let header = ChannelHeader {
+    let header = Ssh3ChannelHeader {
         conversation_stream_id: read_var_int(recv).await?,
         channel_type: read_ssh_bytes(recv).await?,
         max_packet_size: read_var_int(recv).await?,
@@ -369,7 +369,7 @@ pub async fn read_incoming_channel(
         _ => None,
     };
 
-    Ok(IncomingChannel {
+    Ok(Ssh3IncomingChannel {
         stream_id: recv.id().into(),
         header,
         forwarding_target,
@@ -377,30 +377,30 @@ pub async fn read_incoming_channel(
 }
 
 pub async fn open_channel(
-    conversation: &Conversation,
+    conversation: &Ssh3Conversation,
     connection: &Connection,
     channel_type: impl Into<Vec<u8>>,
     max_packet_size: u64,
     datagrams_queue_size: usize,
-) -> Result<Arc<Channel>, OpenChannelError> {
+) -> Result<Arc<Ssh3Channel>, Ssh3OpenChannelError> {
     let (send, recv) = connection.open_bi().await?;
     Ok(conversation.open_channel(
         send.id().into(),
         channel_type,
         max_packet_size,
         datagrams_queue_size,
-        QuinnReceiveStream::new(recv),
-        QuinnSendStream::new(send),
+        Ssh3QuinnReceiveStream::new(recv),
+        Ssh3QuinnSendStream::new(send),
     ))
 }
 
 pub async fn open_udp_forwarding_channel(
-    conversation: &Conversation,
+    conversation: &Ssh3Conversation,
     connection: &Connection,
     max_packet_size: u64,
     datagrams_queue_size: usize,
     remote_addr: SocketAddr,
-) -> Result<Arc<Channel>, OpenChannelError> {
+) -> Result<Arc<Ssh3Channel>, Ssh3OpenChannelError> {
     let (send, recv) = connection.open_bi().await?;
     conversation
         .open_udp_forwarding_channel(
@@ -408,20 +408,20 @@ pub async fn open_udp_forwarding_channel(
             max_packet_size,
             datagrams_queue_size,
             remote_addr,
-            QuinnReceiveStream::new(recv),
-            QuinnSendStream::new(send),
+            Ssh3QuinnReceiveStream::new(recv),
+            Ssh3QuinnSendStream::new(send),
         )
         .await
-        .map_err(OpenChannelError::from)
+        .map_err(Ssh3OpenChannelError::from)
 }
 
 pub async fn open_tcp_forwarding_channel(
-    conversation: &Conversation,
+    conversation: &Ssh3Conversation,
     connection: &Connection,
     max_packet_size: u64,
     datagrams_queue_size: usize,
     remote_addr: SocketAddr,
-) -> Result<Arc<Channel>, OpenChannelError> {
+) -> Result<Arc<Ssh3Channel>, Ssh3OpenChannelError> {
     let (send, recv) = connection.open_bi().await?;
     conversation
         .open_tcp_forwarding_channel(
@@ -429,18 +429,20 @@ pub async fn open_tcp_forwarding_channel(
             max_packet_size,
             datagrams_queue_size,
             remote_addr,
-            QuinnReceiveStream::new(recv),
-            QuinnSendStream::new(send),
+            Ssh3QuinnReceiveStream::new(recv),
+            Ssh3QuinnSendStream::new(send),
         )
         .await
-        .map_err(OpenChannelError::from)
+        .map_err(Ssh3OpenChannelError::from)
 }
 
-async fn read_forwarding_target(recv: &mut RecvStream) -> Result<SocketAddr, ChannelSetupError> {
-    let family = ForwardingAddressFamily::try_from(read_var_int(recv).await?)?;
+async fn read_forwarding_target(
+    recv: &mut RecvStream,
+) -> Result<SocketAddr, Ssh3ChannelSetupError> {
+    let family = Ssh3ForwardingAddressFamily::try_from(read_var_int(recv).await?)?;
     let mut octets = match family {
-        ForwardingAddressFamily::Ipv4 => vec![0; 4],
-        ForwardingAddressFamily::Ipv6 => vec![0; 16],
+        Ssh3ForwardingAddressFamily::Ipv4 => vec![0; 4],
+        Ssh3ForwardingAddressFamily::Ipv6 => vec![0; 16],
     };
     read_exact(recv, &mut octets).await?;
 
@@ -449,18 +451,18 @@ async fn read_forwarding_target(recv: &mut RecvStream) -> Result<SocketAddr, Cha
     let port = u16::from_be_bytes(port);
 
     match family {
-        ForwardingAddressFamily::Ipv4 => {
+        Ssh3ForwardingAddressFamily::Ipv4 => {
             let ip = Ipv4Addr::from(<[u8; 4]>::try_from(octets).unwrap());
             Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
         }
-        ForwardingAddressFamily::Ipv6 => {
+        Ssh3ForwardingAddressFamily::Ipv6 => {
             let ip = Ipv6Addr::from(<[u8; 16]>::try_from(octets).unwrap());
             Ok(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)))
         }
     }
 }
 
-async fn read_var_int(recv: &mut RecvStream) -> Result<u64, ChannelSetupError> {
+async fn read_var_int(recv: &mut RecvStream) -> Result<u64, Ssh3ChannelSetupError> {
     let first_byte = read_byte(recv).await?;
     let len = 1 << ((first_byte & 0xc0) >> 6);
     let b1 = first_byte & 0x3f;
@@ -496,7 +498,7 @@ async fn read_var_int(recv: &mut RecvStream) -> Result<u64, ChannelSetupError> {
         + (u64::from(b1) << 56))
 }
 
-async fn read_ssh_bytes(recv: &mut RecvStream) -> Result<Vec<u8>, ChannelSetupError> {
+async fn read_ssh_bytes(recv: &mut RecvStream) -> Result<Vec<u8>, Ssh3ChannelSetupError> {
     let len = read_var_int(recv).await?;
     let len = usize::try_from(len)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SSH string too large"))?;
@@ -505,17 +507,17 @@ async fn read_ssh_bytes(recv: &mut RecvStream) -> Result<Vec<u8>, ChannelSetupEr
     Ok(out)
 }
 
-async fn read_byte(recv: &mut RecvStream) -> Result<u8, ChannelSetupError> {
+async fn read_byte(recv: &mut RecvStream) -> Result<u8, Ssh3ChannelSetupError> {
     let mut byte = [0; 1];
     read_exact(recv, &mut byte).await?;
     Ok(byte[0])
 }
 
-async fn read_exact(recv: &mut RecvStream, buf: &mut [u8]) -> Result<(), ChannelSetupError> {
+async fn read_exact(recv: &mut RecvStream, buf: &mut [u8]) -> Result<(), Ssh3ChannelSetupError> {
     recv.read_exact(buf)
         .await
         .map_err(read_exact_error_to_io)
-        .map_err(ChannelSetupError::from)
+        .map_err(Ssh3ChannelSetupError::from)
 }
 
 #[cfg(test)]
@@ -524,14 +526,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use ssh3_core::{AcceptedChannel, Conversation};
-    use ssh3_proto::{ChannelRequest, ChannelRequestMessage, Message, append_var_int};
+    use ssh3_core::{Ssh3AcceptedChannel, Ssh3Conversation};
+    use ssh3_proto::{Ssh3ChannelRequest, Ssh3ChannelRequestMessage, Ssh3Message, append_var_int};
 
     use super::{
-        IncomingChannelRouter, RouteAcceptedChannelError, accept_bi_channel, open_channel,
+        Ssh3IncomingChannelRouter, Ssh3RouteAcceptedChannelError, accept_bi_channel, open_channel,
         open_tcp_forwarding_channel, open_udp_forwarding_channel,
     };
-    use crate::{QuinnDatagramSender, client_config_for_certificate, self_signed_server_config};
+    use crate::{
+        Ssh3QuinnDatagramSender, client_config_for_certificate, self_signed_server_config,
+    };
 
     fn conversation_id() -> [u8; 32] {
         [7; 32]
@@ -591,12 +595,12 @@ mod tests {
         let (_client_endpoint, _server_endpoint, client_connection, server_connection) =
             loopback().await;
 
-        let conversation = Conversation::new(
+        let conversation = Ssh3Conversation::new(
             5,
             conversation_id(),
             4096,
             8,
-            Arc::new(QuinnDatagramSender::new(client_connection.clone())),
+            Arc::new(Ssh3QuinnDatagramSender::new(client_connection.clone())),
         );
         let client_channel = open_channel(
             &conversation,
@@ -629,9 +633,9 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let request = ChannelRequestMessage {
+        let request = Ssh3ChannelRequestMessage {
             want_reply: true,
-            request: ChannelRequest::Shell,
+            request: Ssh3ChannelRequest::Shell,
         };
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -646,7 +650,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            Message::ChannelRequest(request)
+            Ssh3Message::ChannelRequest(request)
         );
     }
 
@@ -655,19 +659,19 @@ mod tests {
         let (_client_endpoint, _server_endpoint, client_connection, server_connection) =
             loopback().await;
 
-        let client_conversation = Conversation::new(
+        let client_conversation = Ssh3Conversation::new(
             11,
             conversation_id(),
             4096,
             8,
-            Arc::new(QuinnDatagramSender::new(client_connection.clone())),
+            Arc::new(Ssh3QuinnDatagramSender::new(client_connection.clone())),
         );
-        let server_conversation = Conversation::new(
+        let server_conversation = Ssh3Conversation::new(
             11,
             conversation_id(),
             4096,
             8,
-            Arc::new(QuinnDatagramSender::new(server_connection.clone())),
+            Arc::new(Ssh3QuinnDatagramSender::new(server_connection.clone())),
         );
         let remote_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 443));
         let client_channel = open_udp_forwarding_channel(
@@ -701,7 +705,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let server_channel = match accepted {
-            AcceptedChannel::UdpForwarding {
+            Ssh3AcceptedChannel::UdpForwarding {
                 channel,
                 remote_addr: accepted_remote_addr,
             } => {
@@ -755,12 +759,12 @@ mod tests {
         let (_client_endpoint, _server_endpoint, client_connection, server_connection) =
             loopback().await;
 
-        let conversation = Conversation::new(
+        let conversation = Ssh3Conversation::new(
             12,
             conversation_id(),
             4096,
             8,
-            Arc::new(QuinnDatagramSender::new(server_connection.clone())),
+            Arc::new(Ssh3QuinnDatagramSender::new(server_connection.clone())),
         );
         let remote_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 22));
         let _channel =
@@ -778,7 +782,7 @@ mod tests {
 
         let accepted = incoming.into_accepted_channel_for_conversation(&conversation, recv, send);
         match accepted {
-            AcceptedChannel::TcpForwarding {
+            Ssh3AcceptedChannel::TcpForwarding {
                 channel,
                 remote_addr: accepted_remote_addr,
             } => {
@@ -795,21 +799,21 @@ mod tests {
             loopback().await;
 
         let control_stream_id = 21;
-        let client_conversation = Conversation::new(
+        let client_conversation = Ssh3Conversation::new(
             control_stream_id,
             conversation_id(),
             4096,
             8,
-            Arc::new(QuinnDatagramSender::new(client_connection.clone())),
+            Arc::new(Ssh3QuinnDatagramSender::new(client_connection.clone())),
         );
-        let server_conversation = Arc::new(Conversation::new(
+        let server_conversation = Arc::new(Ssh3Conversation::new(
             control_stream_id,
             conversation_id(),
             4096,
             8,
-            Arc::new(QuinnDatagramSender::new(server_connection.clone())),
+            Arc::new(Ssh3QuinnDatagramSender::new(server_connection.clone())),
         ));
-        let router = IncomingChannelRouter::new();
+        let router = Ssh3IncomingChannelRouter::new();
         router.register_conversation(server_conversation.clone());
 
         let remote_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 15), 5353));
@@ -840,7 +844,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let server_channel = match accepted {
-            AcceptedChannel::UdpForwarding {
+            Ssh3AcceptedChannel::UdpForwarding {
                 channel,
                 remote_addr: accepted_remote_addr,
             } => {
@@ -892,14 +896,14 @@ mod tests {
         let (_client_endpoint, _server_endpoint, client_connection, server_connection) =
             loopback().await;
 
-        let client_conversation = Conversation::new(
+        let client_conversation = Ssh3Conversation::new(
             33,
             conversation_id(),
             4096,
             8,
-            Arc::new(QuinnDatagramSender::new(client_connection.clone())),
+            Arc::new(Ssh3QuinnDatagramSender::new(client_connection.clone())),
         );
-        let router = IncomingChannelRouter::new();
+        let router = Ssh3IncomingChannelRouter::new();
 
         let channel = open_channel(
             &client_conversation,
@@ -922,8 +926,8 @@ mod tests {
         .await
         .unwrap()
         {
-            Err(RouteAcceptedChannelError::Route(
-                super::RouteIncomingChannelError::UnknownConversation {
+            Err(Ssh3RouteAcceptedChannelError::Route(
+                super::Ssh3RouteIncomingChannelError::UnknownConversation {
                     control_stream_id,
                     channel_id,
                 },

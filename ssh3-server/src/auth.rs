@@ -1,0 +1,339 @@
+//! Server-side authentication and authorization of SSH3 requests.
+//!
+//! An SSH3 client authenticates with the HTTP `Authorization` header of the
+//! CONNECT request:
+//!
+//! * `Authorization: Bearer <token>` — an SSH3 bearer token (public key) or
+//!   an OIDC identity token, matched against the configured authorized
+//!   identities;
+//! * `Authorization: Basic <base64(user:password)>` — password login, checked
+//!   either by a custom [`Ssh3PasswordVerifier`](crate::Ssh3PasswordVerifier) or by
+//!   the platform default (`crypt(3)` against the shadow database on Linux).
+//!
+//! When the server is configured without any authentication requirement
+//! (`require_authentication`, `enable_password_login` and
+//! `authorized_identity_paths` are all empty/disabled), every request is
+//! accepted.
+
+use std::io;
+use std::path::PathBuf;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use http::Request;
+use ssh3_auth::{
+    Ssh3AuthError, Ssh3AuthorizedIdentity, conversation_id_base64,
+    load_authorized_identities_from_paths, verify_bearer_token, verify_oidc_identity_token,
+};
+
+use crate::config::Ssh3ServerConfig;
+use crate::session::SessionUser;
+
+/// Credentials extracted from the `Authorization` header of a CONNECT request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RequestAuthorization {
+    /// No (or unparsable) `Authorization` header was present.
+    None,
+    /// HTTP basic authentication with a decoded username and password.
+    Basic { username: String, password: String },
+    /// HTTP bearer authentication carrying a raw token.
+    Bearer(String),
+}
+
+/// Extracts the value of a query parameter from a request URI.
+///
+/// Returns `None` when the parameter is absent or has an empty value.
+fn extract_query_param(uri: &http::Uri, name: &str) -> Option<String> {
+    uri.query()?.split('&').find_map(|entry| {
+        let mut parts = entry.splitn(2, '=');
+        let key = parts.next()?;
+        let value = parts.next().unwrap_or_default();
+        (key == name && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// Returns the user name requested by the client.
+///
+/// The `ssh3-user` header wins, the `user` query parameter is the fallback and
+/// `config.default_user` closes the list. An empty value is treated as "not
+/// requested".
+pub(crate) fn requested_username(
+    request: &Request<()>,
+    config: &Ssh3ServerConfig,
+) -> Option<String> {
+    request
+        .headers()
+        .get(ssh3_h3::SSH3_USER_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| extract_query_param(request.uri(), "user"))
+        .or_else(|| config.default_user.clone())
+}
+
+/// Parses the `Authorization` header into a [`RequestAuthorization`].
+///
+/// Malformed headers (bad base64, non-UTF-8 payload, missing colon) are
+/// reported as [`RequestAuthorization::None`] rather than as an error, so the
+/// caller can answer with a plain `401 Unauthorized`.
+pub(crate) fn parse_request_authorization(request: &Request<()>) -> RequestAuthorization {
+    fn strip_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
+        let prefix_len = scheme.len();
+        (value.len() > prefix_len
+            && value[..prefix_len].eq_ignore_ascii_case(scheme)
+            && value.as_bytes().get(prefix_len) == Some(&b' '))
+        .then(|| value[prefix_len + 1..].trim())
+    }
+
+    let Some(value) = request
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return RequestAuthorization::None;
+    };
+
+    if let Some(encoded) = strip_scheme(value, "Basic") {
+        let Some(decoded) = BASE64_STANDARD.decode(encoded).ok() else {
+            return RequestAuthorization::None;
+        };
+        let Some(decoded) = String::from_utf8(decoded).ok() else {
+            return RequestAuthorization::None;
+        };
+        let Some((username, password)) = decoded.split_once(':') else {
+            return RequestAuthorization::None;
+        };
+        return RequestAuthorization::Basic {
+            username: username.to_string(),
+            password: password.to_string(),
+        };
+    }
+
+    if let Some(token) = strip_scheme(value, "Bearer") {
+        if !token.is_empty() {
+            return RequestAuthorization::Bearer(token.to_string());
+        }
+    }
+
+    RequestAuthorization::None
+}
+
+/// Default locations of the authorized identity file of a user.
+fn default_authorized_identity_paths(session_user: &SessionUser) -> Vec<PathBuf> {
+    vec![
+        session_user
+            .home_dir
+            .join(".ssh3")
+            .join("authorized_identities"),
+        session_user.home_dir.join(".ssh").join("authorized_keys"),
+    ]
+}
+
+/// Authorized identity files used for the given session user.
+///
+/// Falls back to the per-user defaults when the server does not configure any
+/// path explicitly.
+fn configured_authorized_identity_paths(
+    config: &Ssh3ServerConfig,
+    session_user: &SessionUser,
+) -> Vec<PathBuf> {
+    if config.authorized_identity_paths.is_empty() {
+        default_authorized_identity_paths(session_user)
+    } else {
+        config.authorized_identity_paths.clone()
+    }
+}
+
+/// Returns `true` when the configuration requires credentials from clients.
+fn should_authenticate(config: &Ssh3ServerConfig) -> bool {
+    config.require_authentication
+        || config.enable_password_login
+        || !config.authorized_identity_paths.is_empty()
+}
+
+#[cfg(target_os = "linux")]
+#[link(name = "crypt")]
+unsafe extern "C" {
+    fn crypt(
+        key: *const nix::libc::c_char,
+        salt: *const nix::libc::c_char,
+    ) -> *mut nix::libc::c_char;
+}
+
+#[cfg(target_os = "linux")]
+fn crypt_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Returns `true` when the platform provides a built-in password check.
+#[cfg(target_os = "linux")]
+fn platform_password_auth_available() -> bool {
+    true
+}
+
+/// Returns `true` when the platform provides a built-in password check.
+#[cfg(not(target_os = "linux"))]
+fn platform_password_auth_available() -> bool {
+    false
+}
+
+/// Returns `true` when password authentication can be performed at all.
+pub(crate) fn password_auth_available(config: &Ssh3ServerConfig) -> bool {
+    config.password_verifier.is_some() || platform_password_auth_available()
+}
+
+/// Verifies a password against the shadow database of the given user.
+///
+/// The stored hash is used as the salt for `crypt(3)`, exactly as the
+/// classic Unix tools do. Accounts whose hash is locked (`!` or `*` prefix)
+/// never authenticate.
+#[cfg(target_os = "linux")]
+fn default_password_verifier(username: &str, password: &str) -> io::Result<bool> {
+    let username = std::ffi::CString::new(username)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "username contains NUL byte"))?;
+    let password = std::ffi::CString::new(password)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "password contains NUL byte"))?;
+
+    let mut buffer_len = 1024usize;
+    loop {
+        let mut shadow_entry = std::mem::MaybeUninit::<nix::libc::spwd>::uninit();
+        let mut buffer = vec![0u8; buffer_len];
+        let mut result = std::ptr::null_mut();
+        let status = unsafe {
+            nix::libc::getspnam_r(
+                username.as_ptr(),
+                shadow_entry.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+
+        if status == 0 {
+            if result.is_null() {
+                return Ok(false);
+            }
+
+            let shadow_entry = unsafe { shadow_entry.assume_init() };
+            if shadow_entry.sp_pwdp.is_null() {
+                return Ok(false);
+            }
+
+            let stored_hash = unsafe { std::ffi::CStr::from_ptr(shadow_entry.sp_pwdp) };
+            let stored_bytes = stored_hash.to_bytes();
+            if stored_bytes.is_empty() || matches!(stored_bytes[0], b'!' | b'*') {
+                return Ok(false);
+            }
+
+            let computed_hash = {
+                // F-21: a panic while holding this process-wide lock must not
+                // poison it — that would turn one panicking thread into a
+                // process-wide password-auth outage. Recover the guard even
+                // from a poisoned lock: the critical section holds no
+                // invariant to repair (crypt(3) works on a static buffer).
+                let _guard = crypt_lock()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let computed = unsafe { crypt(password.as_ptr(), shadow_entry.sp_pwdp) };
+                if computed.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                unsafe { std::ffi::CStr::from_ptr(computed).to_owned() }
+            };
+
+            return Ok(computed_hash.as_c_str().to_bytes() == stored_bytes);
+        }
+
+        if status == nix::libc::ERANGE && buffer_len < 1 << 20 {
+            buffer_len *= 2;
+            continue;
+        }
+
+        return Err(io::Error::from_raw_os_error(status));
+    }
+}
+
+/// Platform stub: password authentication is not available here.
+#[cfg(not(target_os = "linux"))]
+fn default_password_verifier(_username: &str, _password: &str) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "password authentication is not supported on this platform",
+    ))
+}
+
+/// Verifies a password with the configured verifier or with the platform default.
+fn verify_password(config: &Ssh3ServerConfig, username: &str, password: &str) -> io::Result<bool> {
+    if let Some(verifier) = config.password_verifier.as_ref() {
+        return verifier(username, password);
+    }
+    default_password_verifier(username, password)
+}
+
+/// Authorizes a request against the credentials it carries.
+///
+/// Returns `Ok(true)` when the request may proceed. `Ok(false)` means the
+/// credentials were missing or wrong; an `Err` is reserved for infrastructure
+/// failures (an unreadable identity file, a failing OIDC provider).
+pub(crate) async fn authorize_request(
+    authorization: &RequestAuthorization,
+    session_user: &SessionUser,
+    conversation_id: &[u8; 32],
+    config: &Ssh3ServerConfig,
+) -> Result<bool, Ssh3AuthError> {
+    if !should_authenticate(config) {
+        return Ok(true);
+    }
+
+    match authorization {
+        RequestAuthorization::Basic { username, password } => {
+            if !config.enable_password_login || username != &session_user.username {
+                return Ok(false);
+            }
+            verify_password(config, username, password).map_err(Ssh3AuthError::from)
+        }
+        RequestAuthorization::Bearer(token) => {
+            let identities = load_authorized_identities_from_paths(
+                &configured_authorized_identity_paths(config, session_user),
+            )?;
+            if identities.is_empty() {
+                return Ok(false);
+            }
+
+            for identity in &identities {
+                match identity {
+                    Ssh3AuthorizedIdentity::PublicKey(public_key) => {
+                        if verify_bearer_token(
+                            public_key,
+                            token,
+                            &session_user.username,
+                            conversation_id,
+                        )
+                        .is_ok()
+                        {
+                            return Ok(true);
+                        }
+                    }
+                    Ssh3AuthorizedIdentity::Oidc(oidc_identity) => {
+                        let expected_nonce = conversation_id_base64(conversation_id);
+                        if verify_oidc_identity_token(
+                            oidc_identity,
+                            token,
+                            Some(expected_nonce.as_str()),
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+
+            Ok(false)
+        }
+        RequestAuthorization::None => Ok(false),
+    }
+}

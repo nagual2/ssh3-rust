@@ -6,9 +6,11 @@ use http::{
     HeaderValue, Method, Request, Response, StatusCode, Uri,
     header::{SERVER, USER_AGENT},
 };
-use ssh3_core::{Conversation, ConversationError, ConversationId};
+use ssh3_core::{Ssh3Conversation, Ssh3ConversationError, Ssh3ConversationId};
 use ssh3_proto::read_var_int;
-use ssh3_quinn::{IncomingChannelRouter, QuinnDatagramSender, RouteAcceptedChannelError};
+use ssh3_quinn::{
+    Ssh3IncomingChannelRouter, Ssh3QuinnDatagramSender, Ssh3RouteAcceptedChannelError,
+};
 
 pub const SSH3_PROTOCOL_NAME: &str = "ssh3";
 pub const SSH3_EXPORTER_LABEL: &[u8] = b"EXPORTER-SSH3";
@@ -16,20 +18,20 @@ pub const SSH3_CONVERSATION_ID_LEN: usize = 32;
 pub const SSH3_USER_HEADER: &str = "x-ssh3-user";
 pub const SSH3_VERSION_STRING: &str = "SSH 3.0 ssh3-rust 0.1.0 experimental_spec_version=alpha-00";
 
-pub type QuinnConnection = h3_quinn::Connection;
-pub type ClientConnection = h3::client::Connection<QuinnConnection, Bytes>;
-pub type ServerConnection = h3::server::Connection<QuinnConnection, Bytes>;
-pub type SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
-pub type ClientControlStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
-pub type ServerControlStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+pub type Ssh3QuinnConnection = h3_quinn::Connection;
+pub type Ssh3ClientConnection = h3::client::Connection<Ssh3QuinnConnection, Bytes>;
+pub type Ssh3ServerConnection = h3::server::Connection<Ssh3QuinnConnection, Bytes>;
+pub type Ssh3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
+pub type Ssh3ClientControlStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+pub type Ssh3ServerControlStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
 #[derive(Debug)]
-pub enum BuildConnectRequestError {
+pub enum Ssh3BuildConnectRequestError {
     InvalidUserAgent(http::header::InvalidHeaderValue),
     Http(http::Error),
 }
 
-impl fmt::Display for BuildConnectRequestError {
+impl fmt::Display for Ssh3BuildConnectRequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidUserAgent(err) => write!(f, "{err}"),
@@ -38,7 +40,7 @@ impl fmt::Display for BuildConnectRequestError {
     }
 }
 
-impl std::error::Error for BuildConnectRequestError {
+impl std::error::Error for Ssh3BuildConnectRequestError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidUserAgent(err) => Some(err),
@@ -47,24 +49,24 @@ impl std::error::Error for BuildConnectRequestError {
     }
 }
 
-impl From<http::header::InvalidHeaderValue> for BuildConnectRequestError {
+impl From<http::header::InvalidHeaderValue> for Ssh3BuildConnectRequestError {
     fn from(value: http::header::InvalidHeaderValue) -> Self {
         Self::InvalidUserAgent(value)
     }
 }
 
-impl From<http::Error> for BuildConnectRequestError {
+impl From<http::Error> for Ssh3BuildConnectRequestError {
     fn from(value: http::Error) -> Self {
         Self::Http(value)
     }
 }
 
 #[derive(Debug)]
-pub struct ConversationIdError {
+pub struct Ssh3ConversationIdError {
     inner: h3_quinn::quinn::crypto::ExportKeyingMaterialError,
 }
 
-impl fmt::Display for ConversationIdError {
+impl fmt::Display for Ssh3ConversationIdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -74,26 +76,26 @@ impl fmt::Display for ConversationIdError {
     }
 }
 
-impl std::error::Error for ConversationIdError {
+impl std::error::Error for Ssh3ConversationIdError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         None
     }
 }
 
-impl From<h3_quinn::quinn::crypto::ExportKeyingMaterialError> for ConversationIdError {
+impl From<h3_quinn::quinn::crypto::ExportKeyingMaterialError> for Ssh3ConversationIdError {
     fn from(value: h3_quinn::quinn::crypto::ExportKeyingMaterialError) -> Self {
         Self { inner: value }
     }
 }
 
 #[derive(Debug)]
-pub enum ClientConversationError {
-    ConversationId(ConversationIdError),
+pub enum Ssh3ClientConversationError {
+    ConversationId(Ssh3ConversationIdError),
     Stream(h3::error::StreamError),
     UnexpectedStatus { status: StatusCode },
 }
 
-impl fmt::Display for ClientConversationError {
+impl fmt::Display for Ssh3ClientConversationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ConversationId(err) => write!(f, "{err}"),
@@ -103,7 +105,7 @@ impl fmt::Display for ClientConversationError {
     }
 }
 
-impl std::error::Error for ClientConversationError {
+impl std::error::Error for Ssh3ClientConversationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ConversationId(err) => Some(err),
@@ -113,26 +115,26 @@ impl std::error::Error for ClientConversationError {
     }
 }
 
-impl From<ConversationIdError> for ClientConversationError {
-    fn from(value: ConversationIdError) -> Self {
+impl From<Ssh3ConversationIdError> for Ssh3ClientConversationError {
+    fn from(value: Ssh3ConversationIdError) -> Self {
         Self::ConversationId(value)
     }
 }
 
-impl From<h3::error::StreamError> for ClientConversationError {
+impl From<h3::error::StreamError> for Ssh3ClientConversationError {
     fn from(value: h3::error::StreamError) -> Self {
         Self::Stream(value)
     }
 }
 
 #[derive(Debug)]
-pub enum ServerConversationError {
+pub enum Ssh3ServerConversationError {
     Connection(h3::error::ConnectionError),
     Stream(h3::error::StreamError),
-    ConversationId(ConversationIdError),
+    ConversationId(Ssh3ConversationIdError),
 }
 
-impl fmt::Display for ServerConversationError {
+impl fmt::Display for Ssh3ServerConversationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Connection(err) => write!(f, "{err}"),
@@ -142,7 +144,7 @@ impl fmt::Display for ServerConversationError {
     }
 }
 
-impl std::error::Error for ServerConversationError {
+impl std::error::Error for Ssh3ServerConversationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Connection(err) => Some(err),
@@ -152,32 +154,32 @@ impl std::error::Error for ServerConversationError {
     }
 }
 
-impl From<h3::error::ConnectionError> for ServerConversationError {
+impl From<h3::error::ConnectionError> for Ssh3ServerConversationError {
     fn from(value: h3::error::ConnectionError) -> Self {
         Self::Connection(value)
     }
 }
 
-impl From<h3::error::StreamError> for ServerConversationError {
+impl From<h3::error::StreamError> for Ssh3ServerConversationError {
     fn from(value: h3::error::StreamError) -> Self {
         Self::Stream(value)
     }
 }
 
-impl From<ConversationIdError> for ServerConversationError {
-    fn from(value: ConversationIdError) -> Self {
+impl From<Ssh3ConversationIdError> for Ssh3ServerConversationError {
+    fn from(value: Ssh3ConversationIdError) -> Self {
         Self::ConversationId(value)
     }
 }
 
 #[derive(Debug)]
-pub enum DatagramDispatchError {
+pub enum Ssh3DatagramDispatchError {
     Connection(h3_quinn::quinn::ConnectionError),
-    Proto(ssh3_proto::Error),
-    Conversation(ConversationError),
+    Proto(ssh3_proto::Ssh3Error),
+    Conversation(Ssh3ConversationError),
 }
 
-impl fmt::Display for DatagramDispatchError {
+impl fmt::Display for Ssh3DatagramDispatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Connection(err) => write!(f, "{err}"),
@@ -187,7 +189,7 @@ impl fmt::Display for DatagramDispatchError {
     }
 }
 
-impl std::error::Error for DatagramDispatchError {
+impl std::error::Error for Ssh3DatagramDispatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Connection(err) => Some(err),
@@ -197,45 +199,45 @@ impl std::error::Error for DatagramDispatchError {
     }
 }
 
-impl From<h3_quinn::quinn::ConnectionError> for DatagramDispatchError {
+impl From<h3_quinn::quinn::ConnectionError> for Ssh3DatagramDispatchError {
     fn from(value: h3_quinn::quinn::ConnectionError) -> Self {
         Self::Connection(value)
     }
 }
 
-impl From<ssh3_proto::Error> for DatagramDispatchError {
-    fn from(value: ssh3_proto::Error) -> Self {
+impl From<ssh3_proto::Ssh3Error> for Ssh3DatagramDispatchError {
+    fn from(value: ssh3_proto::Ssh3Error) -> Self {
         Self::Proto(value)
     }
 }
 
-impl From<ConversationError> for DatagramDispatchError {
-    fn from(value: ConversationError) -> Self {
+impl From<Ssh3ConversationError> for Ssh3DatagramDispatchError {
+    fn from(value: Ssh3ConversationError) -> Self {
         Self::Conversation(value)
     }
 }
 
-pub struct EstablishedClientConversation {
-    pub conversation: Arc<Conversation>,
+pub struct Ssh3EstablishedClientConversation {
+    pub conversation: Arc<Ssh3Conversation>,
     pub connection: h3_quinn::quinn::Connection,
-    pub control_stream: ClientControlStream,
+    pub control_stream: Ssh3ClientControlStream,
     pub response: Response<()>,
 }
 
-pub struct AcceptedServerConversation {
-    pub conversation: Arc<Conversation>,
+pub struct Ssh3AcceptedServerConversation {
+    pub conversation: Arc<Ssh3Conversation>,
     pub connection: h3_quinn::quinn::Connection,
-    pub control_stream: ServerControlStream,
+    pub control_stream: Ssh3ServerControlStream,
     pub request: Request<()>,
 }
 
-pub struct ServerConnectionDriver {
+pub struct Ssh3ServerConnectionDriver {
     connection: h3_quinn::quinn::Connection,
-    server: ServerConnection,
-    channel_router: Arc<IncomingChannelRouter>,
+    server: Ssh3ServerConnection,
+    channel_router: Arc<Ssh3IncomingChannelRouter>,
 }
 
-impl ServerConnectionDriver {
+impl Ssh3ServerConnectionDriver {
     pub async fn new(
         connection: h3_quinn::quinn::Connection,
     ) -> Result<Self, h3::error::ConnectionError> {
@@ -243,7 +245,7 @@ impl ServerConnectionDriver {
         Ok(Self {
             connection,
             server,
-            channel_router: Arc::new(IncomingChannelRouter::new()),
+            channel_router: Arc::new(Ssh3IncomingChannelRouter::new()),
         })
     }
 
@@ -251,7 +253,7 @@ impl ServerConnectionDriver {
         &self.connection
     }
 
-    pub fn channel_router(&self) -> &Arc<IncomingChannelRouter> {
+    pub fn channel_router(&self) -> &Arc<Ssh3IncomingChannelRouter> {
         &self.channel_router
     }
 
@@ -259,7 +261,7 @@ impl ServerConnectionDriver {
         &mut self,
         max_packet_size: u64,
         default_datagrams_queue_size: usize,
-    ) -> Result<Option<AcceptedServerConversation>, ServerConversationError> {
+    ) -> Result<Option<Ssh3AcceptedServerConversation>, Ssh3ServerConversationError> {
         let accepted = accept_server_conversation(
             &mut self.server,
             self.connection.clone(),
@@ -276,7 +278,7 @@ impl ServerConnectionDriver {
         Ok(accepted)
     }
 
-    pub fn unregister_conversation(&self, control_stream_id: u64) -> Option<Arc<Conversation>> {
+    pub fn unregister_conversation(&self, control_stream_id: u64) -> Option<Arc<Ssh3Conversation>> {
         self.channel_router
             .unregister_conversation(control_stream_id)
     }
@@ -284,18 +286,20 @@ impl ServerConnectionDriver {
     pub async fn route_datagram(
         &self,
         datagram: &[u8],
-    ) -> Result<Option<Arc<Conversation>>, DatagramDispatchError> {
+    ) -> Result<Option<Arc<Ssh3Conversation>>, Ssh3DatagramDispatchError> {
         route_registered_datagram(self.channel_router.as_ref(), datagram).await
     }
 
     pub async fn accept_and_route_datagram(
         &self,
-    ) -> Result<Option<Arc<Conversation>>, DatagramDispatchError> {
+    ) -> Result<Option<Arc<Ssh3Conversation>>, Ssh3DatagramDispatchError> {
         let datagram = self.connection.read_datagram().await?;
         self.route_datagram(&datagram).await
     }
 
-    pub async fn accept_and_route_datagrams_forever(&self) -> Result<(), DatagramDispatchError> {
+    pub async fn accept_and_route_datagrams_forever(
+        &self,
+    ) -> Result<(), Ssh3DatagramDispatchError> {
         loop {
             self.accept_and_route_datagram().await?;
         }
@@ -303,13 +307,15 @@ impl ServerConnectionDriver {
 
     pub async fn accept_and_route_channel(
         &self,
-    ) -> Result<Arc<Conversation>, RouteAcceptedChannelError> {
+    ) -> Result<Arc<Ssh3Conversation>, Ssh3RouteAcceptedChannelError> {
         self.channel_router
             .accept_and_route_channel(&self.connection)
             .await
     }
 
-    pub async fn accept_and_route_channels_forever(&self) -> Result<(), RouteAcceptedChannelError> {
+    pub async fn accept_and_route_channels_forever(
+        &self,
+    ) -> Result<(), Ssh3RouteAcceptedChannelError> {
         self.channel_router
             .clone()
             .accept_and_route_channels_forever(self.connection.clone())
@@ -331,24 +337,24 @@ pub fn configure_server_builder(builder: &mut h3::server::Builder) -> &mut h3::s
 
 pub async fn new_client(
     connection: h3_quinn::quinn::Connection,
-) -> Result<(ClientConnection, SendRequest), h3::error::ConnectionError> {
+) -> Result<(Ssh3ClientConnection, Ssh3SendRequest), h3::error::ConnectionError> {
     let mut builder = h3::client::builder();
     configure_client_builder(&mut builder);
-    builder.build(QuinnConnection::new(connection)).await
+    builder.build(Ssh3QuinnConnection::new(connection)).await
 }
 
 pub async fn new_server(
     connection: h3_quinn::quinn::Connection,
-) -> Result<ServerConnection, h3::error::ConnectionError> {
+) -> Result<Ssh3ServerConnection, h3::error::ConnectionError> {
     let mut builder = h3::server::builder();
     configure_server_builder(&mut builder);
-    builder.build(QuinnConnection::new(connection)).await
+    builder.build(Ssh3QuinnConnection::new(connection)).await
 }
 
 pub fn build_connect_request(
     uri: Uri,
     user_agent: impl AsRef<str>,
-) -> Result<Request<()>, BuildConnectRequestError> {
+) -> Result<Request<()>, Ssh3BuildConnectRequestError> {
     let mut request = Request::builder()
         .method(Method::CONNECT)
         .uri(uri)
@@ -362,37 +368,37 @@ pub fn build_connect_request(
 
 pub fn generate_conversation_id(
     connection: &h3_quinn::quinn::Connection,
-) -> Result<ConversationId, ConversationIdError> {
+) -> Result<Ssh3ConversationId, Ssh3ConversationIdError> {
     let mut conversation_id = [0; SSH3_CONVERSATION_ID_LEN];
     connection.export_keying_material(&mut conversation_id, SSH3_EXPORTER_LABEL, &[])?;
     Ok(conversation_id)
 }
 
 pub async fn establish_client_conversation(
-    send_request: &mut SendRequest,
+    send_request: &mut Ssh3SendRequest,
     connection: h3_quinn::quinn::Connection,
     request: Request<()>,
     max_packet_size: u64,
     default_datagrams_queue_size: usize,
-) -> Result<EstablishedClientConversation, ClientConversationError> {
+) -> Result<Ssh3EstablishedClientConversation, Ssh3ClientConversationError> {
     let conversation_id = generate_conversation_id(&connection)?;
     let mut control_stream = send_request.send_request(request).await?;
     let response = control_stream.recv_response().await?;
     if response.status() != StatusCode::OK {
-        return Err(ClientConversationError::UnexpectedStatus {
+        return Err(Ssh3ClientConversationError::UnexpectedStatus {
             status: response.status(),
         });
     }
 
-    let conversation = Arc::new(Conversation::new(
+    let conversation = Arc::new(Ssh3Conversation::new(
         control_stream.id().into_inner(),
         conversation_id,
         max_packet_size,
         default_datagrams_queue_size,
-        Arc::new(QuinnDatagramSender::new(connection.clone())),
+        Arc::new(Ssh3QuinnDatagramSender::new(connection.clone())),
     ));
 
-    Ok(EstablishedClientConversation {
+    Ok(Ssh3EstablishedClientConversation {
         conversation,
         connection,
         control_stream,
@@ -401,25 +407,25 @@ pub async fn establish_client_conversation(
 }
 
 pub async fn accept_server_conversation(
-    server: &mut ServerConnection,
+    server: &mut Ssh3ServerConnection,
     connection: h3_quinn::quinn::Connection,
     max_packet_size: u64,
     default_datagrams_queue_size: usize,
-) -> Result<Option<AcceptedServerConversation>, ServerConversationError> {
+) -> Result<Option<Ssh3AcceptedServerConversation>, Ssh3ServerConversationError> {
     let Some(resolver) = server.accept().await? else {
         return Ok(None);
     };
     let (request, control_stream) = resolver.resolve_request().await?;
     let conversation_id = generate_conversation_id(&connection)?;
-    let conversation = Arc::new(Conversation::new(
+    let conversation = Arc::new(Ssh3Conversation::new(
         control_stream.id().into_inner(),
         conversation_id,
         max_packet_size,
         default_datagrams_queue_size,
-        Arc::new(QuinnDatagramSender::new(connection.clone())),
+        Arc::new(Ssh3QuinnDatagramSender::new(connection.clone())),
     ));
 
-    Ok(Some(AcceptedServerConversation {
+    Ok(Some(Ssh3AcceptedServerConversation {
         conversation,
         connection,
         control_stream,
@@ -453,7 +459,7 @@ pub fn request_user_agent(request: &Request<()>) -> Option<&str> {
 pub fn response_with_server_header(
     status: StatusCode,
     server_version: impl AsRef<str>,
-) -> Result<Response<()>, BuildConnectRequestError> {
+) -> Result<Response<()>, Ssh3BuildConnectRequestError> {
     Ok(Response::builder()
         .status(status)
         .header(SERVER, HeaderValue::from_str(server_version.as_ref())?)
@@ -461,9 +467,9 @@ pub fn response_with_server_header(
 }
 
 pub async fn dispatch_datagram(
-    conversation: &Conversation,
+    conversation: &Ssh3Conversation,
     datagram: &[u8],
-) -> Result<(), DatagramDispatchError> {
+) -> Result<(), Ssh3DatagramDispatchError> {
     let mut cursor = Cursor::new(datagram);
     let control_stream_id = read_var_int(&mut cursor)?;
     if control_stream_id != conversation.control_stream_id() {
@@ -472,15 +478,15 @@ pub async fn dispatch_datagram(
 
     let offset = cursor.position() as usize;
     match conversation.add_datagram(&datagram[offset..]).await {
-        Ok(()) | Err(ConversationError::ChannelNotFound { .. }) => Ok(()),
-        Err(err) => Err(DatagramDispatchError::Conversation(err)),
+        Ok(()) | Err(Ssh3ConversationError::ChannelNotFound { .. }) => Ok(()),
+        Err(err) => Err(Ssh3DatagramDispatchError::Conversation(err)),
     }
 }
 
 pub async fn route_registered_datagram(
-    channel_router: &IncomingChannelRouter,
+    channel_router: &Ssh3IncomingChannelRouter,
     datagram: &[u8],
-) -> Result<Option<Arc<Conversation>>, DatagramDispatchError> {
+) -> Result<Option<Arc<Ssh3Conversation>>, Ssh3DatagramDispatchError> {
     let mut cursor = Cursor::new(datagram);
     let control_stream_id = read_var_int(&mut cursor)?;
     let Some(conversation) = channel_router.conversation(control_stream_id) else {
@@ -489,23 +495,23 @@ pub async fn route_registered_datagram(
 
     let offset = cursor.position() as usize;
     match conversation.add_datagram(&datagram[offset..]).await {
-        Ok(()) | Err(ConversationError::ChannelNotFound { .. }) => Ok(Some(conversation)),
-        Err(err) => Err(DatagramDispatchError::Conversation(err)),
+        Ok(()) | Err(Ssh3ConversationError::ChannelNotFound { .. }) => Ok(Some(conversation)),
+        Err(err) => Err(Ssh3DatagramDispatchError::Conversation(err)),
     }
 }
 
 pub async fn dispatch_one_datagram(
-    conversation: &Conversation,
+    conversation: &Ssh3Conversation,
     connection: &h3_quinn::quinn::Connection,
-) -> Result<(), DatagramDispatchError> {
+) -> Result<(), Ssh3DatagramDispatchError> {
     let datagram = connection.read_datagram().await?;
     dispatch_datagram(conversation, &datagram).await
 }
 
 pub async fn dispatch_datagrams_forever(
-    conversation: Arc<Conversation>,
+    conversation: Arc<Ssh3Conversation>,
     connection: h3_quinn::quinn::Connection,
-) -> Result<(), DatagramDispatchError> {
+) -> Result<(), Ssh3DatagramDispatchError> {
     loop {
         dispatch_one_datagram(conversation.as_ref(), &connection).await?;
     }
@@ -518,14 +524,14 @@ mod tests {
 
     use futures_util::future;
     use http::{StatusCode, Version};
-    use ssh3_core::AcceptedChannel;
+    use ssh3_core::Ssh3AcceptedChannel;
     use ssh3_quinn::{
         client_config_for_certificate, open_udp_forwarding_channel, self_signed_server_config,
     };
     use tokio::sync::oneshot;
 
     use super::{
-        SSH3_PROTOCOL_NAME, SSH3_VERSION_STRING, ServerConnectionDriver,
+        SSH3_PROTOCOL_NAME, SSH3_VERSION_STRING, Ssh3ServerConnectionDriver,
         accept_server_conversation, build_connect_request, establish_client_conversation,
         is_ssh3_connect, new_client, new_server, request_protocol, request_user_agent,
         response_server_header, response_with_server_header,
@@ -687,7 +693,7 @@ mod tests {
         let (datagram_seen_tx, datagram_seen_rx) = oneshot::channel();
 
         let server_task = tokio::spawn(async move {
-            let mut driver = ServerConnectionDriver::new(server_quinn).await.unwrap();
+            let mut driver = Ssh3ServerConnectionDriver::new(server_quinn).await.unwrap();
             let mut accepted = tokio::time::timeout(
                 Duration::from_secs(5),
                 driver.accept_conversation(30_000, 10),
@@ -723,7 +729,7 @@ mod tests {
             .unwrap()
             .unwrap();
             match accepted_channel {
-                AcceptedChannel::UdpForwarding {
+                Ssh3AcceptedChannel::UdpForwarding {
                     channel,
                     remote_addr,
                 } => {
@@ -824,7 +830,7 @@ mod tests {
         let (datagram_seen_tx, datagram_seen_rx) = oneshot::channel::<()>();
 
         let server_task = async move {
-            let mut driver = ServerConnectionDriver::new(server_quinn).await.unwrap();
+            let mut driver = Ssh3ServerConnectionDriver::new(server_quinn).await.unwrap();
             let mut accepted = tokio::time::timeout(
                 Duration::from_secs(5),
                 driver.accept_conversation(30_000, 10),
@@ -854,7 +860,7 @@ mod tests {
             .unwrap()
             .unwrap();
             let server_channel = match accepted_channel {
-                AcceptedChannel::UdpForwarding {
+                Ssh3AcceptedChannel::UdpForwarding {
                     channel,
                     remote_addr,
                 } => {
@@ -932,7 +938,6 @@ mod tests {
         };
 
         let (server_result, client_result) = tokio::join!(server_task, client_task);
-        let _ = server_result;
-        let _ = client_result;
+        let _ = (server_result, client_result);
     }
 }

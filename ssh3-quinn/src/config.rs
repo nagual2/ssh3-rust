@@ -15,14 +15,14 @@ use rustls::{
 };
 
 #[derive(Debug)]
-pub enum ConfigError {
+pub enum Ssh3ConfigError {
     Rcgen(rcgen::Error),
     Rustls(rustls::Error),
     Verifier(VerifierBuilderError),
     NoInitialCipherSuite(NoInitialCipherSuite),
 }
 
-impl fmt::Display for ConfigError {
+impl fmt::Display for Ssh3ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Rcgen(err) => write!(f, "{err}"),
@@ -33,7 +33,7 @@ impl fmt::Display for ConfigError {
     }
 }
 
-impl std::error::Error for ConfigError {
+impl std::error::Error for Ssh3ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Rcgen(err) => Some(err),
@@ -44,25 +44,25 @@ impl std::error::Error for ConfigError {
     }
 }
 
-impl From<rcgen::Error> for ConfigError {
+impl From<rcgen::Error> for Ssh3ConfigError {
     fn from(value: rcgen::Error) -> Self {
         Self::Rcgen(value)
     }
 }
 
-impl From<rustls::Error> for ConfigError {
+impl From<rustls::Error> for Ssh3ConfigError {
     fn from(value: rustls::Error) -> Self {
         Self::Rustls(value)
     }
 }
 
-impl From<VerifierBuilderError> for ConfigError {
+impl From<VerifierBuilderError> for Ssh3ConfigError {
     fn from(value: VerifierBuilderError) -> Self {
         Self::Verifier(value)
     }
 }
 
-impl From<NoInitialCipherSuite> for ConfigError {
+impl From<NoInitialCipherSuite> for Ssh3ConfigError {
     fn from(value: NoInitialCipherSuite) -> Self {
         Self::NoInitialCipherSuite(value)
     }
@@ -77,7 +77,7 @@ fn tls_provider() -> Arc<CryptoProvider> {
 pub fn server_config_with_single_cert(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
-) -> Result<ServerConfig, ConfigError> {
+) -> Result<ServerConfig, Ssh3ConfigError> {
     let mut server_crypto = rustls::ServerConfig::builder_with_provider(tls_provider())
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
@@ -88,7 +88,7 @@ pub fn server_config_with_single_cert(
     )))
 }
 
-pub fn client_config_with_roots(roots: RootCertStore) -> Result<ClientConfig, ConfigError> {
+pub fn client_config_with_roots(roots: RootCertStore) -> Result<ClientConfig, Ssh3ConfigError> {
     let mut client_crypto = rustls::ClientConfig::builder_with_provider(tls_provider())
         .with_safe_default_protocol_versions()?
         .with_root_certificates(roots)
@@ -101,18 +101,18 @@ pub fn client_config_with_roots(roots: RootCertStore) -> Result<ClientConfig, Co
 
 pub fn client_config_for_certificate(
     server_certificate: CertificateDer<'static>,
-) -> Result<ClientConfig, ConfigError> {
+) -> Result<ClientConfig, Ssh3ConfigError> {
     let mut roots = RootCertStore::empty();
     roots.add(server_certificate)?;
     client_config_with_roots(roots)
 }
 
-pub fn client_config_with_webpki_roots() -> Result<ClientConfig, ConfigError> {
+pub fn client_config_with_webpki_roots() -> Result<ClientConfig, Ssh3ConfigError> {
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     client_config_with_roots(roots)
 }
 
-pub fn client_config_insecure() -> Result<ClientConfig, ConfigError> {
+pub fn client_config_insecure() -> Result<ClientConfig, Ssh3ConfigError> {
     let mut client_config = rustls::ClientConfig::builder_with_provider(tls_provider())
         .with_safe_default_protocol_versions()?
         .dangerous()
@@ -126,7 +126,7 @@ pub fn client_config_insecure() -> Result<ClientConfig, ConfigError> {
 
 pub fn self_signed_server_config(
     subject_alt_names: Vec<String>,
-) -> Result<(ServerConfig, CertificateDer<'static>), ConfigError> {
+) -> Result<(ServerConfig, CertificateDer<'static>), Ssh3ConfigError> {
     let CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(subject_alt_names)?;
     let certificate = cert.der().clone();
     let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));

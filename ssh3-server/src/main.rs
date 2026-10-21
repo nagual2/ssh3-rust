@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueHint, error::ErrorKind};
-use ssh3_server::{ServerConfig, run_with_self_signed};
+use ssh3_server::{Ssh3ServerConfig, run_with_self_signed};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "ssh3-server",
+    name = "ssh3-rust-server",
     version,
     about = "Starts a minimal Rust SSH3 server with a self-signed certificate."
 )]
@@ -42,9 +42,9 @@ struct Cli {
     shell: Option<String>,
 }
 
-fn parse_args() -> Result<ServerConfig, clap::Error> {
+fn parse_args() -> Result<Ssh3ServerConfig, clap::Error> {
     let cli = Cli::try_parse()?;
-    let mut config = ServerConfig::default();
+    let mut config = Ssh3ServerConfig::default();
     if let Some(bind_addr) = cli.bind {
         config.bind_addr = bind_addr;
     }
@@ -85,7 +85,7 @@ async fn main() -> ExitCode {
     match run_with_self_signed(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("ssh3-server failed: {err}");
+            eprintln!("ssh3-rust-server failed: {err}");
             ExitCode::FAILURE
         }
     }

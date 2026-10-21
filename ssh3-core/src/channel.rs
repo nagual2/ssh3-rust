@@ -1,3 +1,9 @@
+//! Channels of a conversation: the framing of the SSH messages they carry.
+//!
+//! A channel multiplexes three kinds of traffic over a pair of streams: SSH
+//! messages (requests, data, confirmations), datagrams and the channel
+//! header that identifies the channel inside its conversation.
+
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -5,39 +11,58 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ssh3_proto::{
-    ChannelHeader, ChannelOpenConfirmationMessage, ChannelOpenFailureMessage,
-    ChannelRequestMessage, DataOrExtendedDataMessage, Message, SSH_EXTENDED_DATA_NONE, SshDataType,
+    SSH_EXTENDED_DATA_NONE, Ssh3ChannelHeader, Ssh3ChannelOpenConfirmationMessage,
+    Ssh3ChannelOpenFailureMessage, Ssh3ChannelRequestMessage, Ssh3DataOrExtendedDataMessage,
+    Ssh3DataType, Ssh3Message,
 };
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::conversation::{ConversationDatagramSender, ConversationId};
-use crate::queue::DatagramQueue;
-use crate::transport::{ReceiveStream, SendStream};
+use crate::conversation::{Ssh3ConversationDatagramSender, Ssh3ConversationId};
+use crate::queue::Ssh3DatagramQueue;
+use crate::transport::{Ssh3ReceiveStream, Ssh3SendStream};
 
+/// Static description of a channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChannelInfo {
+pub struct Ssh3ChannelInfo {
+    /// Maximum payload size, in bytes, the peer accepts on this channel.
     pub max_packet_size: u64,
+    /// Id of the stream the channel belongs to.
     pub conversation_stream_id: u64,
-    pub conversation_id: ConversationId,
+    /// Id of the conversation the channel belongs to.
+    pub conversation_id: Ssh3ConversationId,
+    /// Id of the channel inside its conversation.
     pub channel_id: u64,
+    /// Type of the channel, for example `session` or `direct-tcp`.
     pub channel_type: Vec<u8>,
 }
 
+/// A channel that the peer opened and that was accepted by the local side.
+///
+/// Forwarding channels carry the address the peer asked the server to
+/// connect to; plain channels do not.
 #[derive(Clone)]
-pub enum AcceptedChannel {
-    Channel(Arc<Channel>),
+pub enum Ssh3AcceptedChannel {
+    /// A plain channel, for example a `session` channel.
+    Channel(Arc<Ssh3Channel>),
+    /// A channel that forwards datagrams to a remote UDP endpoint.
     UdpForwarding {
-        channel: Arc<Channel>,
+        /// The underlying channel.
+        channel: Arc<Ssh3Channel>,
+        /// Address the server shall forward the datagrams to.
         remote_addr: SocketAddr,
     },
+    /// A channel that forwards a byte stream to a remote TCP endpoint.
     TcpForwarding {
-        channel: Arc<Channel>,
+        /// The underlying channel.
+        channel: Arc<Ssh3Channel>,
+        /// Address the server shall forward the stream to.
         remote_addr: SocketAddr,
     },
 }
 
-impl AcceptedChannel {
-    pub fn channel(&self) -> &Arc<Channel> {
+impl Ssh3AcceptedChannel {
+    /// Returns the underlying channel.
+    pub fn channel(&self) -> &Arc<Ssh3Channel> {
         match self {
             Self::Channel(channel)
             | Self::UdpForwarding { channel, .. }
@@ -45,7 +70,8 @@ impl AcceptedChannel {
         }
     }
 
-    pub fn into_channel(self) -> Arc<Channel> {
+    /// Consumes the value and returns the underlying channel.
+    pub fn into_channel(self) -> Arc<Ssh3Channel> {
         match self {
             Self::Channel(channel)
             | Self::UdpForwarding { channel, .. }
@@ -53,6 +79,7 @@ impl AcceptedChannel {
         }
     }
 
+    /// Returns the forwarding target, or `None` for a plain channel.
     pub fn remote_addr(&self) -> Option<SocketAddr> {
         match self {
             Self::Channel(_) => None,
@@ -63,19 +90,22 @@ impl AcceptedChannel {
     }
 }
 
-impl From<Arc<Channel>> for AcceptedChannel {
-    fn from(value: Arc<Channel>) -> Self {
+impl From<Arc<Ssh3Channel>> for Ssh3AcceptedChannel {
+    fn from(value: Arc<Ssh3Channel>) -> Self {
         Self::Channel(value)
     }
 }
 
+/// The refusal of the peer to open a channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChannelOpenFailure {
+pub struct Ssh3ChannelOpenFailure {
+    /// Protocol-specific reason of the refusal.
     pub reason_code: u64,
+    /// Human readable description of the refusal, in UTF-8.
     pub error_message_utf8: Vec<u8>,
 }
 
-impl fmt::Display for ChannelOpenFailure {
+impl fmt::Display for Ssh3ChannelOpenFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -86,14 +116,16 @@ impl fmt::Display for ChannelOpenFailure {
     }
 }
 
-impl std::error::Error for ChannelOpenFailure {}
+impl std::error::Error for Ssh3ChannelOpenFailure {}
 
+/// A message that arrived before the channel was confirmed.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MessageOnNonConfirmedChannel {
-    pub message: Message,
+pub struct Ssh3MessageOnNonConfirmedChannel {
+    /// The message that was received too early.
+    pub message: Ssh3Message,
 }
 
-impl fmt::Display for MessageOnNonConfirmedChannel {
+impl fmt::Display for Ssh3MessageOnNonConfirmedChannel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -103,14 +135,16 @@ impl fmt::Display for MessageOnNonConfirmedChannel {
     }
 }
 
-impl std::error::Error for MessageOnNonConfirmedChannel {}
+impl std::error::Error for Ssh3MessageOnNonConfirmedChannel {}
 
+/// A datagram that was sent on a channel that has no datagram transport.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SentDatagramOnNonDatagramChannel {
+pub struct Ssh3SentDatagramOnNonDatagramChannel {
+    /// Id of the offending channel.
     pub channel_id: u64,
 }
 
-impl fmt::Display for SentDatagramOnNonDatagramChannel {
+impl fmt::Display for Ssh3SentDatagramOnNonDatagramChannel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -120,22 +154,31 @@ impl fmt::Display for SentDatagramOnNonDatagramChannel {
     }
 }
 
-impl std::error::Error for SentDatagramOnNonDatagramChannel {}
+impl std::error::Error for Ssh3SentDatagramOnNonDatagramChannel {}
 
+/// Everything that can fail while a channel is used.
 #[derive(Debug)]
-pub enum ChannelError {
+pub enum Ssh3ChannelError {
+    /// The underlying stream failed.
     Io(io::Error),
-    Proto(ssh3_proto::Error),
-    OpenFailure(ChannelOpenFailure),
-    NonConfirmed(MessageOnNonConfirmedChannel),
-    DatagramSenderMissing(SentDatagramOnNonDatagramChannel),
+    /// The peer sent a message that could not be decoded.
+    Proto(ssh3_proto::Ssh3Error),
+    /// The peer refused to open the channel.
+    OpenFailure(Ssh3ChannelOpenFailure),
+    /// A message arrived before the channel was confirmed.
+    NonConfirmed(Ssh3MessageOnNonConfirmedChannel),
+    /// A datagram was sent on a channel without a datagram transport.
+    DatagramSenderMissing(Ssh3SentDatagramOnNonDatagramChannel),
+    /// The negotiated maximum packet size leaves no room for the payload.
     MaxPacketSizeTooSmall {
+        /// The negotiated maximum packet size, in bytes.
         max_packet_size: u64,
+        /// Size of the message overhead, in bytes.
         message_overhead: usize,
     },
 }
 
-impl fmt::Display for ChannelError {
+impl fmt::Display for Ssh3ChannelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "{err}"),
@@ -155,7 +198,7 @@ impl fmt::Display for ChannelError {
     }
 }
 
-impl std::error::Error for ChannelError {
+impl std::error::Error for Ssh3ChannelError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
@@ -168,40 +211,51 @@ impl std::error::Error for ChannelError {
     }
 }
 
-impl From<io::Error> for ChannelError {
+impl From<io::Error> for Ssh3ChannelError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
     }
 }
 
-impl From<ssh3_proto::Error> for ChannelError {
-    fn from(value: ssh3_proto::Error) -> Self {
+impl From<ssh3_proto::Ssh3Error> for Ssh3ChannelError {
+    fn from(value: ssh3_proto::Ssh3Error) -> Self {
         Self::Proto(value)
     }
 }
 
-pub struct Channel {
-    info: ChannelInfo,
+/// A channel inside a conversation.
+///
+/// The channel owns the pair of streams that carry its SSH messages, keeps
+/// track of the confirmation handshake and, for datagram channels, holds the
+/// queue of datagrams that were not consumed yet.
+pub struct Ssh3Channel {
+    info: Ssh3ChannelInfo,
     confirm_sent: AtomicBool,
     confirm_received: AtomicBool,
     header: Mutex<Option<Vec<u8>>>,
-    datagram_sender: RwLock<Option<Arc<ConversationDatagramSender>>>,
-    recv: AsyncMutex<Box<dyn ReceiveStream>>,
-    send: AsyncMutex<Box<dyn SendStream>>,
-    datagrams_queue: RwLock<Arc<DatagramQueue>>,
+    datagram_sender: RwLock<Option<Arc<Ssh3ConversationDatagramSender>>>,
+    recv: AsyncMutex<Box<dyn Ssh3ReceiveStream>>,
+    send: AsyncMutex<Box<dyn Ssh3SendStream>>,
+    datagrams_queue: RwLock<Arc<Ssh3DatagramQueue>>,
 }
 
-impl Channel {
+impl Ssh3Channel {
+    /// Creates a channel.
+    ///
+    /// `send_header` decides whether the channel header is written before the
+    /// first message, `confirm_sent` and `confirm_received` record the state
+    /// of the confirmation handshake, and `additional_header_bytes` carries
+    /// the target address of a forwarded channel.
     #[allow(clippy::too_many_arguments)]
     pub fn new<R, W>(
         conversation_stream_id: u64,
-        conversation_id: ConversationId,
+        conversation_id: Ssh3ConversationId,
         channel_id: u64,
         channel_type: impl Into<Vec<u8>>,
         max_packet_size: u64,
         recv: R,
         send: W,
-        datagram_sender: Option<Arc<ConversationDatagramSender>>,
+        datagram_sender: Option<Arc<Ssh3ConversationDatagramSender>>,
         send_header: bool,
         confirm_sent: bool,
         confirm_received: bool,
@@ -209,12 +263,12 @@ impl Channel {
         additional_header_bytes: Option<&[u8]>,
     ) -> Self
     where
-        R: ReceiveStream + 'static,
-        W: SendStream + 'static,
+        R: Ssh3ReceiveStream + 'static,
+        W: Ssh3SendStream + 'static,
     {
         let channel_type = channel_type.into();
         let header = send_header.then(|| {
-            ChannelHeader {
+            Ssh3ChannelHeader {
                 conversation_stream_id,
                 channel_type: channel_type.clone(),
                 max_packet_size,
@@ -223,7 +277,7 @@ impl Channel {
         });
 
         Self {
-            info: ChannelInfo {
+            info: Ssh3ChannelInfo {
                 max_packet_size,
                 conversation_stream_id,
                 conversation_id,
@@ -236,70 +290,82 @@ impl Channel {
             datagram_sender: RwLock::new(datagram_sender),
             recv: AsyncMutex::new(Box::new(recv)),
             send: AsyncMutex::new(Box::new(send)),
-            datagrams_queue: RwLock::new(Arc::new(DatagramQueue::new(datagrams_queue_size))),
+            datagrams_queue: RwLock::new(Arc::new(Ssh3DatagramQueue::new(datagrams_queue_size))),
         }
     }
 
-    pub fn info(&self) -> &ChannelInfo {
+    /// Returns the static description of the channel.
+    pub fn info(&self) -> &Ssh3ChannelInfo {
         &self.info
     }
 
+    /// Returns the id of the channel inside its conversation.
     pub fn channel_id(&self) -> u64 {
         self.info.channel_id
     }
 
-    pub fn conversation_id(&self) -> ConversationId {
+    /// Returns the id of the conversation the channel belongs to.
+    pub fn conversation_id(&self) -> Ssh3ConversationId {
         self.info.conversation_id
     }
 
+    /// Returns the id of the stream the channel belongs to.
     pub fn conversation_stream_id(&self) -> u64 {
         self.info.conversation_stream_id
     }
 
+    /// Returns the maximum payload size, in bytes, accepted on the channel.
     pub fn max_packet_size(&self) -> u64 {
         self.info.max_packet_size
     }
 
+    /// Returns the type of the channel, for example `session`.
     pub fn channel_type(&self) -> &[u8] {
         &self.info.channel_type
     }
 
+    /// Returns `true` once the peer confirmed the channel.
     pub fn confirm_received(&self) -> bool {
         self.confirm_received.load(Ordering::SeqCst)
     }
 
-    pub async fn wait_for_confirmation(&self) -> Result<(), ChannelError> {
+    /// Waits until the peer confirms the channel.
+    ///
+    /// Fails with [`Ssh3ChannelError::OpenFailure`] when the peer refuses the
+    /// channel and with [`Ssh3ChannelError::NonConfirmed`] when it sends an
+    /// unexpected message instead of a confirmation.
+    pub async fn wait_for_confirmation(&self) -> Result<(), Ssh3ChannelError> {
         if self.confirm_received() {
             return Ok(());
         }
 
-        loop {
-            let message = {
-                let mut recv = self.recv.lock().await;
-                parse_message(recv.as_mut()).await?
-            };
+        let message = {
+            let mut recv = self.recv.lock().await;
+            parse_message(recv.as_mut()).await?
+        };
 
-            match message {
-                Message::ChannelOpenConfirmation(_) => {
-                    self.confirm_received.store(true, Ordering::SeqCst);
-                    return Ok(());
-                }
-                Message::ChannelOpenFailure(message) => {
-                    return Err(ChannelError::OpenFailure(ChannelOpenFailure {
-                        reason_code: message.reason_code,
-                        error_message_utf8: message.error_message_utf8,
-                    }));
-                }
-                other => {
-                    return Err(ChannelError::NonConfirmed(MessageOnNonConfirmedChannel {
-                        message: other,
-                    }));
-                }
+        match message {
+            Ssh3Message::ChannelOpenConfirmation(_) => {
+                self.confirm_received.store(true, Ordering::SeqCst);
+                Ok(())
             }
+            Ssh3Message::ChannelOpenFailure(message) => {
+                Err(Ssh3ChannelError::OpenFailure(Ssh3ChannelOpenFailure {
+                    reason_code: message.reason_code,
+                    error_message_utf8: message.error_message_utf8,
+                }))
+            }
+            other => Err(Ssh3ChannelError::NonConfirmed(
+                Ssh3MessageOnNonConfirmedChannel { message: other },
+            )),
         }
     }
 
-    pub async fn next_message(&self) -> Result<Message, ChannelError> {
+    /// Reads the next message from the channel.
+    ///
+    /// A confirmation message is consumed silently: it only updates the
+    /// confirmation state. Any other message is returned to the caller.
+    pub async fn next_message(&self) -> Result<Ssh3Message, Ssh3ChannelError> {
         loop {
             let message = {
                 let mut recv = self.recv.lock().await;
@@ -307,21 +373,21 @@ impl Channel {
             };
 
             match message {
-                Message::ChannelOpenConfirmation(_) => {
+                Ssh3Message::ChannelOpenConfirmation(_) => {
                     self.confirm_received.store(true, Ordering::SeqCst);
                     continue;
                 }
-                Message::ChannelOpenFailure(message) => {
-                    return Err(ChannelError::OpenFailure(ChannelOpenFailure {
+                Ssh3Message::ChannelOpenFailure(message) => {
+                    return Err(Ssh3ChannelError::OpenFailure(Ssh3ChannelOpenFailure {
                         reason_code: message.reason_code,
                         error_message_utf8: message.error_message_utf8,
                     }));
                 }
                 other => {
                     if !self.confirm_sent.load(Ordering::SeqCst) {
-                        return Err(ChannelError::NonConfirmed(MessageOnNonConfirmedChannel {
-                            message: other,
-                        }));
+                        return Err(Ssh3ChannelError::NonConfirmed(
+                            Ssh3MessageOnNonConfirmedChannel { message: other },
+                        ));
                     }
                     return Ok(other);
                 }
@@ -329,7 +395,10 @@ impl Channel {
         }
     }
 
-    pub async fn maybe_send_header(&self) -> Result<(), ChannelError> {
+    /// Writes the channel header, unless it was already written.
+    ///
+    /// The header is sent at most once per channel, before the first message.
+    pub async fn maybe_send_header(&self) -> Result<(), Ssh3ChannelError> {
         let header = self.header.lock().unwrap().take();
         if let Some(header) = header {
             let mut send = self.send.lock().await;
@@ -338,14 +407,19 @@ impl Channel {
         Ok(())
     }
 
+    /// Writes payload data to the channel.
+    ///
+    /// The payload is split into chunks that fit into the negotiated maximum
+    /// packet size. Returns the number of bytes written, including the
+    /// framing of the data messages.
     pub async fn write_data(
         &self,
         data_buf: &[u8],
-        data_type: SshDataType,
-    ) -> Result<usize, ChannelError> {
+        data_type: Ssh3DataType,
+    ) -> Result<usize, Ssh3ChannelError> {
         self.maybe_send_header().await?;
 
-        let empty = DataOrExtendedDataMessage {
+        let empty = Ssh3DataOrExtendedDataMessage {
             data_type,
             data: Vec::new(),
         };
@@ -354,7 +428,7 @@ impl Channel {
             .info
             .max_packet_size
             .checked_sub(overhead as u64)
-            .ok_or(ChannelError::MaxPacketSizeTooSmall {
+            .ok_or(Ssh3ChannelError::MaxPacketSizeTooSmall {
                 max_packet_size: self.info.max_packet_size,
                 message_overhead: overhead,
             })? as usize;
@@ -362,7 +436,7 @@ impl Channel {
         let mut written = 0;
         let mut send = self.send.lock().await;
         for chunk in data_buf.chunks(max_payload.max(1)) {
-            let message = Message::Data(DataOrExtendedDataMessage {
+            let message = Ssh3Message::Data(Ssh3DataOrExtendedDataMessage {
                 data_type,
                 data: chunk.to_vec(),
             });
@@ -373,40 +447,51 @@ impl Channel {
         Ok(written)
     }
 
-    pub async fn confirm_channel(&self, max_packet_size: u64) -> Result<(), ChannelError> {
-        self.send_message(Message::ChannelOpenConfirmation(
-            ChannelOpenConfirmationMessage { max_packet_size },
+    /// Confirms the channel to the peer with the given maximum packet size.
+    pub async fn confirm_channel(&self, max_packet_size: u64) -> Result<(), Ssh3ChannelError> {
+        self.send_message(Ssh3Message::ChannelOpenConfirmation(
+            Ssh3ChannelOpenConfirmationMessage { max_packet_size },
         ))
         .await?;
         self.confirm_sent.store(true, Ordering::SeqCst);
         Ok(())
     }
 
-    pub async fn send_message(&self, message: Message) -> Result<(), ChannelError> {
+    /// Sends a message to the peer.
+    pub async fn send_message(&self, message: Ssh3Message) -> Result<(), Ssh3ChannelError> {
         self.maybe_send_header().await?;
         let mut send = self.send.lock().await;
         send.write_all(&message.to_vec()).await?;
         Ok(())
     }
 
+    /// Appends a datagram to the queue, waiting until the queue has room.
     pub async fn wait_add_datagram(&self, datagram: Vec<u8>) {
         let queue = self.datagrams_queue.read().unwrap().clone();
         queue.wait_add(datagram).await;
     }
 
+    /// Appends a datagram to the queue without waiting.
+    ///
+    /// Returns `false` when the queue is full and the datagram was dropped.
     pub fn add_datagram(&self, datagram: Vec<u8>) -> bool {
         self.datagrams_queue.read().unwrap().add(datagram)
     }
 
+    /// Waits for the next datagram of the channel.
     pub async fn receive_datagram(&self) -> Vec<u8> {
         let queue = self.datagrams_queue.read().unwrap().clone();
         queue.wait_next().await
     }
 
-    pub async fn send_datagram(&self, datagram: Vec<u8>) -> Result<(), ChannelError> {
+    /// Sends a datagram to the peer.
+    ///
+    /// Fails with [`Ssh3ChannelError::DatagramSenderMissing`] when the channel
+    /// was opened without a datagram transport.
+    pub async fn send_datagram(&self, datagram: Vec<u8>) -> Result<(), Ssh3ChannelError> {
         self.maybe_send_header().await?;
         let sender = self.datagram_sender.read().unwrap().clone().ok_or(
-            ChannelError::DatagramSenderMissing(SentDatagramOnNonDatagramChannel {
+            Ssh3ChannelError::DatagramSenderMissing(Ssh3SentDatagramOnNonDatagramChannel {
                 channel_id: self.channel_id(),
             }),
         )?;
@@ -414,69 +499,83 @@ impl Channel {
         Ok(())
     }
 
-    pub async fn send_request(&self, request: ChannelRequestMessage) -> Result<(), ChannelError> {
-        self.send_message(Message::ChannelRequest(request)).await
+    /// Sends a channel request to the peer.
+    pub async fn send_request(
+        &self,
+        request: Ssh3ChannelRequestMessage,
+    ) -> Result<(), Ssh3ChannelError> {
+        self.send_message(Ssh3Message::ChannelRequest(request))
+            .await
     }
 
+    /// Aborts a pending read on the channel.
     pub async fn cancel_read(&self) {
         self.recv.lock().await.cancel_read(42);
     }
 
-    pub async fn close(&self) -> Result<(), ChannelError> {
+    /// Closes the write side of the channel.
+    pub async fn close(&self) -> Result<(), Ssh3ChannelError> {
         self.send.lock().await.close().await?;
         Ok(())
     }
 
-    pub fn set_datagram_sender(&self, datagram_sender: Arc<ConversationDatagramSender>) {
+    /// Attaches the datagram transport of the conversation to the channel.
+    pub fn set_datagram_sender(&self, datagram_sender: Arc<Ssh3ConversationDatagramSender>) {
         *self.datagram_sender.write().unwrap() = Some(datagram_sender);
     }
 
-    pub fn set_datagram_queue(&self, queue: Arc<DatagramQueue>) {
+    /// Replaces the datagram queue of the channel.
+    ///
+    /// Used to hand over the datagrams that arrived before the channel was
+    /// registered.
+    pub fn set_datagram_queue(&self, queue: Arc<Ssh3DatagramQueue>) {
         *self.datagrams_queue.write().unwrap() = queue;
     }
 }
 
-async fn parse_message(recv: &mut dyn ReceiveStream) -> Result<Message, ChannelError> {
+async fn parse_message(recv: &mut dyn Ssh3ReceiveStream) -> Result<Ssh3Message, Ssh3ChannelError> {
     let message_type = read_var_int(recv).await?;
     Ok(match message_type {
         ssh3_proto::SSH_MSG_CHANNEL_REQUEST => {
-            Message::ChannelRequest(read_channel_request(recv).await?)
+            Ssh3Message::ChannelRequest(read_channel_request(recv).await?)
         }
         ssh3_proto::SSH_MSG_CHANNEL_OPEN_CONFIRMATION => {
-            Message::ChannelOpenConfirmation(ChannelOpenConfirmationMessage {
+            Ssh3Message::ChannelOpenConfirmation(Ssh3ChannelOpenConfirmationMessage {
                 max_packet_size: read_var_int(recv).await?,
             })
         }
         ssh3_proto::SSH_MSG_CHANNEL_OPEN_FAILURE => {
-            Message::ChannelOpenFailure(ChannelOpenFailureMessage {
+            Ssh3Message::ChannelOpenFailure(Ssh3ChannelOpenFailureMessage {
                 reason_code: read_var_int(recv).await?,
                 error_message_utf8: read_ssh_bytes(recv).await?,
                 language_tag: read_ssh_bytes(recv).await?,
             })
         }
-        ssh3_proto::SSH_MSG_CHANNEL_DATA => Message::Data(DataOrExtendedDataMessage {
+        ssh3_proto::SSH_MSG_CHANNEL_DATA => Ssh3Message::Data(Ssh3DataOrExtendedDataMessage {
             data_type: SSH_EXTENDED_DATA_NONE,
             data: read_ssh_bytes(recv).await?,
         }),
-        ssh3_proto::SSH_MSG_CHANNEL_EXTENDED_DATA => Message::Data(DataOrExtendedDataMessage {
-            data_type: read_var_int(recv).await?,
-            data: read_ssh_bytes(recv).await?,
-        }),
+        ssh3_proto::SSH_MSG_CHANNEL_EXTENDED_DATA => {
+            Ssh3Message::Data(Ssh3DataOrExtendedDataMessage {
+                data_type: read_var_int(recv).await?,
+                data: read_ssh_bytes(recv).await?,
+            })
+        }
         kind => {
-            return Err(ChannelError::Proto(ssh3_proto::Error::UnknownMessageType(
-                kind,
-            )));
+            return Err(Ssh3ChannelError::Proto(
+                ssh3_proto::Ssh3Error::UnknownMessageType(kind),
+            ));
         }
     })
 }
 
 async fn read_channel_request(
-    recv: &mut dyn ReceiveStream,
-) -> Result<ChannelRequestMessage, ChannelError> {
+    recv: &mut dyn Ssh3ReceiveStream,
+) -> Result<Ssh3ChannelRequestMessage, Ssh3ChannelError> {
     let request_type = read_ssh_bytes(recv).await?;
     let want_reply = read_bool(recv).await?;
     let request = match request_type.as_slice() {
-        b"pty-req" => ssh3_proto::ChannelRequest::Pty(ssh3_proto::PtyRequest {
+        b"pty-req" => ssh3_proto::Ssh3ChannelRequest::Pty(ssh3_proto::Ssh3PtyRequest {
             term: read_ssh_bytes(recv).await?,
             char_width: read_var_int(recv).await?,
             char_height: read_var_int(recv).await?,
@@ -484,59 +583,66 @@ async fn read_channel_request(
             pixel_height: read_var_int(recv).await?,
             encoded_terminal_modes: read_ssh_bytes(recv).await?,
         }),
-        b"x11-req" => ssh3_proto::ChannelRequest::X11(ssh3_proto::X11Request {
+        b"x11-req" => ssh3_proto::Ssh3ChannelRequest::X11(ssh3_proto::Ssh3X11Request {
             single_connection: read_bool(recv).await?,
             x11_authentication_protocol: read_ssh_bytes(recv).await?,
             x11_authentication_cookie: read_ssh_bytes(recv).await?,
             x11_screen_number: read_var_int(recv).await?,
         }),
-        b"shell" => ssh3_proto::ChannelRequest::Shell,
-        b"exec" => ssh3_proto::ChannelRequest::Exec(ssh3_proto::ExecRequest {
+        b"shell" => ssh3_proto::Ssh3ChannelRequest::Shell,
+        b"exec" => ssh3_proto::Ssh3ChannelRequest::Exec(ssh3_proto::Ssh3ExecRequest {
             command: read_ssh_bytes(recv).await?,
         }),
-        b"subsystem" => ssh3_proto::ChannelRequest::Subsystem(ssh3_proto::SubsystemRequest {
-            subsystem_name: read_ssh_bytes(recv).await?,
-        }),
+        b"subsystem" => {
+            ssh3_proto::Ssh3ChannelRequest::Subsystem(ssh3_proto::Ssh3SubsystemRequest {
+                subsystem_name: read_ssh_bytes(recv).await?,
+            })
+        }
         b"window-change" => {
-            ssh3_proto::ChannelRequest::WindowChange(ssh3_proto::WindowChangeRequest {
+            ssh3_proto::Ssh3ChannelRequest::WindowChange(ssh3_proto::Ssh3WindowChangeRequest {
                 char_width: read_var_int(recv).await?,
                 char_height: read_var_int(recv).await?,
                 pixel_width: read_var_int(recv).await?,
                 pixel_height: read_var_int(recv).await?,
             })
         }
-        b"signal" => ssh3_proto::ChannelRequest::Signal(ssh3_proto::SignalRequest {
+        b"signal" => ssh3_proto::Ssh3ChannelRequest::Signal(ssh3_proto::Ssh3SignalRequest {
             signal_name_without_sig: read_ssh_bytes(recv).await?,
         }),
-        b"exit-status" => ssh3_proto::ChannelRequest::ExitStatus(ssh3_proto::ExitStatusRequest {
-            exit_status: read_var_int(recv).await?,
-        }),
-        b"exit-signal" => ssh3_proto::ChannelRequest::ExitSignal(ssh3_proto::ExitSignalRequest {
-            signal_name_without_sig: read_ssh_bytes(recv).await?,
-            core_dumped: read_bool(recv).await?,
-            error_message_utf8: read_ssh_bytes(recv).await?,
-            language_tag: read_ssh_bytes(recv).await?,
-        }),
+        b"exit-status" => {
+            ssh3_proto::Ssh3ChannelRequest::ExitStatus(ssh3_proto::Ssh3ExitStatusRequest {
+                exit_status: read_var_int(recv).await?,
+            })
+        }
+        b"exit-signal" => {
+            ssh3_proto::Ssh3ChannelRequest::ExitSignal(ssh3_proto::Ssh3ExitSignalRequest {
+                signal_name_without_sig: read_ssh_bytes(recv).await?,
+                core_dumped: read_bool(recv).await?,
+                error_message_utf8: read_ssh_bytes(recv).await?,
+                language_tag: read_ssh_bytes(recv).await?,
+            })
+        }
         b"forward-port" => {
-            let protocol = ssh3_proto::ForwardingProtocol::try_from(read_var_int(recv).await?)?;
-            let family = ssh3_proto::ForwardingAddressFamily::try_from(read_var_int(recv).await?)?;
+            let protocol = ssh3_proto::Ssh3ForwardingProtocol::try_from(read_var_int(recv).await?)?;
+            let family =
+                ssh3_proto::Ssh3ForwardingAddressFamily::try_from(read_var_int(recv).await?)?;
             let mut octets = vec![
                 0;
                 match family {
-                    ssh3_proto::ForwardingAddressFamily::Ipv4 => 4,
-                    ssh3_proto::ForwardingAddressFamily::Ipv6 => 16,
+                    ssh3_proto::Ssh3ForwardingAddressFamily::Ipv4 => 4,
+                    ssh3_proto::Ssh3ForwardingAddressFamily::Ipv6 => 16,
                 }
             ];
             recv.read_exact(&mut octets).await?;
             let mut port = [0; 2];
             recv.read_exact(&mut port).await?;
-            ssh3_proto::ChannelRequest::ForwardPort(ssh3_proto::ForwardingRequest {
+            ssh3_proto::Ssh3ChannelRequest::ForwardPort(ssh3_proto::Ssh3ForwardingRequest {
                 protocol,
                 ip_address: match family {
-                    ssh3_proto::ForwardingAddressFamily::Ipv4 => std::net::IpAddr::V4(
+                    ssh3_proto::Ssh3ForwardingAddressFamily::Ipv4 => std::net::IpAddr::V4(
                         std::net::Ipv4Addr::from(<[u8; 4]>::try_from(octets).unwrap()),
                     ),
-                    ssh3_proto::ForwardingAddressFamily::Ipv6 => std::net::IpAddr::V6(
+                    ssh3_proto::Ssh3ForwardingAddressFamily::Ipv6 => std::net::IpAddr::V6(
                         std::net::Ipv6Addr::from(<[u8; 16]>::try_from(octets).unwrap()),
                     ),
                 },
@@ -544,18 +650,18 @@ async fn read_channel_request(
             })
         }
         _ => {
-            return Err(ChannelError::Proto(ssh3_proto::Error::UnknownRequestType(
-                request_type,
-            )));
+            return Err(Ssh3ChannelError::Proto(
+                ssh3_proto::Ssh3Error::UnknownRequestType(request_type),
+            ));
         }
     };
-    Ok(ChannelRequestMessage {
+    Ok(Ssh3ChannelRequestMessage {
         want_reply,
         request,
     })
 }
 
-async fn read_var_int(recv: &mut dyn ReceiveStream) -> Result<u64, ChannelError> {
+async fn read_var_int(recv: &mut dyn Ssh3ReceiveStream) -> Result<u64, Ssh3ChannelError> {
     let first_byte = read_byte(recv).await?;
     let len = 1 << ((first_byte & 0xc0) >> 6);
     let b1 = first_byte & 0x3f;
@@ -591,24 +697,26 @@ async fn read_var_int(recv: &mut dyn ReceiveStream) -> Result<u64, ChannelError>
         + (u64::from(b1) << 56))
 }
 
-async fn read_ssh_bytes(recv: &mut dyn ReceiveStream) -> Result<Vec<u8>, ChannelError> {
+async fn read_ssh_bytes(recv: &mut dyn Ssh3ReceiveStream) -> Result<Vec<u8>, Ssh3ChannelError> {
     let len = read_var_int(recv).await?;
     let len = usize::try_from(len)
-        .map_err(|_| ChannelError::Proto(ssh3_proto::Error::InvalidLength(len)))?;
+        .map_err(|_| Ssh3ChannelError::Proto(ssh3_proto::Ssh3Error::InvalidLength(len)))?;
     let mut out = vec![0; len];
     recv.read_exact(&mut out).await?;
     Ok(out)
 }
 
-async fn read_bool(recv: &mut dyn ReceiveStream) -> Result<bool, ChannelError> {
+async fn read_bool(recv: &mut dyn Ssh3ReceiveStream) -> Result<bool, Ssh3ChannelError> {
     match read_byte(recv).await? {
         0 => Ok(false),
         1 => Ok(true),
-        value => Err(ChannelError::Proto(ssh3_proto::Error::InvalidBool(value))),
+        value => Err(Ssh3ChannelError::Proto(ssh3_proto::Ssh3Error::InvalidBool(
+            value,
+        ))),
     }
 }
 
-async fn read_byte(recv: &mut dyn ReceiveStream) -> Result<u8, ChannelError> {
+async fn read_byte(recv: &mut dyn Ssh3ReceiveStream) -> Result<u8, Ssh3ChannelError> {
     let mut byte = [0; 1];
     recv.read_exact(&mut byte).await?;
     Ok(byte[0])
@@ -619,12 +727,12 @@ mod tests {
     use std::sync::Arc;
 
     use ssh3_proto::{
-        ChannelHeader, ChannelRequest, ChannelRequestMessage, Message, SignalRequest,
-        append_var_int,
+        Ssh3ChannelHeader, Ssh3ChannelRequest, Ssh3ChannelRequestMessage, Ssh3Message,
+        Ssh3SignalRequest, append_var_int,
     };
 
-    use super::{Channel, ChannelError};
-    use crate::conversation::ConversationDatagramSender;
+    use super::{Ssh3Channel, Ssh3ChannelError};
+    use crate::conversation::Ssh3ConversationDatagramSender;
     use crate::transport::testutil::{
         BytesReceiveStream, RecordingDatagramSender, RecordingSendStream,
     };
@@ -637,7 +745,7 @@ mod tests {
     async fn write_data_sends_header_once_and_chunks_payload() {
         let (recv, _) = BytesReceiveStream::new(Vec::new());
         let (send, handle) = RecordingSendStream::new();
-        let channel = Channel::new(
+        let channel = Ssh3Channel::new(
             11,
             conversation_id(),
             22,
@@ -657,7 +765,7 @@ mod tests {
             .write_data(b"abcdefg", ssh3_proto::SSH_EXTENDED_DATA_NONE)
             .await
             .unwrap();
-        let mut expected = ChannelHeader {
+        let mut expected = Ssh3ChannelHeader {
             conversation_stream_id: 11,
             channel_type: b"session".to_vec(),
             max_packet_size: 5,
@@ -671,7 +779,7 @@ mod tests {
             b"g".as_slice(),
         ] {
             expected.extend_from_slice(
-                &Message::Data(ssh3_proto::DataOrExtendedDataMessage {
+                &Ssh3Message::Data(ssh3_proto::Ssh3DataOrExtendedDataMessage {
                     data_type: ssh3_proto::SSH_EXTENDED_DATA_NONE,
                     data: chunk.to_vec(),
                 })
@@ -686,14 +794,14 @@ mod tests {
     #[tokio::test]
     async fn next_message_handles_confirmation_then_returns_message() {
         let mut recv_bytes =
-            Message::ChannelOpenConfirmation(ssh3_proto::ChannelOpenConfirmationMessage {
+            Ssh3Message::ChannelOpenConfirmation(ssh3_proto::Ssh3ChannelOpenConfirmationMessage {
                 max_packet_size: 4096,
             })
             .to_vec();
         recv_bytes.extend_from_slice(
-            &Message::ChannelRequest(ChannelRequestMessage {
+            &Ssh3Message::ChannelRequest(Ssh3ChannelRequestMessage {
                 want_reply: true,
-                request: ChannelRequest::Signal(SignalRequest {
+                request: Ssh3ChannelRequest::Signal(Ssh3SignalRequest {
                     signal_name_without_sig: b"TERM".to_vec(),
                 }),
             })
@@ -702,7 +810,7 @@ mod tests {
 
         let (recv, _) = BytesReceiveStream::new(recv_bytes);
         let (send, _) = RecordingSendStream::new();
-        let channel = Channel::new(
+        let channel = Ssh3Channel::new(
             1,
             conversation_id(),
             2,
@@ -722,9 +830,9 @@ mod tests {
         assert!(channel.confirm_received());
         assert_eq!(
             message,
-            Message::ChannelRequest(ChannelRequestMessage {
+            Ssh3Message::ChannelRequest(Ssh3ChannelRequestMessage {
                 want_reply: true,
-                request: ChannelRequest::Signal(SignalRequest {
+                request: Ssh3ChannelRequest::Signal(Ssh3SignalRequest {
                     signal_name_without_sig: b"TERM".to_vec(),
                 }),
             })
@@ -733,14 +841,14 @@ mod tests {
 
     #[tokio::test]
     async fn next_message_returns_non_confirmed_error() {
-        let recv_bytes = Message::Data(ssh3_proto::DataOrExtendedDataMessage {
+        let recv_bytes = Ssh3Message::Data(ssh3_proto::Ssh3DataOrExtendedDataMessage {
             data_type: ssh3_proto::SSH_EXTENDED_DATA_NONE,
             data: b"hello".to_vec(),
         })
         .to_vec();
         let (recv, _) = BytesReceiveStream::new(recv_bytes);
         let (send, _) = RecordingSendStream::new();
-        let channel = Channel::new(
+        let channel = Ssh3Channel::new(
             1,
             conversation_id(),
             2,
@@ -757,7 +865,7 @@ mod tests {
         );
 
         match channel.next_message().await {
-            Err(ChannelError::NonConfirmed(_)) => {}
+            Err(Ssh3ChannelError::NonConfirmed(_)) => {}
             other => panic!("expected non-confirmed error, got {other:?}"),
         }
     }
@@ -767,7 +875,7 @@ mod tests {
         let sender = Arc::new(RecordingDatagramSender::default());
         let (recv, _) = BytesReceiveStream::new(Vec::new());
         let (send, _) = RecordingSendStream::new();
-        let channel = Channel::new(
+        let channel = Ssh3Channel::new(
             11,
             conversation_id(),
             22,
@@ -775,7 +883,7 @@ mod tests {
             1024,
             recv,
             send,
-            Some(Arc::new(ConversationDatagramSender::new(
+            Some(Arc::new(Ssh3ConversationDatagramSender::new(
                 11,
                 22,
                 sender.clone(),

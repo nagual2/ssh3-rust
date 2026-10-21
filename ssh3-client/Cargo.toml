@@ -2,15 +2,26 @@
 name = "ssh3-client"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "Apache-2.0"
 publish = false
 description = "Minimal Rust SSH3 client runtime and binary"
+authors = [
+    "Matias Hiltunen <26164588+MatiasHiltunen@users.noreply.github.com>",
+    "nagual2 <912140+nagual2@users.noreply.github.com>",
+]
+repository = "https://github.com/nagual2/ssh3-rust"
+homepage = "https://github.com/nagual2/ssh3-rust"
+documentation = "https://docs.rs/ssh3-client"
+readme = "../README.md"
+keywords = ["ssh3", "quic", "http3", "ssh"]
+categories = ["network-programming", "command-line-utilities"]
 
 [lib]
 path = "src/lib.rs"
 
 [[bin]]
-name = "ssh3-client"
+name = "ssh3-rust-client"
 path = "src/main.rs"
 
 [dependencies]

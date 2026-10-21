@@ -1,7 +1,15 @@
+//! Primitive encoding and decoding of the SSH3 wire format.
+//!
+//! The two building blocks are the QUIC variable-length integer and the
+//! length-prefixed byte string ("SSH string"). Both are byte-compatible with
+//! the reference implementation `nagual2/ssh3-go` (`util/wire.go`).
+
 use std::fmt;
 use std::io::{self, Read};
 
+/// Smallest value that can be encoded as a variable-length integer.
 pub const MIN_VARINT: u64 = 0;
+/// Largest value that can be encoded as a variable-length integer (2^62 - 1).
 pub const MAX_VARINT: u64 = MAX_VARINT_8;
 
 const MAX_VARINT_1: u64 = 63;
@@ -9,20 +17,29 @@ const MAX_VARINT_2: u64 = 16_383;
 const MAX_VARINT_4: u64 = 1_073_741_823;
 const MAX_VARINT_8: u64 = 4_611_686_018_427_387_903;
 
-pub type Result<T> = std::result::Result<T, Error>;
+/// Result of a decoding operation on the wire format.
+pub type Ssh3Result<T> = std::result::Result<T, Ssh3Error>;
 
+/// Everything that can go wrong while decoding a wire message.
 #[derive(Debug)]
-pub enum Error {
+pub enum Ssh3Error {
+    /// The underlying reader failed.
     Io(io::Error),
+    /// A boolean field carried a byte other than `0` or `1`.
     InvalidBool(u8),
+    /// A string length did not fit into the address space of the process.
     InvalidLength(u64),
+    /// The message type is not known to this implementation.
     UnknownMessageType(u64),
+    /// The channel request type is not known to this implementation.
     UnknownRequestType(Vec<u8>),
+    /// The forwarding protocol was neither `0` (UDP) nor `1` (TCP).
     InvalidForwardingProtocol(u64),
+    /// The address family was neither `4` (IPv4) nor `6` (IPv6).
     InvalidAddressFamily(u64),
 }
 
-impl fmt::Display for Error {
+impl fmt::Display for Ssh3Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "{err}"),
@@ -42,7 +59,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {
+impl std::error::Error for Ssh3Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
@@ -51,13 +68,18 @@ impl std::error::Error for Error {
     }
 }
 
-impl From<io::Error> for Error {
+impl From<io::Error> for Ssh3Error {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
     }
 }
 
-pub fn read_var_int<R: Read>(reader: &mut R) -> Result<u64> {
+/// Reads a variable-length integer from `reader`.
+///
+/// The first two bits of the first byte select the width of the encoding
+/// (1, 2, 4 or 8 bytes); the remaining bits carry the value, most significant
+/// byte first.
+pub fn read_var_int<R: Read>(reader: &mut R) -> Ssh3Result<u64> {
     let first_byte = read_byte(reader)?;
     let len = 1 << ((first_byte & 0xc0) >> 6);
     let b1 = first_byte & 0x3f;
@@ -93,6 +115,11 @@ pub fn read_var_int<R: Read>(reader: &mut R) -> Result<u64> {
         + (u64::from(b1) << 56))
 }
 
+/// Appends `value` to `out` using the shortest variable-length encoding.
+///
+/// # Panics
+///
+/// Panics when `value` exceeds [`MAX_VARINT`].
 pub fn append_var_int(out: &mut Vec<u8>, value: u64) {
     if value <= MAX_VARINT_1 {
         out.push(value as u8);
@@ -121,6 +148,16 @@ pub fn append_var_int(out: &mut Vec<u8>, value: u64) {
     }
 }
 
+/// Appends `value` to `out` using exactly `length` bytes.
+///
+/// The value is padded with leading zero bytes, so the encoded number keeps
+/// the width the peer expects. Used where the protocol fixes the width of a
+/// field, for example inside a fixed-size frame.
+///
+/// # Panics
+///
+/// Panics when `length` is not 1, 2, 4 or 8, or when `value` does not fit
+/// into `length` bytes.
 pub fn append_var_int_with_len(out: &mut Vec<u8>, value: u64, length: usize) {
     if !matches!(length, 1 | 2 | 4 | 8) {
         panic!("invalid varint length");
@@ -151,6 +188,11 @@ pub fn append_var_int_with_len(out: &mut Vec<u8>, value: u64, length: usize) {
     }
 }
 
+/// Returns the number of bytes [`append_var_int`] writes for `value`.
+///
+/// # Panics
+///
+/// Panics when `value` exceeds [`MAX_VARINT`].
 pub fn var_int_len(value: u64) -> usize {
     if value <= MAX_VARINT_1 {
         1
@@ -165,40 +207,54 @@ pub fn var_int_len(value: u64) -> usize {
     }
 }
 
-pub fn read_ssh_bytes<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
+/// Reads a length-prefixed byte string ("SSH string") from `reader`.
+///
+/// The length is a variable-length integer followed by exactly that many
+/// bytes. The length is bounded by the address space of the process; a length
+/// that does not fit is reported as [`Ssh3Error::InvalidLength`] instead of
+/// causing an allocation.
+pub fn read_ssh_bytes<R: Read>(reader: &mut R) -> Ssh3Result<Vec<u8>> {
     let length = read_var_int(reader)?;
-    let length = usize::try_from(length).map_err(|_| Error::InvalidLength(length))?;
+    let length = usize::try_from(length).map_err(|_| Ssh3Error::InvalidLength(length))?;
     let mut out = vec![0; length];
     reader.read_exact(&mut out)?;
     Ok(out)
 }
 
+/// Appends `bytes` to `out` as a length-prefixed byte string.
 pub fn append_ssh_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     append_var_int(out, bytes.len() as u64);
     out.extend_from_slice(bytes);
 }
 
+/// Returns the number of bytes [`append_ssh_bytes`] writes for `bytes`.
 pub fn ssh_string_len(bytes: &[u8]) -> usize {
     var_int_len(bytes.len() as u64) + bytes.len()
 }
 
-pub fn read_bool<R: Read>(reader: &mut R) -> Result<bool> {
+/// Reads a boolean field from `reader`.
+///
+/// A boolean is encoded as a single byte: `0` is false, `1` is true. Any
+/// other value is rejected with [`Ssh3Error::InvalidBool`].
+pub fn read_bool<R: Read>(reader: &mut R) -> Ssh3Result<bool> {
     match read_byte(reader)? {
         0 => Ok(false),
         1 => Ok(true),
-        value => Err(Error::InvalidBool(value)),
+        value => Err(Ssh3Error::InvalidBool(value)),
     }
 }
 
+/// Writes a boolean field to `out` as a single byte (`0` or `1`).
 pub fn write_bool(out: &mut Vec<u8>, value: bool) {
     out.push(u8::from(value));
 }
 
+/// Returns the smaller of the two values.
 pub fn min_u64(a: u64, b: u64) -> u64 {
     if a <= b { a } else { b }
 }
 
-fn read_byte<R: Read>(reader: &mut R) -> Result<u8> {
+fn read_byte<R: Read>(reader: &mut R) -> Ssh3Result<u8> {
     let mut byte = [0; 1];
     reader.read_exact(&mut byte)?;
     Ok(byte[0])
