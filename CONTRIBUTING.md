@@ -1,0 +1,140 @@
+# Contributing
+
+Thanks for taking the time to contribute. This document describes how to work
+in the **Rust** workspace of this repository.
+
+> [!NOTE]
+> The workspace is **frozen (dormant) since 2026-10-13** (see
+> [`FROZEN.md`](FROZEN.md)). Before starting work, check
+> [`ROADMAP.md`](ROADMAP.md): the plan defines which items are open, which are
+> deferred and what the unfreezing conditions are. Small documentation,
+> tooling and test-hygiene contributions are still welcome.
+
+## Ground rules
+
+1. **Tests first.** Every bug fix comes with a regression test that fails
+   before the fix and passes after it. Every feature comes with tests that
+   describe the expected behaviour, including the edge cases.
+2. **One concern per commit.** Keep commits small, atomic and reviewable.
+3. **Conventional Commits.** Commit subjects follow
+   `type(scope): subject`, for example:
+   - `feat(client): add --forward-agent flag`
+   - `fix(core): clamp peer max_packet_size`
+   - `docs(readme): describe the interop matrix`
+   - `test(proto): cover oversized SSH string length`
+   - `chore(deps): update quinn-proto to 0.11.19`
+   Types in use: `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `build`,
+   `ci`, `chore`, `revert`.
+4. **No new dependency without justification.** Registry sources only — no git
+   dependencies. Explain why the existing dependencies are not sufficient in
+   the commit message or the pull request. `Cargo.lock` must stay committed and
+   in sync (`cargo check --workspace --locked`).
+5. **Wire compatibility is a contract.** The Rust implementation must stay
+   wire-compatible with the Go implementation. Never change the on-the-wire
+   format, the message numbering or the authentication flows without an
+   explicit decision recorded in [`ROADMAP.md`](ROADMAP.md) and in the Go
+   repository.
+6. **No telemetry, no network calls** outside the SSH3 protocol semantics.
+7. **Secrets belong in files.** Prefer `--password-file`,
+   `--bearer-token-file` and `--oidc-client-secret-file` over passing secrets
+   in `argv`.
+
+## Build
+
+```bash
+cargo build --workspace
+cargo check --workspace --locked
+```
+
+Rust 1.85 or newer is required (the crates use edition 2024).
+
+## Tests
+
+```bash
+cargo test --workspace          # the whole suite
+cargo test -p ssh3-client       # adds the cross-implementation matrix
+```
+
+The suite contains 91 tests. The cross-implementation (interop) scenarios build
+**real Go binaries** from the [nagual2/ssh3-go](https://github.com/nagual2/ssh3-go)
+repository and need:
+
+- a **Go toolchain** (1.21+),
+- a **checkout of the Go repository** — the `SSH3_GO_REPO` environment variable
+  points at that checkout, and the harness builds the Go peers from it. Pin the
+  checkout to a **release tag** of the Go implementation: the matrix is verified
+  against a concrete Go release (`v0.1.12` in the CI), not against `main`
+  (see `M0.C.2` in [`ROADMAP.md`](ROADMAP.md)),
+- a Unix-like host (the scenarios are `#[cfg(unix)]`).
+
+The `vendor/h3` shim interoperates with the Go implementation up to its
+`quic-go` v0.40.x line. A checkout that carries a newer `quic-go` (v0.49+) is
+not wire-compatible with this workspace: the scenarios then fail with an
+HTTP/3 `0x104` error instead of exercising the wire.
+
+When the checkout or the toolchain is missing, every interop scenario is
+**skipped** — each one prints a `skipping:` line to the test log — and the rest
+of the suite still runs. A scenario never passes without having exercised the
+wire: it either ran against the Go peers or it reported the skip.
+
+When a change touches the wire format, the authentication flow, the channel
+lifecycle, PTY handling or forwarding, the interop matrix is the mandatory
+regression gate: run it in both directions (Rust → Go and Go → Rust).
+
+## Do not touch
+
+- **`vendor/h3`** — this is a deliberate `[patch.crates-io]` shim over the
+  crates.io crate `h3` 0.0.8 that adds the `:protocol` pseudo-header support
+  required by Extended CONNECT. Upstream `h3` does not provide it. Replacing
+  the directory with the upstream crate breaks the SSH3 handshake. Any change
+  here must be a minimal, clearly documented patch on top of the upstream
+  version, and it must keep `vendor/h3/LICENSE` intact.
+- **The wire format** — see ground rule 5.
+- **`ROADMAP.md` and `FROZEN.md`** — they record owner decisions. Propose
+  changes, do not rewrite them unilaterally.
+
+## Continuous integration
+
+The pipeline lives in `.github/workflows/ci.yml` and has four jobs:
+
+| Job | What it does |
+|---|---|
+| `build` | `cargo build --workspace --locked`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` |
+| `test` | `cargo test --workspace --locked` without the Go checkout: the interop scenarios skip instead of failing |
+| `interop` | checks out the Go reference repository at the pinned tag `v0.1.12`, installs the Go toolchain and runs the matrix with `SSH3_GO_REPO` |
+| `audit` | `cargo audit`; tolerant of a network outage (`continue-on-error`) |
+
+The toolchain is pinned in `rust-toolchain.toml`, the formatter in `rustfmt.toml`
+and the linter in `clippy.toml`.
+
+The following rules apply:
+
+- **A new dependency requires a CI update in the same change.** The CI job
+  must build the workspace with `--locked`, run the test suite and — for
+  dependency changes — run the interop job with the Go repository checkout.
+- **A change to the wire format requires the interop job**, not only the unit
+  tests.
+- **Dependency updates must include the advisory scan** (`cargo-audit`).
+  The frozen `quinn-proto` 0.11.14 (RUSTSEC-2026-0185) is a known, documented
+  exception and must not be silently reintroduced.
+- **The interop job stays on the tag `v0.1.12`.** The Go side has moved
+  `quic-go` from v0.40.1 to v0.63.0, and the frozen `h3` 0.0.8 shim of this
+  workspace only speaks the HTTP/3 version of the v0.40.x line: against `main`
+  the scenarios abort with an HTTP/3 `0x104` error. That is a wire
+  incompatibility of the Go side, not a regression of the Rust code, so the
+  checkout must not float until the shim is updated.
+
+## Style
+
+- Rust: `cargo fmt --all` and `cargo clippy --workspace --all-targets` must be
+  clean. The formatter and the linter are configured in `rustfmt.toml` and
+  `clippy.toml`; both are checked by the `build` job of the CI.
+- Comments and documentation are written in **English**.
+- Public API changes are documented with doc comments (`///`, `//!`); the
+  `ssh3-proto` and `ssh3-core` crates still lack them, and filling that gap
+  is tracked in the roadmap.
+
+## License
+
+Contributions are accepted under the Apache License 2.0, the license of this
+repository. See [`NOTICE`](NOTICE) for the provenance of the imported code.

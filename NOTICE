@@ -1,0 +1,70 @@
+NOTICE
+======
+
+SSH3 over HTTP/3 — Rust implementation
+Copyright 2026 The ssh3-rust contributors
+
+This product includes software developed by third parties. The provenance of
+every component is listed below.
+
+
+1. Origin of the code
+---------------------
+
+The Rust implementation in this repository was **imported** on 2026-04-02 from
+the repository https://github.com/MatiasHiltunen/ssh3 — a fork of
+https://github.com/francoismichel/ssh3 — as a workspace of seven crates:
+
+    ssh3-proto   ssh3-core   ssh3-quinn   ssh3-h3
+    ssh3-auth    ssh3-client ssh3-server
+
+The import consists of 13 commits authored by Matias Hiltunen
+(26164588+MatiasHiltunen@users.noreply.github.com) and covers the protocol
+core, the authentication layer, the client and server runtimes, PTY handling,
+port and agent forwarding, OIDC support and the Rust<->Go interop test
+harness.
+
+The code was subsequently extended by the maintainers of
+https://github.com/nagual2/ssh3-go, notably with the Rust-side remediation of
+the pass-6 audit findings F-19 and F-21.
+
+This repository was extracted from https://github.com/nagual2/ssh3-go on
+2026-10-21 as a standalone project. The Go implementation remains the only
+shipped product; see README.md for the positioning of this workspace.
+
+The code was **not** written from scratch, and this repository is not a fork of
+the upstream projects — it is an independent reference implementation that
+imported their Rust code under the same license.
+
+
+2. License
+----------
+
+This product is licensed under the Apache License, Version 2.0 (the
+"License"); you may not use these files except in compliance with the
+License. You may obtain a copy of the License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations under
+the License.
+
+The upstream projects from which the code was imported are distributed under
+the same Apache License, Version 2.0.
+
+
+3. Vendored third-party code
+----------------------------
+
+vendor/h3 — a copy of the crates.io crate `h3` version 0.0.8
+(https://github.com/hyperium/h3), Copyright (c) 2020 h3 authors, distributed
+under the MIT License. The copy carries a deliberate patch that adds the
+`:protocol` pseudo-header support required by Extended CONNECT; the upstream
+license text is kept in vendor/h3/LICENSE. Do not replace this directory with
+the upstream crate without checking the SSH3 requirements.
+
+All other dependencies are regular crates.io registry dependencies listed in
+Cargo.lock and are not vendored into this repository.
