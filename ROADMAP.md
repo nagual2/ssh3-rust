@@ -176,6 +176,7 @@
 | 1.10 | **Secret URL path**: сервер принимает не любой путь | `ssh3-h3/src/lib.rs:434` | Medium | Аналог Go `-url-path` |
 | 1.11 | **Таймауты в прод-коде**: handshake/idle/OIDC-callback | `ssh3-client/src/lib.rs:821`, `ssh3-server` | Medium | `tokio::time::timeout` в проде; эквиваленты `-handshake-idle-timeout` / `-max-idle-timeout` |
 | 1.12 | **Таймаут отмены чтения**: `cancel_read` сейчас физически не может прервать зависшее чтение (мьютекс удержится через await) | `ssh3-core/src/channel.rs:278,305,421` | Medium | Отмена работает; writer-ы не блокируют друг друга на зависшем пире |
+| 1.13 | **Сокет проброса ssh-agent удаляется слишком рано**: `AgentForwarding::drop` сносит сокет вместе с сессией, и проброс-агент, подключающийся через мгновение, получает `ENOENT` (подтверждено на CI: Go-клиент v0.1.12 закрывает канал раньше, чем пробник успевает подключиться) | `ssh3-server/src/session.rs:217-223` | Medium | Проброс агента переживает закрытие сессии-инициатора; interop-тест `real_go_client_forward_agent_round_trips_against_the_rust_server` проходит без `--skip` |
 
 ### M3 — Supply chain и зависимости
 
