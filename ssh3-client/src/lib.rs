@@ -1593,7 +1593,8 @@ mod tests {
         tokio::task::JoinHandle<Vec<Ssh3Message>>,
     ) {
         let (server_config, server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -1651,7 +1652,7 @@ mod tests {
         });
 
         let mut config = Ssh3ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
@@ -3762,7 +3763,8 @@ mod tests {
     #[tokio::test]
     async fn exec_capture_round_trips_against_the_rust_server() {
         let (server_config, server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -3789,7 +3791,7 @@ mod tests {
         });
 
         let mut config = Ssh3ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
@@ -4107,7 +4109,8 @@ mod tests {
         let username = fixture.username.clone();
         let private_key_path = fixture.private_key_path.clone();
         let (server_config, server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -4132,7 +4135,7 @@ mod tests {
         });
 
         let mut config = Ssh3ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
@@ -4173,7 +4176,8 @@ mod tests {
         let username = fixture.username.clone();
         let private_key_path = fixture.private_key_path.clone();
         let (server_config, server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -4198,7 +4202,7 @@ mod tests {
         });
 
         let mut config = Ssh3ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
@@ -4239,7 +4243,8 @@ mod tests {
         let username = fixture.username.clone();
         let private_key_path = fixture.private_key_path.clone();
         let (server_config, server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -4270,7 +4275,7 @@ mod tests {
         });
 
         let mut config = Ssh3ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
@@ -4308,7 +4313,8 @@ mod tests {
         let username = fixture.username.clone();
         let private_key_path = fixture.private_key_path.clone();
         let (server_config, _server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -4339,7 +4345,7 @@ mod tests {
         });
 
         let Some(output) = run_go_interop_client(
-            &format!("https://localhost:{}/ssh3-term", server_addr.port()),
+            &format!("https://127.0.0.1:{}/ssh3-term", server_addr.port()),
             &username,
             &private_key_path,
             "printf 'hello from go to rust\\n'",
@@ -4368,7 +4374,8 @@ mod tests {
         let username = fixture.username.clone();
         let private_key_path = fixture.private_key_path.clone();
         let (server_config, _server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -4430,7 +4437,8 @@ mod tests {
         let issuer_url = fixture.issuer_url.clone();
         let client_id = fixture.client_id.clone();
         let (server_config, _server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -4502,7 +4510,8 @@ mod tests {
         let expected_username = username.clone();
         let expected_password = password.clone();
         let (server_config, _server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -4663,7 +4672,8 @@ mod tests {
         let username = fixture.username.clone();
         let private_key_path = fixture.private_key_path.clone();
         let (server_config, _server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -4727,7 +4737,8 @@ mod tests {
         let username = fixture.username.clone();
         let private_key_path = fixture.private_key_path.clone();
         let (server_config, _server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -4806,7 +4817,8 @@ mod tests {
         let username = fixture.username.clone();
         let private_key_path = fixture.private_key_path.clone();
         let (server_config, _server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -4946,7 +4958,8 @@ mod tests {
         let username = fixture.username.clone();
         let private_key_path = fixture.private_key_path.clone();
         let (server_config, _server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -5094,7 +5107,8 @@ mod tests {
         let username = fixture.username.clone();
         let private_key_path = fixture.private_key_path.clone();
         let (server_config, _server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -5180,7 +5194,8 @@ mod tests {
         let private_key = ssh3_auth::load_private_key(&fixture.private_key_path).unwrap();
         let agent = spawn_mock_agent(private_key).await;
         let (server_config, server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -5211,7 +5226,7 @@ mod tests {
         });
 
         let mut config = Ssh3ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
@@ -5252,7 +5267,8 @@ mod tests {
         let private_key = ssh3_auth::load_private_key(&private_key_path).unwrap();
         let agent = spawn_mock_agent(private_key).await;
         let (server_config, server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -5283,7 +5299,7 @@ mod tests {
         });
 
         let mut config = Ssh3ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
@@ -5320,7 +5336,8 @@ mod tests {
         let _agent_socket_guard = lock_agent_socket_tests();
         let agent = spawn_mock_agent(auth_private_key(AuthKeyAlgorithm::Ed25519)).await;
         let (server_config, server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -5347,7 +5364,7 @@ mod tests {
         });
 
         let mut config = Ssh3ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
@@ -5405,7 +5422,8 @@ mod tests {
         let _agent_socket_guard = lock_agent_socket_tests();
         let agent = spawn_mock_agent(auth_private_key(AuthKeyAlgorithm::Ed25519)).await;
         let (server_config, server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -5432,7 +5450,7 @@ mod tests {
         });
 
         let mut config = Ssh3ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
@@ -5644,7 +5662,8 @@ mod tests {
         let username = fixture.username.clone();
         let private_key_path = fixture.private_key_path.clone();
         let (server_config, _server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -5708,7 +5727,8 @@ mod tests {
         let authorized_identities_path = fixture.authorized_identities_path.clone();
         let username = fixture.username.clone();
         let (server_config, server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -5739,7 +5759,7 @@ mod tests {
         });
 
         let mut config = Ssh3ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
@@ -5786,7 +5806,8 @@ mod tests {
         let issuer_url = fixture.issuer_url.clone();
         let client_id = fixture.client_id.clone();
         let (server_config, server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -5817,7 +5838,7 @@ mod tests {
         });
 
         let mut config = Ssh3ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );
@@ -5871,7 +5892,8 @@ mod tests {
         let expected_username = username.clone();
         let expected_password = password.clone();
         let (server_config, server_certificate) =
-            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
         let server_endpoint = quinn::Endpoint::server(
             server_config,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -5906,7 +5928,7 @@ mod tests {
         });
 
         let mut config = Ssh3ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
                 .parse()
                 .unwrap(),
         );

@@ -1,4 +1,9 @@
 [toolchain]
-channel = "stable"
+# Pinned on purpose: the workspace is frozen, and a moving "stable" toolchain
+# turns a green build red whenever upstream clippy adds a lint (1.99 introduced
+# `double_must_use`, which fires on the `#[async_trait]` macro expansion).
+# Bumping this is a deliberate act, together with a local
+# `cargo clippy --workspace --all-targets -- -D warnings` run.
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

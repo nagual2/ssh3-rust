@@ -5,7 +5,6 @@ use quinn::{
     ClientConfig, ServerConfig,
     crypto::rustls::{NoInitialCipherSuite, QuicClientConfig, QuicServerConfig},
 };
-use rcgen::CertifiedKey;
 use rustls::{
     RootCertStore,
     client::VerifierBuilderError,
@@ -127,7 +126,21 @@ pub fn client_config_insecure() -> Result<ClientConfig, Ssh3ConfigError> {
 pub fn self_signed_server_config(
     subject_alt_names: Vec<String>,
 ) -> Result<(ServerConfig, CertificateDer<'static>), Ssh3ConfigError> {
-    let CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(subject_alt_names)?;
+    // `generate_simple_self_signed` turns every name into a DNS SAN, which
+    // leaves a certificate that rustls refuses for an IP address. Split the
+    // names instead: the addresses become IP SANs, the rest stay DNS names.
+    let mut dns_names = Vec::new();
+    let mut ip_sans = Vec::new();
+    for name in &subject_alt_names {
+        match name.parse::<std::net::IpAddr>() {
+            Ok(address) => ip_sans.push(rcgen::SanType::IpAddress(address)),
+            Err(_) => dns_names.push(name.clone()),
+        }
+    }
+    let mut params = rcgen::CertificateParams::new(dns_names)?;
+    params.subject_alt_names.extend(ip_sans);
+    let signing_key = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&signing_key)?;
     let certificate = cert.der().clone();
     let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
     let server_config = server_config_with_single_cert(vec![certificate.clone()], private_key)?;
