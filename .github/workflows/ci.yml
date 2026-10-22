@@ -48,12 +48,11 @@ jobs:
   cross-build:
     name: cross-build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    # KNOWN GAP: the workspace does not compile on Windows yet.
-    # `ssh3-server/src/session.rs` calls `AgentForwardingSlot::socket_path()`
-    # (lines 437 and 464) unconditionally, while the method itself is
-    # `#[cfg(unix)]`. The job is therefore informational for now and must not
-    # block the pipeline; it becomes blocking together with the fix of that
-    # call site. The macOS leg of the matrix is expected to pass.
+    # The Windows leg is informational for now: the workspace compiles for
+    # the Windows target (the unix-only agent socket accessor was made
+    # platform neutral), but the msvc toolchain of the runner cannot be
+    # reproduced locally, so the leg stays non-blocking until it has proven
+    # itself in the pipeline. The macOS leg is expected to pass.
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -93,6 +92,12 @@ jobs:
       # 0x104 error. That failure is a wire incompatibility of the Go side,
       # not a regression of the Rust code, so the checkout stays on the tag
       # v0.1.12 until the shim is updated.
+      #
+      # The same limit applies to the newer tags: the shim speaks to the Go
+      # implementation of v0.1.18 and older, and the reverse forwarding
+      # (v0.1.23) and the dynamic forwarding (v0.1.24) only exist from
+      # there on. The scenarios that need them detect the version of the
+      # reference and skip with a `skipping:` line instead of failing.
       - name: Check out the Go reference repository
         uses: actions/checkout@v7
         with:
