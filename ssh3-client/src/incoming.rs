@@ -180,6 +180,7 @@ impl IncomingChannels {
             return;
         };
 
+        #[cfg(unix)]
         tokio::spawn(async move {
             if let Err(err) = forward_agent_channel(channel, &agent_socket).await
                 && !crate::is_benign_client_error(&err)
@@ -187,6 +188,16 @@ impl IncomingChannels {
                 eprintln!("ssh3-rust-client agent forwarding error: {err}");
             }
         });
+        #[cfg(not(unix))]
+        {
+            // The local SSH agent is a Unix socket, so there is nothing to
+            // forward a connection to on the other platforms.
+            let _ = agent_socket;
+            eprintln!(
+                "ssh3-rust-client rejecting an agent connection: the agent forwarding is unix-only"
+            );
+            let _ = channel.close().await;
+        }
     }
 
     /// Tells whether the target of a forwarded channel was requested.
