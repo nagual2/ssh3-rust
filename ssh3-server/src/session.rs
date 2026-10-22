@@ -661,10 +661,15 @@ async fn spawn_pipe_session_process(
                 request: Ssh3ChannelRequest::ExitStatus(Ssh3ExitStatusRequest { exit_status }),
             })
             .await;
-        // The exit status ends the session. The Go server does not close the
-        // channel here either ("both channels are closed, nothing else to
-        // do"): closing it right away races the delivery of the status, and a
-        // client that reads an EOF before the status reports a failure.
+        // The exit status must reach the peer before the channel is closed.
+        // The Go reference waits for the status to be sent before the
+        // deferred close of the channel ("the exit status wins the race
+        // against the deferred channel.Close()"), and a client that reads
+        // the end of the stream before the status reports a failure. The
+        // pause gives the QUIC stream the moment it needs to flush the
+        // status that was written above.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = channel.close().await;
     });
 
     Ok(RunningSession {

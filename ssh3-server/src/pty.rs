@@ -225,10 +225,11 @@ mod unix {
                     request: Ssh3ChannelRequest::ExitStatus(Ssh3ExitStatusRequest { exit_status }),
                 })
                 .await;
-            // The exit status ends the session. The Go server does not close
-            // the channel here either: closing it right away races the
-            // delivery of the status, and a client that reads an EOF before
-            // the status reports a failure.
+            // The exit status must reach the peer before the channel is
+            // closed; see the same note in `session.rs`. The pause gives
+            // the QUIC stream the moment it needs to flush the status.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = channel.close().await;
         });
 
         Ok(RunningSession {
