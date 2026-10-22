@@ -52,10 +52,13 @@ tokio = { version = "1.48.0", features = [
     "time",
 ] }
 url = "2.5.8"
+webpki-roots = "1.0.10"
+x509-parser = { version = "0.18.1", features = ["verify"] }
 
 [dev-dependencies]
 p256 = { version = "0.13.2", features = ["ecdsa"] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
+rcgen = "0.14.7"
 rsa = { version = "0.9.10", features = ["sha2"] }
 sha2 = "0.10.9"
 signature = "2.2.0"

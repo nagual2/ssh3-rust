@@ -2052,6 +2052,7 @@ dependencies = [
  "quinn",
  "rand 0.8.8",
  "rand_core 0.6.4",
+ "rcgen",
  "reqwest",
  "rsa",
  "rustls",
@@ -2069,6 +2070,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "url",
+ "webpki-roots",
+ "x509-parser",
 ]
 
 [[package]]
