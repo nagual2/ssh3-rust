@@ -122,6 +122,62 @@ cargo run -p ssh3-client -- \
 The server currently accepts any URL path — there is no secret path support
 yet (see the limitations below).
 
+### Host key verification
+
+The client can pin the certificate of a server in a `known_hosts` file, the
+way the Go implementation does:
+
+```bash
+cargo run -p ssh3-client -- \
+  -o StrictHostKeyChecking=accept-new \
+  --user "$USER" \
+  --identity ~/.ssh/id_ed25519 \
+  https://127.0.0.1:4433/ssh3-term
+```
+
+The pins live in `~/.ssh3/known_hosts` (`%USERPROFILE%\.ssh3\known_hosts` on
+Windows), one line per certificate:
+
+```text
+127.0.0.1:4433/ssh3-term x509-certificate MIIDqTCCAnugAwIBAgIU...
+```
+
+The `StrictHostKeyChecking` policy takes the values of OpenSSH: `ask` (the
+default: the user confirms an unknown host on the console, and a session
+without a console refuses it), `yes` (only a pinned certificate is accepted),
+`accept-new` (an unknown host is pinned on first use) and `no` (a mismatch
+only warns and the session continues). The policy comes from the
+`--strict-host-key-checking` flag, from the `-o StrictHostKeyChecking=` option
+or from the keyword of the same name of the `~/.ssh/config` file, in that
+order of precedence. The check only runs when one of the sources sets the
+policy.
+
+### Port forwarding
+
+The client forwards ports in the three directions of the ssh(1) canon:
+
+```bash
+# -L: a local listener whose connections the server dials on the client behalf
+cargo run -p ssh3-client -- -L 8080:example.org:80 ...
+
+# -R: the server binds a port and bridges every connection to a local target
+cargo run -p ssh3-client -- -R 8080:127.0.0.1:3000 ...
+
+# -D: a local SOCKS5 proxy whose connections the server dials
+cargo run -p ssh3-client -- -D 1080 ...
+```
+
+The `-L` specification is `[bind_address:]port:host:hostport` (with the
+`udp://` prefix for the datagram forward), the `-R` one is
+`[bind_address:]bind_port[/udp]:target_host:target_port` and the `-D` one is
+`[bind_address:]port`. A bind address of `*` listens on every interface; a
+forward without one stays on the loopback.
+
+The target of a reverse forward is resolved on the client, the way OpenSSH
+resolves it, and the client only bridges the forwarded channels whose target
+it asked for: a server that asks the client to reach another endpoint is
+refused.
+
 ## Workspace crates
 
 | Crate | Description |
@@ -199,7 +255,9 @@ and the Rust workspace does not attempt to replicate it:
 | PTY, resize, signal forwarding | yes | yes |
 | Public key, password, OIDC, agent auth | yes | yes |
 | Direct TCP/UDP forwarding | yes | yes (runtime and CLI) |
-| Reverse forwarding (`-R`), dynamic SOCKS (`-D`), proxy jump | yes | no |
+| Reverse forwarding (`-R`) | yes | yes (runtime and CLI) |
+| Dynamic SOCKS forwarding (`-D`) | yes | yes (runtime and CLI) |
+| Proxy jump | yes | no |
 | Control master / connection multiplexing | yes | no |
 | File transfer (`-transfer`) | yes | no |
 | Secret URL path | yes | no |

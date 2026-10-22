@@ -122,6 +122,60 @@ cargo run -p ssh3-client -- \
 Сервер сейчас принимает любой URL-путь — поддержки секретного пути пока нет
 (см. раздел с ограничениями).
 
+### Проверка ключа хоста
+
+Клиент может закрепить сертификат сервера в файле `known_hosts`, как это делает
+Go-реализация:
+
+```bash
+cargo run -p ssh3-client -- \
+  -o StrictHostKeyChecking=accept-new \
+  --user "$USER" \
+  --identity ~/.ssh/id_ed25519 \
+  https://127.0.0.1:4433/ssh3-term
+```
+
+Закрепления лежат в `~/.ssh3/known_hosts` (`%USERPROFILE%\.ssh3\known_hosts` на
+Windows), по одной строке на сертификат:
+
+```text
+127.0.0.1:4433/ssh3-term x509-certificate MIIDqTCCAnugAwIBAgIU...
+```
+
+Политика `StrictHostKeyChecking` принимает значения OpenSSH: `ask` (по
+умолчанию: пользователь подтверждает неизвестный хост в консоли, а сессия без
+консоли его отклоняет), `yes` (принимается только закреплённый сертификат),
+`accept-new` (неизвестный хост закрепляется при первом обращении) и `no`
+(несовпадение только предупреждает, сессия продолжается). Политика берётся из
+флага `--strict-host-key-checking`, из опции `-o StrictHostKeyChecking=` или из
+ключа с тем же именем в файле `~/.ssh/config` — в этом порядке приоритета.
+Проверка выполняется, только если политику задал хотя бы один из источников.
+
+### Пересылка портов
+
+Клиент пересылает порты в трёх направлениях, как канон ssh(1):
+
+```bash
+# -L: a local listener whose connections the server dials on the client behalf
+cargo run -p ssh3-client -- -L 8080:example.org:80 ...
+
+# -R: the server binds a port and bridges every connection to a local target
+cargo run -p ssh3-client -- -R 8080:127.0.0.1:3000 ...
+
+# -D: a local SOCKS5 proxy whose connections the server dials
+cargo run -p ssh3-client -- -D 1080 ...
+```
+
+Спецификация `-L` — `[bind_address:]port:host:hostport` (с префиксом `udp://`
+для дейтаграммной пересылки), `-R` —
+`[bind_address:]bind_port[/udp]:target_host:target_port`, `-D` —
+`[bind_address:]port`. Адрес привязки `*` слушает все интерфейсы; пересылка
+без адреса остаётся на loopback.
+
+Цель обратной пересылки разрешается на клиенте, как это делает OpenSSH, и
+клиент мостит только те каналы, цель которых он запросил сам: сервер,
+который попытается отправить клиент к другой конечной точке, получает отказ.
+
 ## Крейты workspace
 
 | Крейт | Описание |
@@ -197,7 +251,9 @@ Rust-реализация говорит на том же wire-протокол�
 | PTY, resize, пересылка сигналов | да | да |
 | Аутентификация по ключу, паролю, OIDC, через агента | да | да |
 | Прямая TCP/UDP-пересылка | да | да (рантайм и CLI) |
-| Обратная пересылка (`-R`), динамический SOCKS (`-D`), proxy jump | да | нет |
+| Обратная пересылка (`-R`) | да | да (runtime и CLI) |
+| Динамический SOCKS (`-D`) | да | да (runtime и CLI) |
+| Proxy jump | да | нет |
 | Control master / мультиплексирование соединений | да | нет |
 | Передача файлов (`-transfer`) | да | нет |
 | Секретный URL-путь | да | нет |

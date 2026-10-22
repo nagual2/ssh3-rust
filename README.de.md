@@ -122,6 +122,62 @@ cargo run -p ssh3-client -- \
 Der Server akzeptiert derzeit jeden URL-Pfad — Unterstützung für geheime Pfade
 gibt es noch nicht (siehe die Einschränkungen unten).
 
+### Prüfung des Host-Keys
+
+Der Client kann das Zertifikat eines Servers in einer `known_hosts`-Datei
+festhalten, so wie es die Go-Implementierung tut:
+
+```bash
+cargo run -p ssh3-client -- \
+  -o StrictHostKeyChecking=accept-new \
+  --user "$USER" \
+  --identity ~/.ssh/id_ed25519 \
+  https://127.0.0.1:4433/ssh3-term
+```
+
+Die Festhalterungen liegen in `~/.ssh3/known_hosts`
+(`%USERPROFILE%\.ssh3\known_hosts` unter Windows), eine Zeile je Zertifikat:
+
+```text
+127.0.0.1:4433/ssh3-term x509-certificate MIIDqTCCAnugAwIBAgIU...
+```
+
+Die Richtlinie `StrictHostKeyChecking` kennt die Werte von OpenSSH: `ask`
+(Vorgabe: der Benutzer bestätigt einen unbekannten Host auf der Konsole, eine
+Sitzung ohne Konsole lehnt ihn ab), `yes` (nur ein festgehaltenes Zertifikat
+wird akzeptiert), `accept-new` (ein unbekannter Host wird beim ersten Mal
+festgehalten) und `no` (eine Abweichung warnt nur, die Sitzung läuft weiter).
+Die Richtlinie kommt aus der Option `--strict-host-key-checking`, aus
+`-o StrictHostKeyChecking=` oder aus dem gleichnamigen Schlüssel der Datei
+`~/.ssh/config` — in dieser Reihenfolge der Priorität. Die Prüfung läuft nur,
+wenn eine der Quellen die Richtlinie setzt.
+
+### Port-Weiterleitung
+
+Der Client leitet Ports in den drei Richtungen des ssh(1)-Kanons weiter:
+
+```bash
+# -L: a local listener whose connections the server dials on the client behalf
+cargo run -p ssh3-client -- -L 8080:example.org:80 ...
+
+# -R: the server binds a port and bridges every connection to a local target
+cargo run -p ssh3-client -- -R 8080:127.0.0.1:3000 ...
+
+# -D: a local SOCKS5 proxy whose connections the server dials
+cargo run -p ssh3-client -- -D 1080 ...
+```
+
+Die `-L`-Spezifikation lautet `[bind_address:]port:host:hostport` (mit dem
+Praefix `udp://` fuer die Datagramm-Weiterleitung), die `-R`-Spezifikation
+`[bind_address:]bind_port[/udp]:target_host:target_port` und die `-D`-Spezifikation
+`[bind_address:]port`. Eine Bind-Adresse `*` hoert auf allen Schnittstellen an;
+eine Weiterleitung ohne Adresse bleibt auf dem Loopback.
+
+Das Ziel einer Rueckwaertsweiterleitung wird auf dem Client aufgeloest, wie
+OpenSSH es tut, und der Client ueberbrueckt nur die weitergeleiteten Kanäle,
+deren Ziel er selbst angefordert hat: ein Server, der den Client zu einem
+anderen Endpunkt schicken moechte, wird abgelehnt.
+
 ## Crates im Workspace
 
 | Crate | Beschreibung |
@@ -201,7 +257,9 @@ ausgelieferte Produkt, und der Rust-Workspace versucht nicht, sie nachzubauen:
 | PTY, Resize, Signalweiterleitung | ja | ja |
 | Public-Key-, Passwort-, OIDC- und Agent-Authentifizierung | ja | ja |
 | Direkte TCP/UDP-Weiterleitung | ja | ja (Runtime und CLI) |
-| Reverse-Forwarding (`-R`), dynamisches SOCKS (`-D`), Proxy-Jump | ja | nein |
+| Reverse-Forwarding (`-R`) | ja | ja (Laufzeit und CLI) |
+| Dynamisches SOCKS-Forwarding (`-D`) | ja | ja (Laufzeit und CLI) |
+| Proxy-Jump | ja | nein |
 | Control Master / Verbindungs-Multiplexing | ja | nein |
 | Dateiübertragung (`-transfer`) | ja | nein |
 | Geheimer URL-Pfad | ja | nein |
