@@ -152,6 +152,41 @@ Die Richtlinie kommt aus der Option `--strict-host-key-checking`, aus
 `~/.ssh/config` — in dieser Reihenfolge der Priorität. Die Prüfung läuft nur,
 wenn eine der Quellen die Richtlinie setzt.
 
+### Client-Konfiguration
+
+Der Client liest die ssh_config-Datei des Benutzers (standardmäßig
+`~/.ssh/config`, unter Windows `%USERPROFILE%\.ssh\config`). Das Flag `-F`
+benennt eine andere Datei; eine nicht lesbare Datei wird wie in der
+Go-Implementierung mit einer Warnung auf der Standardausgabe ignoriert.
+
+Die Option `-o` akzeptiert die Schlüssel von ssh(1): `RequestTTY`, `Term`,
+`EscapeChar`, `StrictHostKeyChecking`, `LocalForward`, `RemoteForward`,
+`DynamicForward`, `ProxyJump` und `ServerAliveInterval`. Die Werte von
+`LocalForward`, `RemoteForward` und `DynamicForward` folgen der Syntax der
+Flags `-L`, `-R` und `-D`. Jede Einstellung wird mit der OpenSSH-Reihenfolge
+aufgelöst: die Kommandozeile schlägt die `-o`-Option, diese schlägt den
+Schlüssel der ssh_config-Datei, und der Schlüssel schlägt den Standardwert.
+
+Die ssh_config-Datei versteht die Direktive `Include` (rekursiv, mit
+Glob-Mustern, Zyklusschutz und einer Tiefengrenze von 16) sowie die
+`Match`-Blöcke mit den Kriterien `all`, `final`, `host`, `originalhost`,
+`user`, `localuser` und `exec` und der Negation über `!`.
+
+Das Flag `-N` öffnet überhaupt keine Sitzung: die Verbindung bleibt für die
+Weiterleitungen offen, bis der Client unterbrochen wird.
+
+```bash
+# die Verbindung bleibt für die Weiterleitungen offen, ohne Sitzung
+cargo run -p ssh3-client -- -N -L 8080:example.org:80 ...
+```
+
+Das Flag `-V` gibt die Versionszeichenfolge des Clients im Format der
+Go-Implementierung aus:
+
+```text
+SSH 3.0 ssh3-rust 0.1.0 experimental_spec_version=alpha-00
+```
+
 ### Port-Weiterleitung
 
 Der Client leitet Ports in den drei Richtungen des ssh(1)-Kanons weiter:
@@ -233,10 +268,9 @@ Rust-Implementierung — in beide Richtungen:
 > `skipping:` — statt fehlschlagen. Pin den Checkout auf ein Release-Tag der
 > Go-Implementierung: die Interop-Matrix wird gegen ein konkretes Go-Release
 > geprüft, nicht gegen `main` (siehe `M0.C.2` in [`ROADMAP.md`](ROADMAP.md)).
-> Der eingefrorene `h3`-0.0.8-Shim ist mit der Go-Implementierung bis zur
-> `quic-go`-v0.40.x-Linie interoperabel; ein Checkout mit neuerem `quic-go`
-> (v0.49+) ist auf Drahtebene nicht kompatibel zu diesem Workspace — die
-> Szenarien scheitern mit einem HTTP/3-Fehler `0x104`.
+> Die CI prüft die Matrix gegen das Release `v0.1.37` (mit `quic-go`
+> v0.63.0). Der `h3`-0.0.8-Shim spricht das finale HTTP/3 (RFC 9114) und ist
+> mit diesem Release interoperabel.
 > Die Szenarien werden nur auf Unix-ähnlichen Hosts kompiliert.
 
 ## Kompatibilität mit der Go-Implementierung
@@ -284,7 +318,7 @@ hier, damit niemand diesen Code für production-hardened hält.
 
 Der Workspace wird von `.github/workflows/ci.yml` gebaut: `cargo fmt --check`,
 Clippy mit `-D warnings`, die Testsuite und die Interop-Matrix gegen das
-festgehaltene Go-Release `v0.1.12`. Die Toolchain ist in `rust-toolchain.toml`
+festgehaltene Go-Release `v0.1.37`. Die Toolchain ist in `rust-toolchain.toml`
 festgelegt, Formatter und Linter sind in `rustfmt.toml` und `clippy.toml`
 konfiguriert.
 

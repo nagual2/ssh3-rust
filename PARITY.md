@@ -86,7 +86,7 @@
 | B12 | Escape | `-o EscapeChar=` / ssh_config `EscapeChar` | да | нет | Go `cmd/cli_flags.go:346` (`parseEscapeChar`), `cmd/ssh3.go:822`, `cmd/ssh3.go:1362`; Rust — **не найдено** | S | B11 |
 | B13 | Сессия | Код возврата удалённой команды (`exit-status`, `128+signum`) | да | частично | Go `cmd/exit_status.go:17` (`safeExitStatus`), `cmd/exit_status.go:51` (`exitCodeForExitSignal`), `cmd/exit_status.go:28-63` (карта `128+signum`); Rust `ssh3-client/src/main.rs:230` — возвращает код из `Ssh3CapturedSession.exit_status` (`ssh3-client/src/lib.rs:171`), но карты `128+signum` для `exit-signal` нет | S | — |
 | B14 | Сессия | `-f` — уход в фон | да | нет | Go `cmd/ssh3.go:702`, `cmd/background.go:38` (`validateBackgroundMode`), `cmd/background.go:17` (`backgroundEnv`); Rust — **не найдено** | M | B12, A9 |
-| B15 | Сессия | `-N` — не открывать сессию (только форвардинг) | да | нет | Go `cmd/ssh3.go:710`; Rust — **не найдено** | S | C1 |
+| B15 | Сессия | `-N` — не открывать сессию (только форвардинг) | да | да | Go `cmd/ssh3.go:710`; Rust `ssh3-client/src/main.rs` (`-N`), `ssh3-client/src/lib.rs` (`run_forwards_only`, `hold_forwards`) | S | C1 |
 
 ### 2.3. Клиент — форвардинг
 
@@ -117,7 +117,7 @@
 |---|-----------|-------------|----|------|----------------------|-----------|-------------|
 | E1 | Proxy jump | `-J host[,host...]` (цепочка хопов) | да | нет | Go `cmd/ssh3.go:694`, `cmd/ssh3.go:1515` (`parseProxyJumpChain`), `cmd/ssh3.go:1605`; Rust — **не найдено** | L | C2 |
 | E2 | Proxy jump | `-proxy-jump` (deprecated-алиас) | да | нет | Go `cmd/ssh3.go:693`, `cmd/ssh3.go:968`; Rust — **не найдено** | S | E1 |
-| E3 | Proxy jump | ssh_config `ProxyJump` / `UDPProxyJump` | да | нет | Go `cmd/ssh3.go:1365-1368`, `cmd/ssh3.go:890`; Rust — **не найдено** | M | E1, G4 |
+| E3 | Proxy jump | ssh_config `ProxyJump` / `UDPProxyJump` | да | частично | Go `cmd/ssh3.go:1365-1368`, `cmd/ssh3.go:890`; Rust `ssh3-client/src/ssh_config.rs` (чтение ключа), `ssh3-client/src/main.rs` (`-o ProxyJump=`) — значение разбирается и проверяется, но сам туннель через jump-хост не реализован | M | E1, G4 |
 
 ### 2.6. Клиент — передача файлов
 
@@ -134,15 +134,15 @@
 
 | № | Подсистема | Возможность | Go | Rust | Файлы (путь:строка) | Сложность | Зависимости |
 |---|-----------|-------------|----|------|----------------------|-----------|-------------|
-| G1 | Конфигурация | `-F path` — альтернативный ssh_config | да | нет | Go `cmd/ssh3.go:711`, `cmd/cli_flags.go:169` (`resolveConfigPath`); Rust — **не найдено** | S | G3 |
-| G2 | Конфигурация | `-o Key=Value` (повторяемый) | да | нет | Go `cmd/ssh3.go:670`, `cmd/ssh3.go:811-927` (диспетчер по 13 ключам); Rust — **не найдено** | M | G3 |
-| G3 | Конфигурация | ssh_config: секции `Host` | да | нет | Go `client/config/matchcfg/matchcfg.go:294` (`parseSections`), `client/config/matchcfg/matchcfg.go:123`; Rust — **не найдено** | M | — |
-| G4 | Конфигурация | ssh_config: секции `Match` (all/final/canonical/host/originalhost/user) | да | нет | Go `client/config/matchcfg/matchcfg.go:257` (`matchSection`), `client/config/matchcfg/matchcfg.go:534` (`parseMatchCriteria`); Rust — **не найдено** | L | G3 |
-| G5 | Конфигурация | ssh_config: `Include` (рекурсия, glob, `~/.ssh`) | да | нет | Go `client/config/matchcfg/matchcfg.go:342` (`expandIncludes`), `client/config/matchcfg/matchcfg.go:120` (`maxIncludeDepth = 16`), `client/config/matchcfg/matchcfg.go:447` (`globInclude`); Rust — **не найдено** | M | G3 |
-| G6 | Конфигурация | ssh_config: `ServerAliveInterval` | да | нет | Go `cmd/ssh3.go:1332`; Rust — **не найдено** | S | G3 |
-| G7 | Конфигурация | ssh_config: `ForwardAgent` | да | нет | Go `cmd/ssh3.go:1338`; Rust — **не найдено** | S | G3, A11 |
-| G8 | Конфигурация | ssh_config: `EscapeChar` | да | нет | Go `cmd/ssh3.go:1362`; Rust — **не найдено** | S | G3, B12 |
-| G9 | Конфигурация | ssh_config: `StrictHostKeyChecking` | да | да | Go `strict_host_key.go:62` (`ResolveStrictHostKeyChecking`); Rust `ssh3-client/src/ssh_config.rs` (`SshConfig::get`), `ssh3-client/src/main.rs` (`--ssh-config`) — читается только этот ключ | — | G3, A9 |
+| G1 | Конфигурация | `-F path` — альтернативный ssh_config | да | да | Go `cmd/ssh3.go:711`, `cmd/cli_flags.go:169` (`resolveConfigPath`); Rust `ssh3-client/src/main.rs` (`-F`), `ssh3-client/src/main.rs` (`load_user_ssh_config`) — нечитаемый файл игнорируется с предупреждением в stderr, как в Go | S | G3 |
+| G2 | Конфигурация | `-o Key=Value` (повторяемый) | да | да | Go `cmd/ssh3.go:670`, `cmd/ssh3.go:811-927` (диспетчер по 13 ключам); Rust `ssh3-client/src/main.rs` (`parse_options`) — ключи `RequestTTY`, `Term`, `EscapeChar`, `StrictHostKeyChecking`, `LocalForward`, `RemoteForward`, `DynamicForward`, `ProxyJump`, `ServerAliveInterval` | M | G3 |
+| G3 | Конфигурация | ssh_config: секции `Host` | да | да | Go `client/config/matchcfg/matchcfg.go:294` (`parseSections`), `client/config/matchcfg/matchcfg.go:123`; Rust `ssh3-client/src/ssh_config.rs` (`SshConfig::parse_with_base`, `SshConfigSection`) | M | — |
+| G4 | Конфигурация | ssh_config: секции `Match` (all/final/canonical/host/originalhost/user) | да | да | Go `client/config/matchcfg/matchcfg.go:257` (`matchSection`), `client/config/matchcfg/matchcfg.go:534` (`parseMatchCriteria`); Rust `ssh3-client/src/ssh_config.rs` (`parse_match_criteria`, `MatchCriterion`, `criteria_hold`) — критерии `all`, `final`, `host`, `originalhost`, `user`, `localuser`, `exec` и отрицание через `!` | L | G3 |
+| G5 | Конфигурация | ssh_config: `Include` (рекурсия, glob, `~/.ssh`) | да | да | Go `client/config/matchcfg/matchcfg.go:342` (`expandIncludes`), `client/config/matchcfg/matchcfg.go:120` (`maxIncludeDepth = 16`), `client/config/matchcfg/matchcfg.go:447` (`globInclude`); Rust `ssh3-client/src/ssh_config.rs` (`expand_includes`, `resolve_include_target`, `glob_paths`, `MAX_INCLUDE_DEPTH = 16`) | M | G3 |
+| G6 | Конфигурация | ssh_config: `ServerAliveInterval` | да | да | Go `cmd/ssh3.go:1332`; Rust `ssh3-client/src/main.rs` (`ssh_config_values`, `keep_alive_interval`) | S | G3 |
+| G7 | Конфигурация | ssh_config: `ForwardAgent` | да | да | Go `cmd/ssh3.go:1338`; Rust `ssh3-client/src/main.rs` (`ssh_config_values`, `forward_agent`) | S | G3, A11 |
+| G8 | Конфигурация | ssh_config: `EscapeChar` | да | да | Go `cmd/ssh3.go:1362`; Rust `ssh3-client/src/main.rs` (`ssh_config_values`, `escape_char`) | S | G3, B12 |
+| G9 | Конфигурация | ssh_config: `StrictHostKeyChecking` | да | да | Go `strict_host_key.go:62` (`ResolveStrictHostKeyChecking`); Rust `ssh3-client/src/ssh_config.rs` (`SshConfig::get_for_user`), `ssh3-client/src/main.rs` (`ssh_config_values`) | — | G3, A9 |
 | G10 | Конфигурация | ssh_config: `User`, `Port` | да | нет | Go `cmd/ssh3.go:855` (`Port`), `cmd/ssh3.go:863` (`User`); Rust — **не найдено** (только `--user` CLI) | S | G3 |
 | G11 | Конфигурация | ssh_config: `IdentityFile` | да | нет | Go `cmd/ssh3.go:931` (маршрутизация по ключу), `auth/plugins/pubkey_authentication/client/privkey_auth.go:57`; Rust — **не найдено** | S | G3, A1 |
 | G12 | Конфигурация | Переменные окружения `SSH3_*` (серверная политика) | да | нет | Go `cmd/ssh3-server.go:992-1082` (`SSH3_ENABLE_PASSWORD_LOGIN`, `SSH3_GATEWAY_PORTS`, `SSH3_MAX_*`, `SSH3_PERMIT_OPEN`, `SSH3_PERMIT_LISTEN`, `SSH3_SHUTDOWN_DRAIN`), `packaging/ssh3-server.env`; Rust — **не найдено** | M | — |
@@ -156,7 +156,7 @@
 | H3 | Прочее | `-4` / `-6` — только IPv4 / IPv6 | да | нет | Go `cmd/ssh3.go:715-716`, `cmd/ssh3.go:759` (взаимная исключительность); Rust — **не найдено** | S | — |
 | H4 | Прочее | `-p` — порт сервера | да | нет | Go `cmd/ssh3.go:690`; Rust — **не найдено** (порт только в URL) | S | — |
 | H5 | Прочее | `-insecure` — не проверять сертификат | да | да | Go `cmd/ssh3.go:666`; Rust `ssh3-client/src/main.rs:131-132` | — | — |
-| H6 | Прочее | `-version` / `-V` | да | да | Go `cmd/ssh3.go:676-677`; Rust `ssh3-client/src/main.rs:12` (`version` в clap) | — | — |
+| H6 | Прочее | `-version` / `-V` | да | да | Go `cmd/ssh3.go:676-677`; Rust `ssh3-client/src/main.rs` (`-V`/`--version`), `ssh3-client/src/lib.rs` (`SSH3_CLIENT_VERSION_STRING`) — печатается строка версии в формате Go (`SSH 3.0 ssh3-rust 0.1.0 experimental_spec_version=alpha-00`) | — | — |
 | H7 | Прочее | X11 forwarding | да (серверная заглушка) | нет | Go `cmd/ssh3-server.go:564` (`newX11Req`), `cmd/ssh3-server.go:1497`, `client/session_pump.go:156` («not implemented» на клиенте); Rust — протокольный тип есть (`ssh3-proto/src/message.rs:331`), обработчика нет | M | — |
 
 ### 2.9. Сервер — аутентификация и политики
@@ -233,7 +233,7 @@
 | R3 | I4 | Сервер: аутентификация | **Password-login по умолчанию.** Go: парольный вход **включён** по умолчанию, выключается `-enable-password-login=false` / `SSH3_ENABLE_PASSWORD_LOGIN=0`. Rust: `enable_password_login: false` в дефолте конфигурации — парольный вход по умолчанию **выключен**. | `cmd/ssh3-server.go:992` (дефолт `true`) | `ssh3-server/src/config.rs:92` (`enable_password_login: false`), `ssh3-server/src/auth.rs:149` (`should_authenticate`) | Расхождение в **безопасную** сторону: Rust-сервер из коробки не принимает пароли. Но при этом и не запрашивает пароль при запуске — поведение неэквивалентно и требует явного решения |
 | R4 | B7 | PTY | **Переопределение `TERM`.** Go: `-o Term=` → ssh_config `Term` → переменная `TERM` → дефолт. Rust: берёт **только** `TERM` из окружения, переопределения нет. | `cmd/cli_flags.go:310` (`parseTermType`), `cmd/ssh3.go:329-340` (`resolveTermType`) | `ssh3-client/src/lib.rs:574` | Терминальный тип нельзя задать явно — не совпадает с ожиданиями пользователей и с поведением Go |
 | R5 | B13, M6 | Сессия / эксплуатация | **Exit-код по сигналу.** Go маппит `exit-signal` в `128+signum` (HUP→129, TERM→143, …) и в 255 при аномальном завершении. Rust пробрасывает код как есть, карты `128+signum` нет. | `cmd/exit_status.go:28-63` (карта `signalExitCodes`), `cmd/exit_status.go:51` (`exitCodeForExitSignal`), `cmd/exit_status.go:17` (`safeExitStatus`) | `ssh3-client/src/lib.rs:171`, `ssh3-client/src/main.rs:230` | Скрипты, различающие `exit 143` (TERM) и `exit 1`, получат разные коды |
-| R6 | — | Клиент: прочее | **Баннер версии.** Go печатает полную строку версии протокола и ПО (`SSH 3.0 alpha-00 francoismichel/ssh3 0.1.37`, `version.go:22-27`). Rust печатает только версию крейта из `Cargo.toml` (`clap` `version`). | `version.go:22-27`, `cmd/ssh3.go:676-677` | `ssh3-client/src/main.rs:12` | Невозможно отличить сборку по версии; мелочь, но видна пользователю |
+| R6 | — | Клиент: прочее | **Баннер версии.** Go печатает полную строку версии протокола и ПО (`SSH 3.0 alpha-00 francoismichel/ssh3 0.1.37`, `version.go:22-27`). Rust печатает строку того же формата (`SSH 3.0 ssh3-rust 0.1.0 experimental_spec_version=alpha-00`) — она совпадает со строкой, которую клиент объявляет при рукопожатии. | `version.go:22-27`, `cmd/ssh3.go:676-677` | `ssh3-client/src/main.rs` (`-V`), `ssh3-client/src/lib.rs` (`SSH3_CLIENT_VERSION_STRING`) | Устранено |
 
 ### 3.2. Поведенческие последствия пробелов
 

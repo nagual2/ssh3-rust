@@ -58,18 +58,20 @@ The suite contains 91 tests. The cross-implementation (interop) scenarios build
 **real Go binaries** from the [nagual2/ssh3-go](https://github.com/nagual2/ssh3-go)
 repository and need:
 
-- a **Go toolchain** (1.21+),
+- a **Go toolchain** (1.26+ for the current releases of the Go repository),
 - a **checkout of the Go repository** — the `SSH3_GO_REPO` environment variable
   points at that checkout, and the harness builds the Go peers from it. Pin the
   checkout to a **release tag** of the Go implementation: the matrix is verified
-  against a concrete Go release (`v0.1.12` in the CI), not against `main`
+  against a concrete Go release (`v0.1.37` in the CI), not against `main`
   (see `M0.C.2` in [`ROADMAP.md`](ROADMAP.md)),
 - a Unix-like host (the scenarios are `#[cfg(unix)]`).
 
-The `vendor/h3` shim interoperates with the Go implementation up to its
-`quic-go` v0.40.x line. A checkout that carries a newer `quic-go` (v0.49+) is
-not wire-compatible with this workspace: the scenarios then fail with an
-HTTP/3 `0x104` error instead of exercising the wire.
+The `vendor/h3` shim speaks the final HTTP/3 (RFC 9114) and interoperates
+with the current `quic-go` line (v0.49.0 and later, v0.63.0 in the CI
+reference). The HTTP/3 datagram setting must stay disabled on the Rust side:
+the SSH3 datagrams travel over the QUIC datagram API, and a peer that
+announces the HTTP/3 datagram support opens a second reader on the same
+connection-wide datagram queue and steals them.
 
 When the checkout or the toolchain is missing, every interop scenario is
 **skipped** — each one prints a `skipping:` line to the test log — and the rest
@@ -132,7 +134,7 @@ wanted, and it falls back to the cargo registry cache on its own.
 1. Download the new crate and unpack it into a scratch directory.
 2. Apply `patches/h3-0.0.8.patch` to it. A clean apply means the upstream
    code did not move; a rejected hunk means the shim has to be **rebased**:
-   port the two edits by hand to the new upstream sources.
+   port the three edits by hand to the new upstream sources.
 3. Replace `vendor/h3` with the patched tree (keep `vendor/h3/LICENSE` and
    `vendor/h3/Cargo.toml.orig` intact).
 4. Regenerate the patch against the new release and store it as
@@ -145,8 +147,15 @@ wanted, and it falls back to the cargo registry cache on its own.
    release may change the HTTP/3 wire behaviour, and the interop matrix
    against the Go implementation is the gate for that.
 
-The interop job stays on the tag `v0.1.12` of the Go repository until the
-shim speaks the same HTTP/3 version as the current `quic-go` line.
+The gate also checks that the `h3` requirement of `ssh3-h3/Cargo.toml` and the
+`h3` version resolved in `Cargo.lock` still match the recorded base, so a
+dependency bump cannot silently move the base of the shim.
+
+A new `h3` release only helps if it can carry an arbitrary `:protocol` value:
+upstream `h3` still knows a closed set of protocols (`webtransport`,
+`connect-udp`, `connect-ip`, `websocket`), so the shim stays as long as the
+SSH3 `:protocol` value is `ssh3`. The published `h3-quinn` releases pin the
+`h3` version they are built against, so the two crates move together.
 
 ## Continuous integration
 
@@ -157,7 +166,7 @@ The pipeline lives in `.github/workflows/ci.yml` and has seven jobs:
 | `build` | `cargo build --workspace --locked`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` |
 | `test` | `cargo test --workspace --locked` without the Go checkout: the interop scenarios skip instead of failing |
 | `cross-build` | `cargo check --workspace --locked` on `windows-latest` and `macos-latest`. **Known gap:** the workspace does not compile on Windows yet (`AgentForwardingSlot::socket_path()` is `#[cfg(unix)]` but is called unconditionally in `ssh3-server/src/session.rs`), so the job is `continue-on-error` for now. |
-| `interop` | checks out the Go reference repository at the pinned tag `v0.1.12`, installs the Go toolchain and runs the matrix with `SSH3_GO_REPO` |
+| `interop` | checks out the Go reference repository at the pinned tag `v0.1.37`, installs the Go toolchain and runs the matrix with `SSH3_GO_REPO` |
 | `audit` | `cargo audit`; tolerant of a network outage (`continue-on-error`) |
 | `deny` | **blocking** dependency policy gate: `cargo deny check` with the configuration in `deny.toml` (advisories, bans, licenses, sources) |
 | `shim` | **blocking** check that `vendor/h3` still matches the pristine crates.io release plus `patches/h3-0.0.8.patch` |
@@ -179,12 +188,12 @@ The following rules apply:
   reintroduced silently and must not grow without a new decision.
 - **Only crates.io is allowed as a source.** `deny.toml` denies unknown
   registries and git dependencies.
-- **The interop job stays on the tag `v0.1.12`.** The Go side has moved
-  `quic-go` from v0.40.1 to v0.63.0, and the frozen `h3` 0.0.8 shim of this
-  workspace only speaks the HTTP/3 version of the v0.40.x line: against `main`
-  the scenarios abort with an HTTP/3 `0x104` error. That is a wire
-  incompatibility of the Go side, not a regression of the Rust code, so the
-  checkout must not float until the shim is updated.
+- **The interop job stays on a release tag of the Go repository** (`v0.1.37`).
+  The Go side has moved `quic-go` from v0.40.1 to v0.63.0, and the `h3` 0.0.8
+  shim of this workspace speaks the final HTTP/3 (RFC 9114), which is the
+  dialect of the current `quic-go` line. The checkout must not float to
+  `main`: the matrix is verified against a concrete release, and a moving
+  reference turns a regression of this workspace into a moving target.
 
 ## Style
 

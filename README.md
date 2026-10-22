@@ -152,6 +152,42 @@ or from the keyword of the same name of the `~/.ssh/config` file, in that
 order of precedence. The check only runs when one of the sources sets the
 policy.
 
+### Client configuration
+
+The client reads the ssh_config file of the user (`~/.ssh/config` by default,
+`%USERPROFILE%\.ssh\config` on Windows). The `-F` flag names another file;
+a file that cannot be read is ignored with a warning on the standard error,
+like the Go implementation does.
+
+The `-o` option accepts the keywords of ssh(1): `RequestTTY`, `Term`,
+`EscapeChar`, `StrictHostKeyChecking`, `LocalForward`, `RemoteForward`,
+`DynamicForward`, `ProxyJump` and `ServerAliveInterval`. The `LocalForward`,
+`RemoteForward` and `DynamicForward` values use the syntax of the `-L`, `-R`
+and `-D` flags. Every setting is resolved with the precedence of OpenSSH: the
+command line wins over the `-o` option, which wins over the keyword of the
+ssh_config file, which wins over the default.
+
+The ssh_config file understands the `Include` directive (recursive, with glob
+patterns, a guard against cycles and a depth limit of 16) and the `Match`
+blocks, with the `all`, `final`, `host`, `originalhost`, `user`, `localuser`
+and `exec` criteria and the `!` negation of a criterion or of a pattern of a
+list.
+
+The `-N` flag opens no session at all: the connection is held open for the
+forwards, and the client waits until it is interrupted.
+
+```bash
+# the connection is held open for the forwards, without a session
+cargo run -p ssh3-client -- -N -L 8080:example.org:80 ...
+```
+
+The `-V` flag prints the version string of the client, in the format of the
+Go implementation:
+
+```text
+SSH 3.0 ssh3-rust 0.1.0 experimental_spec_version=alpha-00
+```
+
 ### Port forwarding
 
 The client forwards ports in the three directions of the ssh(1) canon:
@@ -232,10 +268,9 @@ Rust implementation, in both directions:
 > with a `skipping:` line in the test log instead of failing. Pin the checkout
 > to a release tag of the Go implementation: the interop matrix is verified
 > against a specific Go release, not against `main` (see `M0.C.2` in
-> [`ROADMAP.md`](ROADMAP.md)). The frozen `h3` 0.0.8 shim interoperates with
-> the Go implementation up to its `quic-go` v0.40.x line; a checkout that
-> carries a newer `quic-go` (v0.49+) is not wire-compatible with this
-> workspace, and its scenarios fail with an HTTP/3 `0x104` error. The
+> [`ROADMAP.md`](ROADMAP.md)). The CI runs the matrix against the release
+> `v0.1.37`, which carries `quic-go` v0.63.0. The `h3` 0.0.8 shim speaks the
+> final HTTP/3 (RFC 9114) and interoperates with that release; the
 > scenarios are compiled only on Unix-like hosts.
 
 ## Compatibility with the Go implementation
@@ -282,7 +317,7 @@ so that nobody mistakes this code for production-hardened.
 
 The workspace is built by `.github/workflows/ci.yml`: `cargo fmt --check`, clippy
 with `-D warnings`, the test suite and the interop matrix against the pinned Go
-release `v0.1.12`. The toolchain is pinned in `rust-toolchain.toml`, the
+release `v0.1.37`. The toolchain is pinned in `rust-toolchain.toml`, the
 formatter and the linter are configured in `rustfmt.toml` and `clippy.toml`.
 
 The wire parser also has a second, asynchronous copy in
