@@ -8,12 +8,15 @@ in a separate repository ([nagual2/ssh3-go](https://github.com/nagual2/ssh3-go))
 and is the only shipped product.
 
 > [!WARNING]
-> The workspace is **frozen (dormant) since 2026-10-13** (see
-> [`FROZEN.md`](FROZEN.md)). It is built by CI (build, tests, clippy, advisory
-> scan), but not shipped in any release, and the findings listed below are
-> frozen together with the code. The
-> protocol itself is experimental and pre-standard. Do not deploy this code in
-> production.
+> The workspace was **frozen (dormant) from 2026-10-13 until 2026-10-22**
+> (see [`FROZEN.md`](FROZEN.md)). The freeze was lifted on 2026-10-22, but
+> the code is still **not shipped**: the Go implementation
+> ([nagual2/ssh3-go](https://github.com/nagual2/ssh3-go)) remains the only
+> released product. The workspace is built by CI (build, tests, clippy,
+> cross-build, advisory scan, dependency policy, shim verification), and the
+> findings listed below are tracked in
+> [`ROADMAP.md`](ROADMAP.md). The protocol itself is experimental and
+> pre-standard. Do not deploy this code in production.
 
 ## Threat model
 
@@ -61,10 +64,55 @@ an operator can assess the risk; the fix plan is tracked in
 | SSH string length limit | High | `ssh3-proto/src/wire.rs:167` | `read_ssh_bytes` allocates memory according to the peer-supplied length; no cap is applied (the Go implementation caps it at `util.MaxSSHStringLen = 1<<24`). |
 | `max_packet_size` is not clamped | High | `ssh3-quinn/src/channel.rs:364`, `ssh3-core/src/channel.rs:447` | The peer-advertised value is neither clamped nor floored. |
 | No `permit-open` / `permit-listen` | High | `ssh3-server/src/lib.rs:1718` | The server forwards to any address the peer requests. |
-| Outdated QUIC dependency | Medium | `Cargo.lock` (`quinn-proto` 0.11.14) | RUSTSEC-2026-0185 (remote memory exhaustion) and a DATAGRAM limit bypass; fixed in `quinn-proto` 0.11.19+. |
+| Outdated QUIC dependency | Medium | `Cargo.lock` (`quinn-proto` 0.11.19) | **Fixed on 2026-10-22**: RUSTSEC-2026-0185 and the related `quinn-proto` advisories (RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340, RUSTSEC-2026-0342) are cleared by `quinn-proto` 0.11.19 and `quinn` 0.11.12. See "Known advisories and accepted risks". |
 | No authentication DoS guard | Medium | `ssh3-server` | No cap on unauthenticated conversations and no failed-attempt counter. |
 | Secret URL path not enforced | Medium | `ssh3-h3` | The server accepts any URL path; the path is therefore not a secret. |
 | Minimal server | Low | `ssh3-server` | Self-signed certificates only; no public certificate automation and no certificate pinning workflow. |
+
+## Known advisories and accepted risks
+
+The dependency audit of 2026-10 (stage M3 of [`ROADMAP.md`](ROADMAP.md))
+reviewed the whole dependency graph with `cargo audit` and the RustSec
+advisory database, and cleared the findings that had an upstream fix. The
+remaining entries are the accepted risks; they are the same entries that the
+blocking `cargo deny` gate of the CI workflow allows in
+[`deny.toml`](deny.toml), with the same justification.
+
+| Advisory | Crate | Status | Risk decision |
+| --- | --- | --- | --- |
+| RUSTSEC-2026-0185 | `quinn-proto` 0.11.14 | **Fixed** (0.11.19) | Remote memory exhaustion through unbounded out-of-order stream reassembly. Relevant to SSH3: the QUIC stack is the transport of every SSH3 session. |
+| RUSTSEC-2026-0338 | `quinn-proto` 0.11.14 | **Fixed** (0.11.19) | A remote peer can panic `quinn-proto` with zero-length STREAM frames during unordered reads. |
+| RUSTSEC-2026-0339 | `quinn-proto` 0.11.14 | **Fixed** (0.11.19) | Unbounded growth of the pending connection ID retirements. |
+| RUSTSEC-2026-0340 | `quinn-proto` 0.11.14 | **Fixed** (0.11.19) | A peer can panic `quinn-proto` when `ACK_FREQUENCY` transmission is enabled. |
+| RUSTSEC-2026-0342 | `quinn-proto` 0.11.14 | **Fixed** (0.11.19) | Zero-length DATAGRAM frames bypass the receive buffer limit. This is the core DATAGRAM path of SSH3 (UDP forwarding), the advisory was treated as release blocking. |
+| RUSTSEC-2026-0346 | `rustls` 0.23.45 | **Fixed** (0.23.46) | The `Debug` implementations of the client session values expose TLS secrets. |
+| RUSTSEC-2026-0347 | `rustls` 0.23.45 | **Fixed** (0.23.46) | Buffered application data is sent to the outer server after an ECH rejection. |
+| RUSTSEC-2026-0348 | `rustls` 0.23.45 | **Fixed** (0.23.46) | Brotli certificate decompression can allocate up to 1 GiB before the authentication completes (pre-authentication). |
+| RUSTSEC-2026-0349 | `rustls` 0.23.45 | **Fixed** (0.23.46) | An unauthenticated ServerHello can downgrade later connections to a classical key exchange. |
+| RUSTSEC-2026-0381 | `webpki-roots` 1.0.6 | **Fixed** (1.0.10) | The bundled root certificates include distrusted emSign intermediates. |
+| RUSTSEC-2026-0382 | `rustls-webpki` 0.103.15 | **Fixed** (0.103.16) | The certificate verification may accept distrusted intermediates. |
+| RUSTSEC-2026-0383 | `webpki-root-certs` 1.0.6 | **Fixed** (1.0.10) | Same emSign intermediate issue in the transitive root store. |
+| RUSTSEC-2026-0097 | `rand` 0.8.5 and 0.9.2 | **Fixed** (0.8.8 and 0.10.3) | `rand` is unsound when a custom logger uses `rand::rng()`; the unsound code needs the `log` feature together with a reentrancy in the logger. |
+| RUSTSEC-2025-0134 | `rustls-pemfile` 2.2.0 | **Accepted** | The crate is unmaintained (the repository was archived in August 2025), not vulnerable. `ssh3-client` uses it for a single call (`rustls_pemfile::certs`). The migration to `rustls-pki-types` (>= 1.9, already in the graph) is prepared but needs a source change in `ssh3-client/src/lib.rs`, which was out of scope for the dependency update. |
+| RUSTSEC-2023-0071 (CVE-2023-49092) | `rsa` 0.9.10 | **Accepted** | The Marvin attack: a timing side channel on the RSA decryption primitive. There is **no fixed release** - the advisory covers every published version of the crate, so no `cargo update` can clear it. The crate is required for the RSA path of the SSH3 bearer-token authentication in `ssh3-auth` and is pulled in by `ssh-key` (feature `rsa`). The workspace only *signs* and *verifies* RSA keys and never decrypts an RSA ciphertext with a private key, so the vulnerable primitive is not reachable from the SSH3 threat model (an untrusted peer). The removal condition is to drop the `rsa` feature of `ssh-key` and replace the RSA bearer-token path, or to wait for a fixed upstream release. |
+| (yanked) | `spin` 0.9.8 | **Fixed** (0.9.9) | The release was yanked upstream; the lock file now uses the re-released version. |
+
+Two further facts belong to this list:
+
+- The Rust part of the project was **frozen from 2026-10-13 until 2026-10-22**.
+  The audit of 2026-10 was carried out during the frozen period and closed
+  part of the findings; the remaining ones are listed in
+  [`ROADMAP.md`](ROADMAP.md).
+- The `h3` crate is overridden by a local shim (`vendor/h3`) that is not
+  covered by the crates.io advisory database, because it is not the crates.io
+  release. The shim is verified against the pristine upstream release by
+  `scripts/verify-h3-shim.sh`, which the CI workflow runs as a blocking job.
+  See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the rebasing procedure when
+  `h3` is updated.
+
+The dependency policy itself is enforced by `cargo deny` (`deny.toml`):
+advisories, duplicate and forbidden crates, licenses and dependency sources
+are checked, and only the two accepted risks above are allowed.
 
 ## Reporting a vulnerability
 

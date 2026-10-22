@@ -1,0 +1,92 @@
+Shim patch for the crates.io h3 0.0.8 crate.
+
+The workspace pins h3 through a [patch.crates-io] path override to
+vendor/h3. The vendored tree is the upstream crates.io h3 0.0.8 release
+with two local edits applied:
+
+  * src/ext.rs            - the closed 'Protocol' enumeration is replaced by
+                            an open 'Cow<str>' token, so that the SSH3 extended
+                            CONNECT ':protocol' value ('ssh3') can be carried
+                            on the wire. Upstream h3 only knows 'webtransport'
+                            and 'connect-udp'.
+  * src/proto/headers.rs  - 'ext.get::<Protocol>().copied()' becomes
+                            '.cloned()', because the open Protocol token is no
+                            longer Copy.
+
+Apply with: patch -p1 -d <h3-0.0.8 source tree> < h3-0.0.8.patch
+Verify with: scripts/verify-h3-shim.sh
+
+--- a/src/ext.rs
++++ b/src/ext.rs
+@@ -1,46 +1,39 @@
+ //! Extensions for the HTTP/3 protocol.
+ 
+-use std::str::FromStr;
++use std::{borrow::Cow, convert::Infallible, str::FromStr};
+ 
+ /// Describes the `:protocol` pseudo-header for extended connect
+ ///
+ /// See: <https://www.rfc-editor.org/rfc/rfc8441#section-4>
+-#[derive(Copy, PartialEq, Debug, Clone)]
+-pub struct Protocol(ProtocolInner);
++#[derive(Clone, Eq, PartialEq, Hash, Debug)]
++pub struct Protocol(Cow<'static, str>);
+ 
+ impl Protocol {
+     /// WebTransport protocol
+-    pub const WEB_TRANSPORT: Protocol = Protocol(ProtocolInner::WebTransport);
++    pub const WEB_TRANSPORT: Protocol = Protocol(Cow::Borrowed("webtransport"));
+     /// RFC 9298 protocol
+-    pub const CONNECT_UDP: Protocol = Protocol(ProtocolInner::ConnectUdp);
++    pub const CONNECT_UDP: Protocol = Protocol(Cow::Borrowed("connect-udp"));
++
++    /// Create a protocol token from a static or owned string.
++    #[inline]
++    pub fn new(value: impl Into<Cow<'static, str>>) -> Self {
++        Self(value.into())
++    }
+ 
+     /// Return a &str representation of the `:protocol` pseudo-header value
+     #[inline]
+     pub fn as_str(&self) -> &str {
+-        match self.0 {
+-            ProtocolInner::WebTransport => "webtransport",
+-            ProtocolInner::ConnectUdp => "connect-udp",
+-        }
++        self.0.as_ref()
+     }
+ }
+ 
+-#[derive(Copy, PartialEq, Debug, Clone)]
+-enum ProtocolInner {
+-    WebTransport,
+-    ConnectUdp,
+-}
+-
+ /// Error when parsing the protocol
+ pub struct InvalidProtocol;
+ 
+ impl FromStr for Protocol {
+-    type Err = InvalidProtocol;
++    type Err = Infallible;
+ 
+     fn from_str(s: &str) -> Result<Self, Self::Err> {
+-        match s {
+-            "webtransport" => Ok(Self(ProtocolInner::WebTransport)),
+-            "connect-udp" => Ok(Self(ProtocolInner::ConnectUdp)),
+-            _ => Err(InvalidProtocol),
+-        }
++        Ok(Self::new(s.to_owned()))
+     }
+ }
+--- a/src/proto/headers.rs
++++ b/src/proto/headers.rs
+@@ -378,7 +378,7 @@
+         //
+         // See: [https://www.rfc-editor.org/rfc/rfc8441#section-4]
+         let protocol = if method == Method::CONNECT {
+-            ext.get::<Protocol>().copied()
++            ext.get::<Protocol>().cloned()
+         } else {
+             None
+         };

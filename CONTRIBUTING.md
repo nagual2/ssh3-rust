@@ -4,11 +4,10 @@ Thanks for taking the time to contribute. This document describes how to work
 in the **Rust** workspace of this repository.
 
 > [!NOTE]
-> The workspace is **frozen (dormant) since 2026-10-13** (see
-> [`FROZEN.md`](FROZEN.md)). Before starting work, check
-> [`ROADMAP.md`](ROADMAP.md): the plan defines which items are open, which are
-> deferred and what the unfreezing conditions are. Small documentation,
-> tooling and test-hygiene contributions are still welcome.
+> The workspace was **frozen (dormant) from 2026-10-13 until 2026-10-22**;
+> the freeze was lifted on 2026-10-22 (see [`FROZEN.md`](FROZEN.md)). Before
+> starting work, check [`ROADMAP.md`](ROADMAP.md): the plan defines which
+> items are open, which are deferred and what the unfreezing conditions are.
 
 ## Ground rules
 
@@ -93,16 +92,75 @@ regression gate: run it in both directions (Rust → Go and Go → Rust).
 - **`ROADMAP.md` and `FROZEN.md`** — they record owner decisions. Propose
   changes, do not rewrite them unilaterally.
 
+## The `h3` shim
+
+The workspace overrides the crates.io crate `h3` with a local path dependency:
+
+```toml
+[patch.crates-io]
+h3 = { path = "vendor/h3" }
+```
+
+**Why the shim exists.** SSH3 uses HTTP/3 Extended CONNECT (RFC 8441) and
+carries the value `ssh3` in the `:protocol` pseudo-header. Upstream `h3`
+0.0.8 models that pseudo-header as a closed enumeration with exactly two
+values, `webtransport` and `connect-udp`, so the SSH3 protocol token cannot
+be expressed. The shim makes the token an open `Cow<'static, str>` value and
+adjusts the one call site that relied on the type being `Copy`.
+
+**Why the shim is checked.** A vendored directory that nobody can diff
+against its upstream is a supply-chain blind spot: it could be edited, and
+nothing would notice. The shim is therefore kept reproducible:
+
+| Artefact | Purpose |
+|---|---|
+| `patches/h3-0.0.8.patch` | The two edits, as a unified diff against the pristine crates.io release. |
+| `scripts/verify-h3-shim.sh` | Downloads the pristine `h3` 0.0.8 crate, checks its SHA-256, applies the patch and compares the result with `vendor/h3`. |
+| CI job `shim` | Runs the script. A drift between `vendor/h3` and the patch fails the build. |
+
+Run it locally before pushing:
+
+```bash
+./scripts/verify-h3-shim.sh
+```
+
+The script accepts `H3_CRATE=/path/to/h3-0.0.8.crate` when the download is not
+wanted, and it falls back to the cargo registry cache on its own.
+
+**Rebasing the shim onto a new `h3` release.** When `h3` is updated:
+
+1. Download the new crate and unpack it into a scratch directory.
+2. Apply `patches/h3-0.0.8.patch` to it. A clean apply means the upstream
+   code did not move; a rejected hunk means the shim has to be **rebased**:
+   port the two edits by hand to the new upstream sources.
+3. Replace `vendor/h3` with the patched tree (keep `vendor/h3/LICENSE` and
+   `vendor/h3/Cargo.toml.orig` intact).
+4. Regenerate the patch against the new release and store it as
+   `patches/h3-<version>.patch`; update `H3_VERSION` and `H3_SHA256` in
+   `scripts/verify-h3-shim.sh`.
+5. Update the `h3` version requirement in the workspace `Cargo.toml` files,
+   the `[patch.crates-io]` entry in the root `Cargo.toml` and the
+   `ignore` rule for `h3` in `.github/dependabot.yml`.
+6. Re-run `./scripts/verify-h3-shim.sh` and the `interop` job: a new `h3`
+   release may change the HTTP/3 wire behaviour, and the interop matrix
+   against the Go implementation is the gate for that.
+
+The interop job stays on the tag `v0.1.12` of the Go repository until the
+shim speaks the same HTTP/3 version as the current `quic-go` line.
+
 ## Continuous integration
 
-The pipeline lives in `.github/workflows/ci.yml` and has four jobs:
+The pipeline lives in `.github/workflows/ci.yml` and has seven jobs:
 
 | Job | What it does |
 |---|---|
 | `build` | `cargo build --workspace --locked`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` |
 | `test` | `cargo test --workspace --locked` without the Go checkout: the interop scenarios skip instead of failing |
+| `cross-build` | `cargo check --workspace --locked` on `windows-latest` and `macos-latest`. **Known gap:** the workspace does not compile on Windows yet (`AgentForwardingSlot::socket_path()` is `#[cfg(unix)]` but is called unconditionally in `ssh3-server/src/session.rs`), so the job is `continue-on-error` for now. |
 | `interop` | checks out the Go reference repository at the pinned tag `v0.1.12`, installs the Go toolchain and runs the matrix with `SSH3_GO_REPO` |
 | `audit` | `cargo audit`; tolerant of a network outage (`continue-on-error`) |
+| `deny` | **blocking** dependency policy gate: `cargo deny check` with the configuration in `deny.toml` (advisories, bans, licenses, sources) |
+| `shim` | **blocking** check that `vendor/h3` still matches the pristine crates.io release plus `patches/h3-0.0.8.patch` |
 
 The toolchain is pinned in `rust-toolchain.toml`, the formatter in `rustfmt.toml`
 and the linter in `clippy.toml`.
@@ -114,9 +172,13 @@ The following rules apply:
   dependency changes — run the interop job with the Go repository checkout.
 - **A change to the wire format requires the interop job**, not only the unit
   tests.
-- **Dependency updates must include the advisory scan** (`cargo-audit`).
-  The frozen `quinn-proto` 0.11.14 (RUSTSEC-2026-0185) is a known, documented
-  exception and must not be silently reintroduced.
+- **Dependency updates must include the advisory scan** (`cargo-audit`) and
+  the `deny` job. The accepted risks (the `rsa` Marvin advisory and the
+  unmaintained `rustls-pemfile`) are listed with their justification in
+  `deny.toml` and in [`SECURITY.md`](SECURITY.md); they must not be
+  reintroduced silently and must not grow without a new decision.
+- **Only crates.io is allowed as a source.** `deny.toml` denies unknown
+  registries and git dependencies.
 - **The interop job stays on the tag `v0.1.12`.** The Go side has moved
   `quic-go` from v0.40.1 to v0.63.0, and the frozen `h3` 0.0.8 shim of this
   workspace only speaks the HTTP/3 version of the v0.40.x line: against `main`

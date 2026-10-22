@@ -45,6 +45,41 @@ jobs:
         # of failing when the Go repository is not available.
         run: cargo test --workspace --locked
 
+  cross-build:
+    name: cross-build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    # KNOWN GAP: the workspace does not compile on Windows yet.
+    # `ssh3-server/src/session.rs` calls `AgentForwardingSlot::socket_path()`
+    # (lines 437 and 464) unconditionally, while the method itself is
+    # `#[cfg(unix)]`. The job is therefore informational for now and must not
+    # block the pipeline; it becomes blocking together with the fix of that
+    # call site. The macOS leg of the matrix is expected to pass.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The Linux build is covered by the `build` job above; this matrix
+          # covers the other two platforms the SSH3 client and server are
+          # expected to run on.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - name: Check out the workspace
+        uses: actions/checkout@v4
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          targets: ${{ matrix.target }}
+      - name: Check the workspace
+        # A part of the code is `#[cfg(unix)]` (the `nix` based terminal and
+        # session handling); this job makes sure that the platform specific
+        # code does not break the build on the other platforms.
+        run: cargo check --workspace --locked --target ${{ matrix.target }}
+
   interop:
     name: interop
     runs-on: ubuntu-latest
@@ -81,8 +116,9 @@ jobs:
     name: audit
     runs-on: ubuntu-latest
     # The advisory database is fetched from the network: a network outage must
-    # not turn the audit into a red build, and the finding list is reviewed
-    # separately (see SECURITY.md).
+    # not turn the audit into a red build. The blocking gate for the
+    # dependency policy is the `deny` job below, which uses the same
+    # advisory database but with an explicit allow list.
     continue-on-error: true
     steps:
       - name: Check out the workspace
@@ -94,8 +130,44 @@ jobs:
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
       - name: Scan the dependency tree
-        # The known advisories are tracked in SECURITY.md; updating the
-        # affected dependencies is staged in ROADMAP.md (M2, M3). The audit
-        # reports them without blocking the pipeline.
+        # The two accepted risks are ignored here as well, so that the audit
+        # output matches the allow list of `deny.toml`:
+        #   RUSTSEC-2023-0071 - rsa / Marvin attack, no upstream fix exists.
+        #   RUSTSEC-2025-0134 - rustls-pemfile is unmaintained, informational.
+        # Both are documented in SECURITY.md.
         continue-on-error: true
-        run: cargo audit
+        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2025-0134
+
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    # Blocking gate for the dependency policy: advisories, duplicate and
+    # forbidden crates, licenses and dependency sources. The accepted risks
+    # are listed with their justification in `deny.toml`.
+    steps:
+      - name: Check out the workspace
+        uses: actions/checkout@v4
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+      - name: Run the dependency policy checks
+        run: cargo deny check
+
+  shim:
+    name: shim
+    runs-on: ubuntu-latest
+    # The `h3` crate is overridden by the local shim in `vendor/h3`. The
+    # shim has to stay reproducible: the script rebuilds the vendored tree
+    # from the pristine crates.io release plus `patches/h3-0.0.8.patch` and
+    # fails the build when the two drift apart.
+    steps:
+      - name: Check out the workspace
+        uses: actions/checkout@v4
+      - name: Verify the vendored h3 shim
+        # The script is invoked through `bash` on purpose: the repository is
+        # checked out with `core.filemode=false` on Windows, so the
+        # executable bit of the script is not recorded in the index.
+        run: bash ./scripts/verify-h3-shim.sh

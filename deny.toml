@@ -1,0 +1,161 @@
+# cargo-deny configuration for the SSH3 Rust workspace.
+#
+# The gate runs in CI (job `deny`) and is blocking: every check below has to
+# pass before a change is merged. The rationale and the accepted risks are
+# documented in SECURITY.md, section "Known advisories and accepted risks".
+
+[graph]
+# The workspace is built for the host platforms only. The `nix` dependency is
+# `cfg(unix)`-gated and `r-efi` only shows up for the UEFI target, so the
+# target list is left empty on purpose: the full graph is checked.
+targets = []
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Advisories
+# ---------------------------------------------------------------------------
+[advisories]
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# A vulnerability in the dependency graph blocks the build (default level).
+# Only the accepted risks are listed here. Everything else has to be fixed.
+ignore = [
+    # ACCEPTED RISK - rsa / Marvin attack (RUSTSEC-2023-0071, CVE-2023-49092).
+    #
+    # The advisory has no fixed release: it covers every published version of
+    # the `rsa` crate, so no `cargo update` can clear it. The crate is needed
+    # for the RSA (ssh-rsa) public key path of the SSH3 bearer-token
+    # authentication in `ssh3-auth`, and it is pulled in transitively by
+    # `ssh-key` (feature `rsa`).
+    #
+    # Why the risk is acceptable here:
+    #   * The Marvin attack is a timing side channel on the RSA *decryption*
+    #     (PKCS#1 v1.5) primitive. This workspace only uses the `rsa` crate
+    #     for *signing* (client side) and *signature verification* (server
+    #     side); it never decrypts an RSA ciphertext with a private key.
+    #   * The affected code path is therefore not reachable from the SSH3
+    #     threat model (an untrusted peer), which is about forged
+    #     authentication, not about oracle attacks on local private keys.
+    #   * The Rust implementation is not the shipped product (the Go
+    #     implementation is), so the exposure is limited to the frozen,
+    #     unreleased Rust tree.
+    #
+    # Removal condition: drop the `rsa` feature from `ssh-key` and replace the
+    # RSA bearer-token path, or upstream publishes a fixed release.
+    { id = "RUSTSEC-2023-0071", reason = "No upstream fix exists for the `rsa` crate; the workspace only signs and verifies RSA keys, it never decrypts with a private key. See SECURITY.md." },
+    # ACCEPTED RISK - rustls-pemfile is unmaintained (RUSTSEC-2025-0134).
+    #
+    # The advisory is informational: the crate is not vulnerable, it is simply
+    # no longer maintained (the repository was archived in August 2025).
+    # `ssh3-client` uses it for a single call, `rustls_pemfile::certs`, to
+    # read a PEM certificate bundle.
+    #
+    # The migration is prepared but was not applied together with the
+    # dependency update, because it needs a source change in
+    # `ssh3-client/src/lib.rs` (see SECURITY.md for the exact recipe):
+    # replace the call with
+    #   rustls_pki_types::pem::PemObject::pem_slice_iter(&bytes)
+    # and drop the `rustls-pemfile` dependency in favour of
+    # `rustls-pki-types` (>= 1.9, already in the graph).
+    { id = "RUSTSEC-2025-0134", reason = "Informational advisory: the crate is not vulnerable. Migration to `rustls-pki-types` (`PemObject`) is prepared, see SECURITY.md." },
+]
+# A stale entry in the ignore list must not fail the build, but it has to
+# stay visible.
+unused-ignored-advisory = "warn"
+
+# ---------------------------------------------------------------------------
+# Bans
+# ---------------------------------------------------------------------------
+[bans]
+# Multiple versions of the same crate are only a warning: the duplicates in
+# this graph are pulled in by upstream crates that have not migrated yet
+# (`rand` 0.8/0.10, `rand_core` 0.6/0.10, `getrandom` 0.2/0.3/0.4,
+# `windows-sys`, `windows-targets`, `r-efi`, `cpufeatures`). They are listed
+# explicitly below, so that a *new* duplicate shows up as a warning and gets
+# reviewed.
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies without a version requirement are workspace-internal
+# crates: their version is pinned by the workspace itself and they never
+# leave the repository. Every other wildcard requirement is rejected.
+allow-wildcard-paths = true
+highlight = "all"
+# Crates that must not enter the dependency graph of an SSH3
+# implementation. They are listed here so that a new dependency pulling them
+# in fails the gate instead of passing silently.
+deny = [
+    # `openssl` / `openssl-sys`: the TLS stack is rustls only, a native OpenSSL
+    # binding would add a system dependency to the build.
+    { crate = "openssl", reason = "The workspace uses rustls exclusively." },
+    { crate = "openssl-sys", reason = "The workspace uses rustls exclusively." },
+    # `native-tls`: same reason, the workspace uses rustls exclusively.
+    { crate = "native-tls", reason = "The workspace uses rustls exclusively." },
+    # `shell-words`: the server spawns processes for authenticated sessions
+    # and must not gain a shell-expanding helper.
+    { crate = "shell-words", reason = "No shell-expanding helper in an SSH session server." },
+]
+skip = [
+    { crate = "rand@0.8.8", reason = "Direct dependency of ssh3-client (random request identifiers); rand 0.10 is pulled in by quinn-proto 0.11.19." },
+    { crate = "rand_core@0.6.4", reason = "Required by rand 0.8 and by the ssh-key/rsa stack." },
+    { crate = "getrandom@0.2.17", reason = "Transitive dependency of rand 0.8." },
+    { crate = "getrandom@0.3.4", reason = "Transitive dependency of an older rand 0.9 consumer." },
+    { crate = "cpufeatures@0.2.17", reason = "Older cpufeatures release still required by a transitive dependency." },
+    { crate = "r-efi@5.3.0", reason = "r-efi 6.x is used by the newer UEFI stack, 5.x is still required by an older transitive dependency." },
+    { crate = "windows-sys@0.52.0", reason = "Older windows-sys release required by a transitive dependency; the newer releases are also in the graph." },
+    { crate = "windows-sys@0.60.2", reason = "Older windows-sys release required by a transitive dependency; the newer releases are also in the graph." },
+    { crate = "windows-targets@0.52.6", reason = "Older windows-targets release required by windows-sys 0.52." },
+    { crate = "windows_aarch64_gnullvm@0.52.6", reason = "Older Windows import library release required by windows-sys 0.52." },
+    { crate = "windows_aarch64_msvc@0.52.6", reason = "Older Windows import library release required by windows-sys 0.52." },
+    { crate = "windows_i686_gnu@0.52.6", reason = "Older Windows import library release required by windows-sys 0.52." },
+    { crate = "windows_i686_gnullvm@0.52.6", reason = "Older Windows import library release required by windows-sys 0.52." },
+    { crate = "windows_i686_msvc@0.52.6", reason = "Older Windows import library release required by windows-sys 0.52." },
+    { crate = "windows_x86_64_gnu@0.52.6", reason = "Older Windows import library release required by windows-sys 0.52." },
+    { crate = "windows_x86_64_gnullvm@0.52.6", reason = "Older Windows import library release required by windows-sys 0.52." },
+    { crate = "windows_x86_64_msvc@0.52.6", reason = "Older Windows import library release required by windows-sys 0.52." },
+]
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+[licenses]
+# Only permissive licenses are accepted. The list is explicit on purpose: a
+# new dependency with a different license has to be reviewed before it is
+# added here.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "LGPL-2.1-or-later",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+exceptions = []
+# The workspace crates themselves are Apache-2.0, the vendored h3 shim is MIT.
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+[sources]
+# Only the crates.io registry is allowed. The workspace has no git
+# dependencies; the only local override is the `h3` path shim in
+# `vendor/h3`, which is a path dependency and therefore neither a registry
+# nor a git source. It is verified against the upstream crate by
+# `scripts/verify-h3-shim.sh`.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

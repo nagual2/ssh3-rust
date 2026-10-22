@@ -1,0 +1,63 @@
+version: 2
+
+# Dependency updates for the SSH3 Rust workspace.
+#
+# The root `Cargo.toml` is a virtual workspace manifest; Dependabot resolves
+# the workspace members from it, so a single `cargo` entry with
+# `directory: "/"` covers every crate of the workspace
+# (ssh3-auth, ssh3-client, ssh3-core, ssh3-h3, ssh3-proto, ssh3-quinn,
+# ssh3-server).
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:00"
+      timezone: "Europe/Moscow"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "supply-chain"
+    groups:
+      # Patch and minor updates of the crates.io dependencies are grouped into
+      # a single pull request; they are low risk and are validated by the
+      # `build`, `test`, `deny` and `shim` jobs of the CI workflow.
+      cargo-patch-and-minor:
+        update-types:
+          - "patch"
+          - "minor"
+        patterns:
+          - "*"
+      # Security relevant major bumps stay in separate pull requests, they
+      # need a manual review of the API changes.
+      cargo-major:
+        update-types:
+          - "major"
+        patterns:
+          - "*"
+    ignore:
+      # The `h3` crate is overridden by the local shim in `vendor/h3` (see
+      # `patches/h3-0.0.8.patch`). Upstream releases cannot be taken over
+      # automatically: the shim has to be rebased first, which is a manual
+      # step documented in CONTRIBUTING.md.
+      - dependency-name: "h3"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:00"
+      timezone: "Europe/Moscow"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "supply-chain"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
