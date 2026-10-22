@@ -33,6 +33,7 @@ use crate::reverse_forward::{CHANNEL_TYPE_REVERSE_FORWARD, handle_reverse_forwar
 use crate::session::{
     AgentForwardingSlot, SessionUser, handle_plain_channel, resolve_session_user,
 };
+use crate::sftp::{CHANNEL_TYPE_SFTP, handle_sftp_channel};
 
 /// Serves an endpoint until it stops accepting connections.
 ///
@@ -340,6 +341,11 @@ async fn handle_accepted_channel(
             CHANNEL_TYPE_DYNAMIC_FORWARD_TCP => {
                 handle_dynamic_forward_data_channel(channel, connection, config, forwarding_state)
                     .await
+            }
+            CHANNEL_TYPE_SFTP => {
+                // the file transfer has its own lifetime: closing the
+                // transfer channel ends the transfer, not the conversation
+                handle_sftp_channel(channel, &config, &session_user).await
             }
             _ => {
                 handle_plain_channel(

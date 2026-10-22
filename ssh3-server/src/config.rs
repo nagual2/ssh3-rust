@@ -13,6 +13,7 @@ use ssh3_h3::SSH3_VERSION_STRING;
 use crate::auth::{Ssh3AuthGuard, password_auth_available};
 use crate::error::Ssh3ServerError;
 use crate::forwarding::ForwardPolicy;
+use crate::sftp::SftpSessionBudget;
 
 /// Callback that decides whether a username/password pair is valid.
 ///
@@ -68,6 +69,69 @@ impl GatewayPortsPolicy {
 }
 
 impl fmt::Display for GatewayPortsPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The path isolation mode of the SFTP subsystem.
+///
+/// The modes follow the `sshd` model of the Go implementation
+/// (`cmd/sftp_subsystem.go` of `nagual2/ssh3-go`):
+///
+/// * [`SftpJailMode::Chroot`] — the sshd model: the network-facing process
+///   never opens a path of the user. A short-lived child is started for the
+///   channel, it chroots into the home directory of the user and drops to
+///   the uid/gid of the user before the first path is opened. The confinement
+///   is the kernel's: after the chroot neither an absolute symlink nor a
+///   `..` reaches outside of the jail.
+/// * [`SftpJailMode::Lexical`] — the historical in-process jail: the client
+///   paths are mapped onto the home directory of the user and the result is
+///   checked against the jail, symlinks included. The privileges of the
+///   server process apply, so the mode only makes sense for a server that
+///   holds no privileges worth abusing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SftpJailMode {
+    /// The sshd model: a per-session child chroots into the home directory.
+    #[default]
+    Chroot,
+    /// The in-process jail: the paths are checked in the server process.
+    Lexical,
+}
+
+impl SftpJailMode {
+    /// Parses the spelling of the jail mode.
+    ///
+    /// The accepted spellings are `chroot` and `lexical`.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        match spec.trim() {
+            "chroot" => Ok(Self::Chroot),
+            "lexical" => Ok(Self::Lexical),
+            other => Err(format!(
+                "invalid sftp jail mode {other:?}: want chroot or lexical"
+            )),
+        }
+    }
+
+    /// Returns the canonical spelling of the jail mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chroot => "chroot",
+            Self::Lexical => "lexical",
+        }
+    }
+
+    /// Returns the jail mode the server can actually run.
+    ///
+    /// The chroot jail needs the privileges of the operating system, so it
+    /// only exists on Unix. On the other platforms the lexical jail is used
+    /// instead: a Windows server has no chroot at all.
+    pub fn effective(self) -> Self {
+        if cfg!(unix) { self } else { Self::Lexical }
+    }
+}
+
+impl fmt::Display for SftpJailMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -144,6 +208,27 @@ pub struct Ssh3ServerConfig {
     /// The guard is shared by all connections of a server; cloning the
     /// configuration keeps sharing it.
     pub auth_guard: Arc<Ssh3AuthGuard>,
+    /// The path isolation mode of the SFTP subsystem.
+    ///
+    /// The default is the sshd model: a per-session child chroots into the
+    /// home directory of the user and drops to its uid/gid.
+    pub sftp_jail: SftpJailMode,
+    /// Maximum number of concurrent SFTP sessions one user may hold.
+    ///
+    /// The sessions of a user are counted across their conversations; a
+    /// request over the cap is refused with a readable reason. `0` disables
+    /// the budget.
+    pub max_sftp_sessions_per_user: usize,
+    /// The directory the SFTP subsystem is jailed into.
+    ///
+    /// `None` jails the subsystem into the home directory of the session
+    /// user, the `ChrootDirectory` analog of the `sshd_config`.
+    pub sftp_root: Option<PathBuf>,
+    /// The number of the concurrent SFTP sessions of every user.
+    ///
+    /// The budget is shared by the conversations of the server: the sessions
+    /// of a user are counted across them.
+    pub sftp_budget: Arc<SftpSessionBudget>,
 }
 
 impl fmt::Debug for Ssh3ServerConfig {
@@ -183,6 +268,13 @@ impl fmt::Debug for Ssh3ServerConfig {
             .field("max_idle_timeout", &self.max_idle_timeout)
             .field("handshake_idle_timeout", &self.handshake_idle_timeout)
             .field("auth_guard", &self.auth_guard)
+            .field("sftp_jail", &self.sftp_jail)
+            .field(
+                "max_sftp_sessions_per_user",
+                &self.max_sftp_sessions_per_user,
+            )
+            .field("sftp_root", &self.sftp_root)
+            .field("sftp_budget", &self.sftp_budget)
             .finish()
     }
 }
@@ -212,6 +304,10 @@ impl Default for Ssh3ServerConfig {
             max_idle_timeout: DEFAULT_MAX_IDLE_TIMEOUT,
             handshake_idle_timeout: DEFAULT_HANDSHAKE_IDLE_TIMEOUT,
             auth_guard: Arc::new(Ssh3AuthGuard::default()),
+            sftp_jail: SftpJailMode::default(),
+            max_sftp_sessions_per_user: DEFAULT_MAX_SFTP_SESSIONS_PER_USER,
+            sftp_root: None,
+            sftp_budget: Arc::new(SftpSessionBudget::new()),
         }
     }
 }
@@ -236,6 +332,12 @@ pub const DEFAULT_HANDSHAKE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The default number of active reverse-forward listeners one user may hold.
 pub const DEFAULT_MAX_REVERSE_FORWARDS_PER_USER: usize = 10;
+
+/// The default number of concurrent SFTP sessions one user may hold.
+///
+/// The value is the default of the `-max-sftp-sessions-per-user` option of the
+/// Go implementation; `0` disables the budget.
+pub const DEFAULT_MAX_SFTP_SESSIONS_PER_USER: usize = 16;
 
 /// Returns the name of the user the server process runs as.
 ///

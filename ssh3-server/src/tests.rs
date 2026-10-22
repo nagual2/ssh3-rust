@@ -63,10 +63,15 @@ struct SessionOutput {
 
 impl TestHarness {
     pub(crate) async fn open_session_channel(&self) -> Arc<Ssh3Channel> {
+        self.open_channel(b"session").await
+    }
+
+    /// Opens a channel of the given type towards the server.
+    pub(crate) async fn open_channel(&self, channel_type: &[u8]) -> Arc<Ssh3Channel> {
         open_channel(
             self.conversation.as_ref(),
             &self.client_connection,
-            b"session".to_vec(),
+            channel_type.to_vec(),
             1024,
             10,
         )

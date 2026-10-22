@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use clap::{Parser, ValueHint, error::ErrorKind};
 use ssh3_server::{
-    ForwardPolicy, GatewayPortsPolicy, Ssh3ServerConfig, parse_duration, run_with_self_signed,
+    ForwardPolicy, GatewayPortsPolicy, InternalSftpOptions, SftpJailMode, Ssh3ServerConfig,
+    parse_duration, run_internal_sftp_server, run_with_self_signed,
 };
 
 /// The environment variables the server options can be set with.
@@ -21,6 +22,8 @@ const ENV_MAX_PASSWORD_FAILURES: &str = "SSH3_MAX_PASSWORD_FAILURES";
 const ENV_PASSWORD_LOCKOUT: &str = "SSH3_PASSWORD_LOCKOUT_SECONDS";
 const ENV_PASSWORD_LOCKOUT_ALIAS: &str = "SSH3_MAX_PASSWORD_FAILOUT_SECONDS";
 const ENV_ENABLE_PASSWORD_LOGIN: &str = "SSH3_ENABLE_PASSWORD_LOGIN";
+const ENV_SFTP_JAIL: &str = "SSH3_SFTP_JAIL";
+const ENV_MAX_SFTP_SESSIONS: &str = "SSH3_MAX_SFTP_SESSIONS_PER_USER";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -119,6 +122,44 @@ struct Cli {
         value_parser = parse_duration,
     )]
     password_lockout: Option<Duration>,
+
+    /// The path isolation mode of the SFTP subsystem.
+    ///
+    /// `chroot` (the default) is the sshd model: a per-session child chroots
+    /// into the home directory of the user and drops to its uid/gid, so the
+    /// network-facing process never opens a path of the user. `lexical` is
+    /// the in-process jail: the paths are checked in the server process.
+    #[arg(long = "sftp-jail", value_name = "MODE")]
+    sftp_jail: Option<String>,
+
+    /// Maximum number of concurrent SFTP sessions one user may hold.
+    ///
+    /// `0` disables the budget.
+    #[arg(long = "max-sftp-sessions-per-user", value_name = "COUNT")]
+    max_sftp_sessions_per_user: Option<usize>,
+
+    /// Internal: run the SFTP child server on stdin/stdout.
+    ///
+    /// The option is set by the server itself, when it starts the child of
+    /// the chroot jail; it is not meant for direct use.
+    #[arg(long = "sftp-server-internal", hide = true)]
+    sftp_server_internal: bool,
+
+    /// Internal: the directory the SFTP child chroots into.
+    #[arg(long = "sftp-chroot", value_name = "DIR", hide = true)]
+    sftp_chroot: Option<PathBuf>,
+
+    /// Internal: the root the SFTP child serves when it runs without a chroot.
+    #[arg(long = "sftp-root", value_name = "DIR", hide = true)]
+    sftp_root: Option<PathBuf>,
+
+    /// Internal: the uid the SFTP child drops to.
+    #[arg(long = "sftp-uid", value_name = "UID", hide = true)]
+    sftp_uid: Option<u32>,
+
+    /// Internal: the gid the SFTP child drops to.
+    #[arg(long = "sftp-gid", value_name = "GID", hide = true)]
+    sftp_gid: Option<u32>,
 }
 
 /// The long options that are also accepted with a single dash.
@@ -137,6 +178,8 @@ const GO_STYLE_OPTIONS: &[&str] = &[
     "max-unauth-conversations",
     "max-password-failures",
     "password-lockout",
+    "sftp-jail",
+    "max-sftp-sessions-per-user",
 ];
 
 /// Rewrites the Go-style single-dash options into their clap spelling.
@@ -196,8 +239,8 @@ fn env_number<T: std::str::FromStr>(name: &str) -> Option<T> {
     }
 }
 
-fn parse_args() -> Result<Ssh3ServerConfig, clap::Error> {
-    let cli = Cli::try_parse_from(normalize_go_style_args(std::env::args()))?;
+/// Builds the configuration of the server from the command line.
+fn build_config(cli: Cli) -> Result<Ssh3ServerConfig, clap::Error> {
     let mut config = Ssh3ServerConfig::default();
     if let Some(bind_addr) = cli.bind {
         config.bind_addr = bind_addr;
@@ -315,12 +358,73 @@ fn parse_args() -> Result<Ssh3ServerConfig, clap::Error> {
         config.password_lockout = lockout;
     }
 
+    if let Some(mode) = cli.sftp_jail.clone().or_else(|| env_value(ENV_SFTP_JAIL)) {
+        config.sftp_jail = match SftpJailMode::parse(&mode) {
+            Ok(mode) => mode,
+            Err(err) => {
+                return Err(clap::Error::raw(
+                    clap::error::ErrorKind::ValueValidation,
+                    err,
+                ));
+            }
+        };
+    }
+    if config.sftp_jail.effective() != config.sftp_jail {
+        eprintln!(
+            "ssh3-rust-server the {} jail of the sftp subsystem needs a unix platform, using the {} jail",
+            config.sftp_jail,
+            config.sftp_jail.effective()
+        );
+    }
+
+    if let Some(max) = cli
+        .max_sftp_sessions_per_user
+        .or_else(|| env_number(ENV_MAX_SFTP_SESSIONS))
+    {
+        config.max_sftp_sessions_per_user = max;
+    }
+
     Ok(config)
+}
+
+/// Runs the internal SFTP child of the chroot jail.
+async fn run_internal_child(cli: &Cli) -> ExitCode {
+    let options = InternalSftpOptions {
+        chroot_dir: cli.sftp_chroot.clone(),
+        root_dir: cli.sftp_root.clone(),
+        uid: cli.sftp_uid,
+        gid: cli.sftp_gid,
+    };
+    match run_internal_sftp_server(options).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("ssh3-rust-server the internal sftp server failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let config = match parse_args() {
+    let cli = match Cli::try_parse_from(normalize_go_style_args(std::env::args())) {
+        Ok(cli) => cli,
+        Err(err) => {
+            let status = match err.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            };
+            err.print().ok();
+            return status;
+        }
+    };
+
+    // the internal child of the chroot jail: it serves the protocol over its
+    // standard streams and never listens on a socket
+    if cli.sftp_server_internal {
+        return run_internal_child(&cli).await;
+    }
+
+    let config = match build_config(cli) {
         Ok(config) => config,
         Err(err) => {
             let status = match err.kind() {

@@ -24,6 +24,9 @@
 //! | `forwarding_wire` | wire payloads of the reverse and dynamic forwarding channels |
 //! | `reverse_forward` | the server side of the reverse port forwarding (`-R`) |
 //! | `dynamic_forward` | the server side of the dynamic SOCKS forwarding (`-D`) |
+//! | `sftp` | the server side of the SFTP subsystem (the file transfer) |
+//! | `sftp_child` | the internal child of the chroot jail of the SFTP subsystem |
+//! | `sftp_stream` | the byte streams of the SFTP subsystem |
 //! | `tls` | self-signed TLS entry point |
 //! | `runtime` | endpoint/connection acceptance and channel routing |
 //! | `error` | [`Ssh3ServerError`] and benign-error classification |
@@ -38,17 +41,26 @@ mod pty;
 mod reverse_forward;
 mod runtime;
 mod session;
+mod sftp;
+mod sftp_child;
+mod sftp_stream;
 mod tls;
 
 #[cfg(test)]
 mod forwarding_tests;
 #[cfg(test)]
+mod sftp_tests;
+#[cfg(test)]
 mod tests;
 
 pub use auth::Ssh3AuthGuard;
-pub use config::{GatewayPortsPolicy, Ssh3PasswordVerifier, Ssh3ServerConfig, parse_duration};
+pub use config::{
+    GatewayPortsPolicy, SftpJailMode, Ssh3PasswordVerifier, Ssh3ServerConfig, parse_duration,
+};
 pub use error::Ssh3ServerError;
 pub use forwarding::{ForwardPolicy, check_listen_target};
 pub use forwarding_wire::Ssh3ForwardingWireError;
 pub use runtime::{serve_connection, serve_endpoint};
+pub use sftp::SftpSessionBudget;
+pub use sftp_child::{InternalSftpOptions, run_internal_sftp_server};
 pub use tls::{apply_transport_timeouts, run_with_self_signed};
