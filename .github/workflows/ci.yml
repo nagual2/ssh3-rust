@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the workspace
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the workspace
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -68,7 +68,7 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - name: Check out the workspace
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the workspace
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       # The Go reference repository is pinned to a release tag on purpose.
       # `main` carries quic-go v0.63.0, while the frozen `h3` 0.0.8 shim of
       # this workspace only speaks the HTTP/3 version of the quic-go v0.40.x
@@ -94,7 +94,7 @@ jobs:
       # not a regression of the Rust code, so the checkout stays on the tag
       # v0.1.12 until the shim is updated.
       - name: Check out the Go reference repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: nagual2/ssh3-go
           ref: v0.1.12
@@ -104,7 +104,7 @@ jobs:
         with:
           toolchain: 1.98.1
       - name: Install the Go toolchain
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: "1.22"
       - name: Run the interop matrix
@@ -122,7 +122,7 @@ jobs:
     continue-on-error: true
     steps:
       - name: Check out the workspace
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -146,7 +146,7 @@ jobs:
     # are listed with their justification in `deny.toml`.
     steps:
       - name: Check out the workspace
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -165,7 +165,7 @@ jobs:
     # fails the build when the two drift apart.
     steps:
       - name: Check out the workspace
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Verify the vendored h3 shim
         # The script is invoked through `bash` on purpose: the repository is
         # checked out with `core.filemode=false` on Windows, so the
