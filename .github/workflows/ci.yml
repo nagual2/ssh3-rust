@@ -79,6 +79,37 @@ jobs:
         # code does not break the build on the other platforms.
         run: cargo check --workspace --locked --target ${{ matrix.target }}
 
+  client-windows:
+    name: client (windows)
+    runs-on: windows-latest
+    # The Windows client is a first-class citizen: the console handling, the
+    # resize polling and the control events of the console live behind the
+    # `#[cfg(windows)]` modules of the client, and this job runs the test
+    # suite of the client on a Windows runner instead of only checking that
+    # it compiles.
+    steps:
+      - name: Check out the workspace
+        uses: actions/checkout@v7
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - name: Run the linter for the Windows target
+        # The linter of the native target covers the Windows code paths of
+        # the client: the console modes, the geometry of the console and the
+        # control events.
+        run: cargo clippy -p ssh3-client --all-targets --locked -- -D warnings
+      - name: Run the client test suite
+        # The interactive scenarios need a local console with a pty, and the
+        # server side still runs the remote commands with `/bin/sh`: those
+        # scenarios stay unix-only and are covered by the `test` and the
+        # `interop` jobs above. The Windows run covers the platform neutral
+        # scenarios of the client and the unit tests of the Windows
+        # console (the geometry of the window, the raw mode and the
+        # mapping of the control events).
+        run: cargo test -p ssh3-client --locked
+
   interop:
     name: interop
     runs-on: ubuntu-latest

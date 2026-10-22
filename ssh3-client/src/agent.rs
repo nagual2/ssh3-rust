@@ -1,19 +1,31 @@
+#[cfg(unix)]
 use std::env;
+#[cfg(unix)]
 use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 
+#[cfg(unix)]
 use ssh_key::{Algorithm, HashAlg, PrivateKey, PublicKey, Signature};
+#[cfg(unix)]
 use ssh3_auth::{Ssh3JwtAlgorithm, build_bearer_token_with_signer};
 
 use crate::{Ssh3ClientConfig, Ssh3ClientError};
 
+#[cfg(unix)]
 const SSH_AGENT_FAILURE: u8 = 5;
+#[cfg(unix)]
 const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
+#[cfg(unix)]
 const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
+#[cfg(unix)]
 const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
+#[cfg(unix)]
 const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
+#[cfg(unix)]
 const SSH_AGENT_RSA_SHA2_256: u32 = 2;
 
 #[derive(Clone, Debug)]

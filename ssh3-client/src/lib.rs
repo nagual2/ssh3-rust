@@ -3,8 +3,6 @@ use std::fmt;
 use std::future::poll_fn;
 use std::io::{self, BufReader};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::Arc;
@@ -13,8 +11,6 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use http::{Uri, header::HeaderValue};
-#[cfg(unix)]
-use nix::sys::termios::{self, SetArg};
 use quinn::{ConnectError, Connection, ConnectionError, Endpoint};
 use rand::{RngCore, rngs::OsRng};
 use reqwest::StatusCode as HttpStatusCode;
@@ -47,6 +43,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use url::Url;
 
 mod agent;
+mod console;
 mod duration;
 mod dynamic;
 mod escape;
@@ -61,6 +58,10 @@ mod strict_host_key;
 
 pub use agent::Ssh3AgentSelection;
 use agent::{build_agent_bearer_token, resolve_agent_socket_path};
+use console::{
+    LocalTerminal, RawModeGuardHandle, TerminalSize, detect_local_terminal, enable_console_modes,
+    enable_raw_mode, spawn_resize_forwarder, spawn_signal_forwarders, suspend_local_process,
+};
 pub use duration::{Ssh3DurationError, parse_duration};
 pub use dynamic::{
     Ssh3DynamicForwardParseError, Ssh3DynamicForwardSpec, parse_dynamic_forward_spec,
@@ -266,77 +267,23 @@ pub enum Ssh3SessionRequest {
     Exec(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TerminalSize {
-    char_width: u16,
-    char_height: u16,
-    pixel_width: u16,
-    pixel_height: u16,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct LocalTerminalInfo {
-    term: Option<String>,
-    size: TerminalSize,
-}
-
-struct LocalTerminal {
-    info: LocalTerminalInfo,
-    #[cfg(unix)]
-    fd: RawFd,
-}
-
-#[cfg(unix)]
-struct RawModeGuard {
-    fd: RawFd,
-    original: termios::Termios,
-}
-
-#[cfg(unix)]
-impl RawModeGuard {
-    /// Restores the terminal state the guard captured.
-    fn restore(&self) -> io::Result<()> {
-        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        termios::tcsetattr(fd, SetArg::TCSANOW, &self.original).map_err(io::Error::from)
-    }
-
-    /// Enters the raw mode again, after a suspend resumed the process.
-    fn reenter(&self) -> io::Result<()> {
-        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        let mut state = termios::tcgetattr(fd).map_err(io::Error::from)?;
-        termios::cfmakeraw(&mut state);
-        termios::tcsetattr(fd, SetArg::TCSANOW, &state).map_err(io::Error::from)
-    }
-}
-
-#[cfg(unix)]
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = self.restore();
-    }
-}
-
 #[derive(Default)]
 struct SessionRuntime {
     background_tasks: Vec<tokio::task::JoinHandle<()>>,
+    console_mode_guard: Option<console::ConsoleModeGuard>,
     raw_mode_guard: RawModeGuardHandle,
 }
-
-/// The handle of the raw mode guard of the local console.
-///
-/// The guard only exists on unix, where the console can be put in the raw
-/// mode; elsewhere the handle stays empty. The mutex keeps the guard
-/// shareable between the session and the stdin pump.
-#[cfg(unix)]
-type RawModeGuardHandle = Option<Arc<std::sync::Mutex<RawModeGuard>>>;
-#[cfg(not(unix))]
-type RawModeGuardHandle = Option<Arc<()>>;
 
 impl Drop for SessionRuntime {
     fn drop(&mut self) {
         for task in &self.background_tasks {
             task.abort();
         }
+        // The console modes are restored before the raw mode: the raw mode
+        // guard holds the console mode the input handle had before the
+        // session started.
+        self.console_mode_guard.take();
+        self.raw_mode_guard.take();
     }
 }
 
@@ -867,15 +814,28 @@ async fn send_pty_request(channel: &Ssh3Channel, pty: &PtySpec) -> Result<(), Ss
         .map_err(Ssh3ClientError::from)
 }
 
+/// Forwards the SSH agent of the client to the server.
+///
+/// The agent socket is a unix domain socket: the Windows client has no
+/// agent to forward, so the request is refused with a clear error instead
+/// of a session that cannot work.
 async fn send_forward_agent_request(channel: &Ssh3Channel) -> Result<(), Ssh3ClientError> {
-    channel
-        .write_data(b"forward-agent", SSH_EXTENDED_DATA_NONE)
-        .await
-        .map(|_| ())
-        .map_err(Ssh3ClientError::from)
+    #[cfg(unix)]
+    {
+        channel
+            .write_data(b"forward-agent", SSH_EXTENDED_DATA_NONE)
+            .await
+            .map(|_| ())
+            .map_err(Ssh3ClientError::from)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = channel;
+        Err(Ssh3ClientError::AgentUnavailable)
+    }
 }
 
-async fn send_window_change_request(
+pub(crate) async fn send_window_change_request(
     channel: &Ssh3Channel,
     size: TerminalSize,
 ) -> Result<(), Ssh3ClientError> {
@@ -893,7 +853,7 @@ async fn send_window_change_request(
         .map_err(Ssh3ClientError::from)
 }
 
-async fn send_signal_request(
+pub(crate) async fn send_signal_request(
     channel: &Ssh3Channel,
     signal_name: &str,
 ) -> Result<(), Ssh3ClientError> {
@@ -908,113 +868,6 @@ async fn send_signal_request(
         .map_err(Ssh3ClientError::from)
 }
 
-#[cfg(unix)]
-fn detect_local_terminal() -> Result<Option<LocalTerminal>, Ssh3ClientError> {
-    let stdin = std::io::stdin();
-    let fd = stdin.as_raw_fd();
-    let is_tty = unsafe { nix::libc::isatty(fd) } == 1;
-    if !is_tty {
-        return Ok(None);
-    }
-
-    Ok(Some(LocalTerminal {
-        info: LocalTerminalInfo {
-            term: env::var("TERM").ok().filter(|term| !term.is_empty()),
-            size: read_terminal_size(fd)?,
-        },
-        fd,
-    }))
-}
-
-#[cfg(not(unix))]
-fn detect_local_terminal() -> Result<Option<LocalTerminal>, Ssh3ClientError> {
-    Ok(None)
-}
-
-#[cfg(unix)]
-fn read_terminal_size(fd: RawFd) -> Result<TerminalSize, Ssh3ClientError> {
-    let mut size = std::mem::MaybeUninit::<nix::libc::winsize>::zeroed();
-    let result = unsafe { nix::libc::ioctl(fd, nix::libc::TIOCGWINSZ, size.as_mut_ptr()) };
-    if result == -1 {
-        return Err(Ssh3ClientError::Io(io::Error::last_os_error()));
-    }
-
-    let size = unsafe { size.assume_init() };
-    Ok(TerminalSize {
-        char_width: size.ws_col,
-        char_height: size.ws_row,
-        pixel_width: size.ws_xpixel,
-        pixel_height: size.ws_ypixel,
-    })
-}
-
-#[cfg(unix)]
-fn enable_raw_mode(fd: RawFd) -> Result<RawModeGuard, Ssh3ClientError> {
-    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-    let mut termios_state = termios::tcgetattr(fd).map_err(io::Error::from)?;
-    let original = termios_state.clone();
-    termios::cfmakeraw(&mut termios_state);
-    termios::tcsetattr(fd, SetArg::TCSANOW, &termios_state).map_err(io::Error::from)?;
-    Ok(RawModeGuard {
-        fd: fd.as_raw_fd(),
-        original,
-    })
-}
-
-#[cfg(unix)]
-fn spawn_resize_forwarder(channel: Arc<Ssh3Channel>, fd: RawFd) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut winsize_signal = match signal(SignalKind::window_change()) {
-            Ok(signal) => signal,
-            Err(_) => return,
-        };
-
-        while winsize_signal.recv().await.is_some() {
-            let size = match read_terminal_size(fd) {
-                Ok(size) => size,
-                Err(_) => return,
-            };
-            if send_window_change_request(channel.as_ref(), size)
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
-    })
-}
-
-#[cfg(unix)]
-fn spawn_signal_forwarders(channel: Arc<Ssh3Channel>) -> Vec<tokio::task::JoinHandle<()>> {
-    [
-        ("INT", SignalKind::interrupt()),
-        ("TERM", SignalKind::terminate()),
-        ("QUIT", SignalKind::quit()),
-        ("HUP", SignalKind::hangup()),
-    ]
-    .into_iter()
-    .filter_map(|(signal_name, kind)| {
-        let mut signal = signal(kind).ok()?;
-        let channel = channel.clone();
-        Some(tokio::spawn(async move {
-            while signal.recv().await.is_some() {
-                if send_signal_request(channel.as_ref(), signal_name)
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        }))
-    })
-    .collect()
-}
-
-#[cfg(not(unix))]
-fn spawn_signal_forwarders(_channel: Arc<Ssh3Channel>) -> Vec<tokio::task::JoinHandle<()>> {
-    Vec::new()
-}
-
 fn build_session_runtime(
     _client: &ActiveClient,
     config: &Ssh3ClientConfig,
@@ -1023,22 +876,28 @@ fn build_session_runtime(
     terminal: Option<&LocalTerminal>,
 ) -> Result<SessionRuntime, Ssh3ClientError> {
     let mut runtime = SessionRuntime {
-        background_tasks: spawn_signal_forwarders(channel.clone()),
+        background_tasks: Vec::new(),
+        console_mode_guard: None,
         raw_mode_guard: None,
     };
 
     // The console only enters the raw mode for a session that owns a pty:
-    // the remote program drives the terminal side of it.
-    #[cfg(unix)]
+    // the remote program drives the terminal side of it. The resizes and the
+    // interrupts of the console follow the same rule: an exec session keeps
+    // the default handling of the console, exactly like the Go client does.
     if pty.is_some()
         && let Some(terminal) = terminal
     {
         runtime.raw_mode_guard = Some(Arc::new(std::sync::Mutex::new(enable_raw_mode(
-            terminal.fd,
+            &terminal.platform,
         )?)));
+        runtime.console_mode_guard = Some(enable_console_modes());
         runtime
             .background_tasks
-            .push(spawn_resize_forwarder(channel, terminal.fd));
+            .push(spawn_resize_forwarder(channel.clone(), terminal.platform));
+        runtime
+            .background_tasks
+            .extend(spawn_signal_forwarders(channel, true));
     }
 
     if config.forward_agent {
@@ -1573,7 +1432,7 @@ pub async fn run_exec_capture(
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn run_exec_capture_with_browser_opener(
     config: &Ssh3ClientConfig,
     command: impl AsRef<str>,
@@ -2105,39 +1964,26 @@ async fn run_stdio_on_client(
     };
 
     stdin_task.abort();
+    // The pump is awaited, so that it releases its handle of the raw mode
+    // guard before the console modes are restored.
+    let _ = stdin_task.await;
     drop(session_runtime);
+
+    // A trailing carriage return restores the prompt position after an
+    // interactive pty session; in exec mode the standard output is data, not
+    // a terminal, so it stays byte-exact.
+    if pty.is_some() {
+        let mut stdout = tokio::io::stdout();
+        let _ = stdout.write_all(b"\r").await;
+        let _ = stdout.flush().await;
+    }
+
     result
 }
 
 /// Tells whether the local console can suspend the process.
 fn suspend_supported() -> bool {
     cfg!(unix)
-}
-
-/// Suspends the client locally: the terminal is restored, the process stops
-/// itself with SIGTSTP and the raw mode is entered again on resume.
-#[cfg(unix)]
-fn suspend_local_process(guard: &RawModeGuardHandle) -> io::Result<()> {
-    let Some(guard) = guard.as_ref() else {
-        return Ok(());
-    };
-    let guard = guard
-        .lock()
-        .map_err(|_| io::Error::other("the raw mode guard is poisoned"))?;
-    guard.restore()?;
-    let result = unsafe { nix::libc::kill(nix::libc::getpid(), nix::libc::SIGTSTP) };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    guard.reenter()
-}
-
-#[cfg(not(unix))]
-fn suspend_local_process(_guard: &RawModeGuardHandle) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "the local console cannot suspend the process",
-    ))
 }
 
 fn is_benign_connection_error(error: &ConnectionError) -> bool {
@@ -2246,6 +2092,11 @@ mod tests {
         clippy::field_reassign_with_default,
         clippy::single_match
     )]
+    // The scenarios of this module are written for the unix platform: the
+    // Windows build runs the platform neutral ones and the console tests of
+    // the console module, so the helpers of the unix scenarios stay unused
+    // there.
+    #![cfg_attr(windows, allow(unused_imports, dead_code))]
 
     use std::fs;
     #[cfg(unix)]
@@ -2308,17 +2159,19 @@ mod tests {
     use tokio::time::{sleep, timeout};
     use url::Url;
 
+    use super::console::{LocalTerminalInfo, TerminalSize};
     use super::{
-        LocalTerminalInfo, PtySpec, Ssh3CapturedSession, Ssh3ClientConfig, Ssh3ClientError,
-        Ssh3ForwardProtocol, Ssh3KnownHostsTrust, Ssh3LocalForwardSpec, Ssh3OidcConfig,
-        Ssh3OidcError, Ssh3PtyPolicy, Ssh3SessionRequest, Ssh3StrictHostKeyChecking,
-        Ssh3TrustStrategy, TerminalSize, activate_client, build_session_runtime, client_bind_addr,
-        client_quinn_config, connect_client, conversation_id_base64, exit_code_for_exit_signal,
-        parse_dynamic_forward_spec, parse_reverse_forward_spec, resolve_pty, resolve_target,
-        run_capture_on_client, run_exec_capture, run_exec_capture_with_browser_opener,
-        send_forward_agent_request, send_initial_session_requests, send_signal_request,
+        PtySpec, Ssh3CapturedSession, Ssh3ClientConfig, Ssh3ClientError, Ssh3ForwardProtocol,
+        Ssh3KnownHostsTrust, Ssh3LocalForwardSpec, Ssh3OidcConfig, Ssh3OidcError, Ssh3PtyPolicy,
+        Ssh3SessionRequest, Ssh3StrictHostKeyChecking, Ssh3TrustStrategy, activate_client,
+        build_session_runtime, client_bind_addr, client_quinn_config, connect_client,
+        conversation_id_base64, exit_code_for_exit_signal, parse_dynamic_forward_spec,
+        parse_reverse_forward_spec, resolve_pty, resolve_target, run_capture_on_client,
+        run_exec_capture, send_initial_session_requests, send_signal_request,
         send_window_change_request, start_dynamic_forwards, start_reverse_forwards,
     };
+    #[cfg(unix)]
+    use super::{run_exec_capture_with_browser_opener, send_forward_agent_request};
 
     /// Builds the pty request of a session out of the metadata of a console.
     fn pty_spec_from_info(info: &LocalTerminalInfo) -> PtySpec {
@@ -4589,6 +4442,10 @@ mod tests {
         server_task.abort();
     }
 
+    // The server side still runs the command with `/bin/sh`, so the
+    // scenario stays unix-only until the server supports the Windows
+    // shells.
+    #[cfg(unix)]
     #[tokio::test]
     async fn exec_capture_round_trips_against_the_rust_server() {
         let (server_config, server_certificate) =
@@ -4931,6 +4788,10 @@ mod tests {
         let _ = server.wait().await;
     }
 
+    // The server side still runs the command with `/bin/sh`, so the
+    // scenario stays unix-only until the server supports the Windows
+    // shells.
+    #[cfg(unix)]
     #[tokio::test]
     async fn exec_capture_round_trips_with_ed25519_bearer_auth() {
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
@@ -4998,6 +4859,10 @@ mod tests {
         }
     }
 
+    // The server side still runs the command with `/bin/sh`, so the
+    // scenario stays unix-only until the server supports the Windows
+    // shells.
+    #[cfg(unix)]
     #[tokio::test]
     async fn exec_capture_round_trips_with_nist_p256_bearer_auth() {
         let fixture = create_auth_fixture(AuthKeyAlgorithm::NistP256);
@@ -5065,6 +4930,10 @@ mod tests {
         }
     }
 
+    // The server side still runs the command with `/bin/sh`, so the
+    // scenario stays unix-only until the server supports the Windows
+    // shells.
+    #[cfg(unix)]
     #[tokio::test]
     async fn exec_capture_round_trips_with_rsa_bearer_auth() {
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Rsa);
@@ -6550,6 +6419,10 @@ mod tests {
         }
     }
 
+    // The server side still runs the command with `/bin/sh`, so the
+    // scenario stays unix-only until the server supports the Windows
+    // shells.
+    #[cfg(unix)]
     #[tokio::test]
     async fn exec_capture_round_trips_with_oidc_bearer_auth() {
         let fixture = create_oidc_fixture().await;
@@ -6627,6 +6500,10 @@ mod tests {
         server_task.await.unwrap();
     }
 
+    // The server side still runs the command with `/bin/sh`, so the
+    // scenario stays unix-only until the server supports the Windows
+    // shells.
+    #[cfg(unix)]
     #[tokio::test]
     async fn exec_capture_round_trips_with_interactive_oidc_login() {
         let fixture = create_oidc_fixture().await;
@@ -6705,6 +6582,10 @@ mod tests {
         server_task.await.unwrap();
     }
 
+    // The server side still runs the command with `/bin/sh`, so the
+    // scenario stays unix-only until the server supports the Windows
+    // shells.
+    #[cfg(unix)]
     #[tokio::test]
     async fn exec_capture_round_trips_with_basic_password_auth() {
         let username = {
@@ -6862,21 +6743,17 @@ mod tests {
         assert_eq!(yes.char_height, 24);
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_auto_pty_policy_follows_the_local_terminal() {
-        let terminal = super::LocalTerminal {
-            info: LocalTerminalInfo {
-                term: Some("xterm-256color".to_string()),
-                size: TerminalSize {
-                    char_width: 120,
-                    char_height: 40,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                },
+        let terminal = super::console::test_local_terminal(LocalTerminalInfo {
+            term: Some("xterm-256color".to_string()),
+            size: TerminalSize {
+                char_width: 120,
+                char_height: 40,
+                pixel_width: 0,
+                pixel_height: 0,
             },
-            fd: 0,
-        };
+        });
         let pty = resolve_pty(
             Ssh3PtyPolicy::Auto,
             &Ssh3SessionRequest::Shell,
@@ -6899,6 +6776,10 @@ mod tests {
         assert_eq!(exit_code_for_exit_signal("WHATEVER"), 255);
     }
 
+    // The session of the scenario keeps the client alive, and the server
+    // side still runs the command with `/bin/sh`: the scenario stays
+    // unix-only until the server supports the Windows shells.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_local_tcp_forward_bridges_a_connection_to_the_target() {
         // the target the forward dials on the client behalf
@@ -6980,6 +6861,10 @@ mod tests {
         server_task.abort();
     }
 
+    // The session of the scenario keeps the client alive, and the server
+    // side still runs the command with `/bin/sh`: the scenario stays
+    // unix-only until the server supports the Windows shells.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_local_udp_forward_bridges_a_datagram_to_the_target() {
         // the target the forward dials on the client behalf

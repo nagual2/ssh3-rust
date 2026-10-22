@@ -613,6 +613,24 @@ fn build_config(cli: Cli) -> Result<(Ssh3ClientConfig, Ssh3SessionRequest, bool)
     // The agent forwarding is enabled by the flag or by the keyword of the
     // ssh_config file.
     config.forward_agent = cli.forward_agent || ssh_config_values.forward_agent;
+    // The agent socket is a unix domain socket: the Windows client cannot
+    // forward an agent, and says so instead of opening a session that
+    // cannot work.
+    #[cfg(windows)]
+    if config.forward_agent {
+        return Err(cli_error(
+            ErrorKind::ValueValidation,
+            "the SSH agent forwarding is not available on Windows: the agent socket is a unix domain socket",
+        ));
+    }
+    // The same socket carries the agent authentication.
+    #[cfg(windows)]
+    if config.agent.is_some() {
+        return Err(cli_error(
+            ErrorKind::ValueValidation,
+            "the SSH agent authentication is not available on Windows: the agent socket is a unix domain socket",
+        ));
+    }
     // The keepalive period comes from the `-o` option first and from the
     // keyword of the ssh_config file next.
     if let Some(interval) = overrides
