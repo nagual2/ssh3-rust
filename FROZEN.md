@@ -1,31 +1,31 @@
-# FROZEN — do not extend, do not fix the frozen findings
+# STATUS — the freeze was lifted on 2026-10-22
 
 The Rust workspace was declared **frozen (dormant)** by the repository owner
-on 2026-10-13. That decision still stands: as of 2026-10-21
+on 2026-10-13, and it was extracted from `nagual2/ssh3-go` into this
+repository on 2026-10-21. On **2026-10-22 the owner lifted the freeze**: the
+goal is to bring this implementation to parity with the Go implementation
+([nagual2/ssh3-go](https://github.com/nagual2/ssh3-go)), which remains the
+shipped product today.
 
-- no bug report or audit finding in this directory is scheduled for a fix:
-  the pass-5/pass-6 Rust findings (F-16, F-20, and the pass-6 F-19 client
-  residual) are frozen together with the code;
-- no new functionality is added — `ROADMAP.md` stages the work that would
-  only start after an explicit unfreeze;
-- audits: **skip this directory entirely**, do not spend budget on it.
+What the freeze had held back, and what is in scope again:
 
-## Update 2026-10-21 — the workspace became a standalone project
+- the audit findings F-16 (the password hash compare short-circuits), F-19
+  (the Rust client residual: a malformed datagram still ends the datagram
+  reception) and F-20 (no channel budget, unbounded dangling datagram
+  queues) are scheduled for a fix;
+- the defects the first CI run exposed are scheduled for a fix: the missing
+  limit on the SSH string length, the unclamped peer `max_packet_size`, the
+  missing `permit-open` on the server, the missing timeouts, the agent
+  socket removed together with the session;
+- new functionality is allowed again, with the Go implementation as the
+  behavioural reference.
 
-The Rust implementation was extracted from `nagual2/ssh3-go` into its own
-repository (`nagual2/ssh3-rust`) with its history intact, and a CI pipeline
-was added. The CI gates the tree — build, format, clippy, unit tests, and a
-cross-implementation job against a pinned Go tag — but it does **not** turn
-the code into an active product:
+What the freeze did not lift:
 
-- nothing here is shipped in any release artifact; the Go implementation
-  remains the only released product;
-- the frozen findings stay frozen: CI must not be used to close them as
-  part of unrelated work;
-- the interop job pins the Go reference repository at tag `v0.1.12`, because
-  the Go `main` branch has moved to quic-go v0.63.0, which the pinned
-  `h3` 0.0.8 shim does not support (HTTP/3 `0x104`).
+- **no release artifact yet.** The Go implementation stays the only shipped
+  product until a fresh audit pass over this workspace is done and the
+  release profile is in place (`ROADMAP.md`, stage M7.1);
+- the protocol itself stays experimental.
 
-To unfreeze, the owner must say so explicitly: update this file and the
-README banner, then re-run a fresh audit pass over the workspace first
-(`ROADMAP.md`, stage M7.1).
+The report of the audit the freeze required, and the plan that follows from
+it, live in [`ROADMAP.md`](ROADMAP.md).

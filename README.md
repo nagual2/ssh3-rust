@@ -2,7 +2,7 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Status: dormant](https://img.shields.io/badge/status-dormant%20since%202026--10--13-lightgrey.svg)](FROZEN.md)
+[![Status: active](https://img.shields.io/badge/status-active-brightgreen.svg)](FROZEN.md)
 
 **English** | [Русский](README.ru.md) | [Deutsch](README.de.md)
 
@@ -21,13 +21,12 @@ independent reference implementation of the SSH3 protocol.
 > and HTTP/3 Extended CONNECT.
 
 > [!WARNING]
-> **This workspace is frozen (dormant) since 2026-10-13.** It is built by CI
-> (build, tests, clippy, advisory scan), but not shipped in any release
-> artifact, and the audit findings listed below are frozen together with the
-> code — they are not scheduled for a fix. The
-> Go implementation ([nagual2/ssh3-go](https://github.com/nagual2/ssh3-go))
-> remains the only shipped product. See [`FROZEN.md`](FROZEN.md) and
-> [`ROADMAP.md`](ROADMAP.md) for the unfreezing conditions.
+> **This workspace was frozen (dormant) from 2026-10-13 to 2026-10-22; the
+> owner lifted the freeze on 2026-10-22** with the goal of reaching parity
+> with the Go implementation ([nagual2/ssh3-go](https://github.com/nagual2/ssh3-go)).
+> The Go implementation remains the only shipped product: this repository is
+> in no release artifact yet, and a fresh audit pass is still required before
+> the first one. See [`FROZEN.md`](FROZEN.md) and [`ROADMAP.md`](ROADMAP.md).
 
 ## Positioning
 

@@ -2,7 +2,7 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Status: dormant](https://img.shields.io/badge/status-dormant%20since%202026--10--13-lightgrey.svg)](FROZEN.md)
+[![Status: active](https://img.shields.io/badge/status-active-brightgreen.svg)](FROZEN.md)
 
 [English](README.md) | [Русский](README.ru.md) | **Deutsch**
 
@@ -21,14 +21,13 @@ Referenzimplementierung des SSH3-Protokolls.
 > HTTP/3 Extended CONNECT.
 
 > [!WARNING]
-> **Dieser Workspace ist seit 2026-10-13 eingefroren (dormant).** Er wird in der
-> CI gebaut (Build, Tests, Clippy, Advisory-Scan), aber in keinem
-> Release-Artefakt ausgeliefert, und die unten aufgeführten Audit-Fundstellen
-> sind mit dem Code eingefroren — es sind keine
-> Fixes geplant. Das einzige ausgelieferte Produkt bleibt die Go-Implementierung
-> ([nagual2/ssh3-go](https://github.com/nagual2/ssh3-go)). Die Bedingungen für
-> das Auftauen stehen in [`FROZEN.md`](FROZEN.md) und
-> [`ROADMAP.md`](ROADMAP.md).
+> **Dieser Workspace war vom 2026-10-13 bis 2026-10-22 eingefroren (dormant);
+> der Owner hob die Sperre am 2026-10-22 auf** — mit dem Ziel, die Parität zur
+> Go-Implementierung ([nagual2/ssh3-go](https://github.com/nagual2/ssh3-go))
+> zu erreichen. Das einzige ausgelieferte Produkt bleibt die
+> Go-Implementierung: dieses Repository ist in keinem Release-Artefakt
+> enthalten, und ein frischer Audit-Durchgang ist vor dem ersten weiterhin
+> nötig. Siehe [`FROZEN.md`](FROZEN.md) und [`ROADMAP.md`](ROADMAP.md).
 
 ## Positionierung
 

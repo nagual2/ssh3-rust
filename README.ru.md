@@ -2,7 +2,7 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Status: dormant](https://img.shields.io/badge/status-dormant%20since%202026--10--13-lightgrey.svg)](FROZEN.md)
+[![Status: active](https://img.shields.io/badge/status-active-brightgreen.svg)](FROZEN.md)
 
 [English](README.md) | **Русский** | [Deutsch](README.de.md)
 
@@ -21,13 +21,12 @@ HTTP-нативный транспорт с QUIC-нативными датагр
 > Extended CONNECT.
 
 > [!WARNING]
-> **Этот workspace заморожен (dormant) с 2026-10-13.** Он собирается в CI
-> (сборка, тесты, clippy, скан уязвимостей), но не входит ни в один
-> релиз-артефакт, а перечисленные ниже аудиторские находки заморожены вместе
-> с кодом — в план фиксов они не внесены. Единственный
-> поставляемый продукт — Go-реализация
-> ([nagual2/ssh3-go](https://github.com/nagual2/ssh3-go)). Условия разморозки —
-> в [`FROZEN.md`](FROZEN.md) и [`ROADMAP.md`](ROADMAP.md).
+> **Этот workspace был заморожен (dormant) с 2026-10-13 по 2026-10-22; 2026-10-22
+> владелец снял заморозку** с целью довести реализацию до паритета с
+> Go-реализацией ([nagual2/ssh3-go](https://github.com/nagual2/ssh3-go)).
+> Единственный поставляемый продукт — по-прежнему Go-реализация: этот
+> репозиторий не входит ни в один релиз-артефакт, а свежий аудит всё ещё
+> требуется до первого. См. [`FROZEN.md`](FROZEN.md) и [`ROADMAP.md`](ROADMAP.md).
 
 ## Позиционирование
 
