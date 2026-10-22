@@ -24,12 +24,27 @@ with three local edits applied:
                             consume them, and it must not kill the connection
                             because of them.
 
+The base stays on 0.0.8 on purpose:
+
+  * 0.0.8 is the newest h3 release on crates.io, and the newest h3-quinn
+    release (0.0.10) depends on exactly that version of h3. A newer h3
+    would come with a newer h3-quinn that is not published either.
+  * The unreleased h3 master still has a closed 'Protocol' enumeration (it
+    knows 'webtransport', 'connect-udp', 'connect-ip' and 'websocket'), so
+    the shim cannot be dropped: an arbitrary ':protocol' value such as
+    'ssh3' is still refused by the upstream request encoder.
+  * h3 0.0.8 already implements the final HTTP/3 (RFC 9114): the setting
+    identifiers, the ALPN and the QPACK static table are the ones of the
+    current quic-go. The shim was never the reason why the interop against
+    quic-go v0.49.0 and later failed; the blocker was the HTTP/3 datagram
+    setting, which is an application level decision (see ssh3-h3).
+
 Apply with: patch -p1 -d <h3-0.0.8 source tree> < h3-0.0.8.patch
 Verify with: scripts/verify-h3-shim.sh
 
 diff -ruN --strip-trailing-cr h3-0.0.8/src/client/connection.rs h3-patched/src/client/connection.rs
---- a/src/client/connection.rs	2026-10-22 14:42:18.872544170 +0200
-+++ b/src/client/connection.rs	2026-10-22 14:42:18.854284126 +0200
+--- a/src/client/connection.rs	2026-10-22 21:15:04.185866928 +0200
++++ b/src/client/connection.rs	2026-10-22 21:15:04.165058845 +0200
 @@ -472,15 +472,13 @@
          //# receipt of a server-initiated bidirectional stream as a connection
          //# error of type H3_STREAM_CREATION_ERROR unless such an extension has
@@ -54,8 +69,8 @@ diff -ruN --strip-trailing-cr h3-0.0.8/src/client/connection.rs h3-patched/src/c
          Poll::Pending
      }
 diff -ruN --strip-trailing-cr h3-0.0.8/src/ext.rs h3-patched/src/ext.rs
---- a/src/ext.rs	2026-10-22 14:42:18.871359743 +0200
-+++ b/src/ext.rs	2026-10-22 14:42:18.852754768 +0200
+--- a/src/ext.rs	2026-10-22 21:15:04.184454465 +0200
++++ b/src/ext.rs	2026-10-22 21:15:04.163123443 +0200
 @@ -1,46 +1,39 @@
  //! Extensions for the HTTP/3 protocol.
  
@@ -118,8 +133,8 @@ diff -ruN --strip-trailing-cr h3-0.0.8/src/ext.rs h3-patched/src/ext.rs
      }
  }
 diff -ruN --strip-trailing-cr h3-0.0.8/src/proto/headers.rs h3-patched/src/proto/headers.rs
---- a/src/proto/headers.rs	2026-10-22 14:42:18.873210318 +0200
-+++ b/src/proto/headers.rs	2026-10-22 14:42:18.855108122 +0200
+--- a/src/proto/headers.rs	2026-10-22 21:15:04.186757904 +0200
++++ b/src/proto/headers.rs	2026-10-22 21:15:04.166122808 +0200
 @@ -378,7 +378,7 @@
          //
          // See: [https://www.rfc-editor.org/rfc/rfc8441#section-4]

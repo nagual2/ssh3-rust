@@ -85,24 +85,48 @@ jobs:
     steps:
       - name: Check out the workspace
         uses: actions/checkout@v7
-      # The Go reference repository is pinned to a release tag on purpose.
-      # `main` carries quic-go v0.63.0, while the frozen `h3` 0.0.8 shim of
-      # this workspace only speaks the HTTP/3 version of the quic-go v0.40.x
-      # line; against `main` the interop scenarios abort with an HTTP/3
-      # 0x104 error. That failure is a wire incompatibility of the Go side,
-      # not a regression of the Rust code, so the checkout stays on the tag
-      # v0.1.12 until the shim is updated.
+      # The Go reference repository is pinned to a release tag on purpose: the
+      # interop matrix is verified against a specific Go release, not against
+      # `main`.
       #
-      # The same limit applies to the newer tags: the shim speaks to the Go
-      # implementation of v0.1.18 and older, and the reverse forwarding
-      # (v0.1.23) and the dynamic forwarding (v0.1.24) only exist from
-      # there on. The scenarios that need them detect the version of the
-      # reference and skip with a `skipping:` line instead of failing.
+      # The tag was v0.1.12 for a long time. That release is on the
+      # quic-go v0.40.x line, and the `h3` 0.0.8 shim of this workspace was
+      # believed to speak only the HTTP/3 dialect of that line: against the
+      # newer releases (quic-go v0.49.0 and later, v0.1.19 and later) the
+      # scenarios aborted with an HTTP/3 0x104 error, so the checkout stayed
+      # on the old tag.
+      #
+      # That diagnosis was wrong. The `h3` 0.0.8 shim already implements the
+      # final HTTP/3 (RFC 9114: the same setting identifiers, the same ALPN
+      # and the same QPACK static table as the current quic-go), and the three
+      # local edits of the shim are all still needed by the new Go. The real
+      # blocker of the newer quic-go was a different one: a peer that
+      # announces the HTTP/3 datagram support (SETTINGS_H3_DATAGRAM, 0x33)
+      # opens a second reader on the connection-wide QUIC datagram queue and
+      # steals the SSH3 datagrams (quic-go does it in the HTTP/3 layer of the
+      # connection, `handleControlStream`). The SSH3 datagrams travel over the
+      # QUIC datagram API and not over the HTTP/3 datagram extension, so the
+      # Rust side does not announce the HTTP/3 datagram support anymore
+      # (`ssh3-h3`, `configure_client_builder` and `configure_server_builder`).
+      #
+      # The checkout is now on the latest release of the Go fork, v0.1.37
+      # (quic-go v0.63.0). The reverse forwarding (v0.1.23) and the dynamic
+      # forwarding (v0.1.24) exist from there on, so their scenarios run
+      # against the reference instead of skipping with a `skipping:` line.
+      #
+      # Known gap: the scenarios that drive the *Go* client against the Rust
+      # server (`real_go_client_*`) fail with the new reference. The Go
+      # client keeps reading the session channel until the server closes it
+      # (the exit status does not end the byte stream), and the Rust server
+      # does not close the channel after the exit status: it waits for the
+      # half close of the client and never sends the EOF the client waits
+      # for. The gap belongs to the server side (`ssh3-server`), not to the
+      # HTTP/3 layer, and it is tracked there.
       - name: Check out the Go reference repository
         uses: actions/checkout@v7
         with:
           repository: nagual2/ssh3-go
-          ref: v0.1.12
+          ref: v0.1.37
           path: ssh3-go
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -111,7 +135,8 @@ jobs:
       - name: Install the Go toolchain
         uses: actions/setup-go@v7
         with:
-          go-version: "1.22"
+          # The Go fork requires Go 1.26 (`go 1.26.0` in its go.mod).
+          go-version: "1.26"
       - name: Run the interop matrix
         env:
           SSH3_GO_REPO: ${{ github.workspace }}/ssh3-go

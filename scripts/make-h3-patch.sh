@@ -78,6 +78,21 @@ with three local edits applied:
                             consume them, and it must not kill the connection
                             because of them.
 
+The base stays on 0.0.8 on purpose:
+
+  * 0.0.8 is the newest h3 release on crates.io, and the newest h3-quinn
+    release (0.0.10) depends on exactly that version of h3. A newer h3
+    would come with a newer h3-quinn that is not published either.
+  * The unreleased h3 master still has a closed 'Protocol' enumeration (it
+    knows 'webtransport', 'connect-udp', 'connect-ip' and 'websocket'), so
+    the shim cannot be dropped: an arbitrary ':protocol' value such as
+    'ssh3' is still refused by the upstream request encoder.
+  * h3 0.0.8 already implements the final HTTP/3 (RFC 9114): the setting
+    identifiers, the ALPN and the QPACK static table are the ones of the
+    current quic-go. The shim was never the reason why the interop against
+    quic-go v0.49.0 and later failed; the blocker was the HTTP/3 datagram
+    setting, which is an application level decision (see ssh3-h3).
+
 Apply with: patch -p1 -d <h3-0.0.8 source tree> < h3-0.0.8.patch
 Verify with: scripts/verify-h3-shim.sh
 

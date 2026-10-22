@@ -327,12 +327,29 @@ pub fn ssh3_protocol() -> Protocol {
     Protocol::new(SSH3_PROTOCOL_NAME)
 }
 
+/// Configures the HTTP/3 layer of the client.
+///
+/// The extended CONNECT is required: SSH3 tunnels its conversation over a
+/// CONNECT request with the `:protocol` pseudo-header set to `ssh3`.
+///
+/// The HTTP/3 datagram setting stays disabled on purpose. SSH3 carries its
+/// own datagrams (the UDP forwarding) directly over the QUIC datagram API,
+/// and the HTTP/3 datagram layer of the peer would open a second reader on
+/// the same connection-wide datagram queue and steal the SSH3 datagrams.
+/// A peer that implements the HTTP/3 datagram extension starts that reader
+/// as soon as the SETTINGS frame of its peer announces the datagram
+/// support (quic-go does it in `http3/conn.go`, `handleControlStream`), so
+/// the setting must not be announced at all.
 pub fn configure_client_builder(builder: &mut h3::client::Builder) -> &mut h3::client::Builder {
-    builder.enable_extended_connect(true).enable_datagram(true)
+    builder.enable_extended_connect(true).enable_datagram(false)
 }
 
+/// Configures the HTTP/3 layer of the server.
+///
+/// See [`configure_client_builder`] for the reason why the HTTP/3 datagram
+/// setting stays disabled.
 pub fn configure_server_builder(builder: &mut h3::server::Builder) -> &mut h3::server::Builder {
-    builder.enable_extended_connect(true).enable_datagram(true)
+    builder.enable_extended_connect(true).enable_datagram(false)
 }
 
 pub async fn new_client(
@@ -551,6 +568,110 @@ mod tests {
             Some(SSH3_PROTOCOL_NAME)
         );
         assert_eq!(request_user_agent(&request), Some(SSH3_VERSION_STRING));
+    }
+
+    /// The stream type of the HTTP/3 control stream.
+    const CONTROL_STREAM_TYPE: u64 = 0x00;
+    /// The type of the HTTP/3 SETTINGS frame.
+    const SETTINGS_FRAME_TYPE: u64 = 0x04;
+    /// The HTTP/3 setting that announces the HTTP/3 datagram support.
+    const SETTING_H3_DATAGRAM: u64 = 0x33;
+
+    /// Reads a QUIC variable-length integer from a receive stream.
+    async fn read_stream_var_int(stream: &mut h3_quinn::quinn::RecvStream) -> u64 {
+        let mut first = [0u8; 1];
+        stream.read_exact(&mut first).await.unwrap();
+        let length = 1usize << ((first[0] & 0xc0) >> 6);
+        let mut value = u64::from(first[0] & 0x3f);
+        for _ in 1..length {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            value = (value << 8) | u64::from(byte[0]);
+        }
+        value
+    }
+
+    /// Reads a QUIC variable-length integer from a buffer.
+    fn read_buffer_var_int(buffer: &[u8], offset: &mut usize) -> u64 {
+        let first = buffer[*offset];
+        *offset += 1;
+        let length = 1usize << ((first & 0xc0) >> 6);
+        let mut value = u64::from(first & 0x3f);
+        for _ in 1..length {
+            let byte = buffer[*offset];
+            *offset += 1;
+            value = (value << 8) | u64::from(byte);
+        }
+        value
+    }
+
+    /// Reads the SETTINGS frame of a peer and returns the announced settings.
+    ///
+    /// The settings are read at the QUIC level, below the HTTP/3 layer: the
+    /// test needs to see what the peer puts on the wire, not what the HTTP/3
+    /// library made of it.
+    async fn read_peer_settings(connection: &h3_quinn::quinn::Connection) -> Vec<(u64, u64)> {
+        let mut stream = connection.accept_uni().await.unwrap();
+        assert_eq!(read_stream_var_int(&mut stream).await, CONTROL_STREAM_TYPE);
+        assert_eq!(read_stream_var_int(&mut stream).await, SETTINGS_FRAME_TYPE);
+        let length = read_stream_var_int(&mut stream).await as usize;
+        let mut payload = vec![0u8; length];
+        stream.read_exact(&mut payload).await.unwrap();
+
+        let mut settings = Vec::new();
+        let mut offset = 0usize;
+        while offset < payload.len() {
+            let id = read_buffer_var_int(&payload, &mut offset);
+            let value = read_buffer_var_int(&payload, &mut offset);
+            settings.push((id, value));
+        }
+        settings
+    }
+
+    /// The SSH3 datagrams travel over the QUIC datagram API, not over the
+    /// HTTP/3 datagram extension. A peer that announces the HTTP/3 datagram
+    /// support opens a second reader on the connection-wide datagram queue
+    /// and steals the SSH3 datagrams (quic-go does it in the HTTP/3 layer of
+    /// the connection, `handleControlStream`).
+    #[tokio::test]
+    async fn the_client_does_not_announce_the_http3_datagram_support() {
+        let (server_config, server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server_endpoint = h3_quinn::quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let mut client_endpoint = h3_quinn::quinn::Endpoint::client(SocketAddr::V4(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        ))
+        .unwrap();
+        client_endpoint
+            .set_default_client_config(client_config_for_certificate(server_certificate).unwrap());
+
+        let client_connecting = client_endpoint.connect(server_addr, "localhost").unwrap();
+        let (client_quinn, server_quinn) =
+            tokio::join!(async { client_connecting.await.unwrap() }, async {
+                let incoming = server_endpoint.accept().await.unwrap();
+                incoming.await.unwrap()
+            },);
+
+        let client_task = tokio::spawn(async move {
+            let _client = new_client(client_quinn).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let settings = read_peer_settings(&server_quinn).await;
+        client_task.abort();
+
+        assert!(
+            !settings
+                .iter()
+                .any(|(id, value)| *id == SETTING_H3_DATAGRAM && *value != 0),
+            "the HTTP/3 datagram support must not be announced: {settings:?}"
+        );
     }
 
     #[tokio::test]

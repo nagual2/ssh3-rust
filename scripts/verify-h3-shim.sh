@@ -98,4 +98,39 @@ if ! diff -r --strip-trailing-cr -x '.cargo-ok' "${SRC_DIR}" "${VENDOR_DIR}"; th
     fail "vendor/h3 drifted from h3-${H3_VERSION} + patches/h3-${H3_VERSION}.patch"
 fi
 
+# --- 5. Check that the dependency pins still match the base ---------------
+# The patch applies to one specific h3 release, and the published h3-quinn
+# releases depend on exactly that version of h3 (0.0.10 on h3 0.0.8). A
+# dependency bump that moves the base must rebase the shim first, so the
+# gate fails until the manifest, the lockfile and the recorded base agree.
+MANIFEST="${REPO_ROOT}/ssh3-h3/Cargo.toml"
+LOCKFILE="${REPO_ROOT}/Cargo.lock"
+
+[ -f "${MANIFEST}" ] || fail "manifest not found: ${MANIFEST}"
+[ -f "${LOCKFILE}" ] || fail "lockfile not found: ${LOCKFILE}"
+
+MANIFEST_REQUIREMENT="$(awk -F'"' '/^h3 = / { print $2; exit }' "${MANIFEST}")"
+[ -n "${MANIFEST_REQUIREMENT}" ] || fail "no h3 requirement found in ${MANIFEST}"
+if [ "${MANIFEST_REQUIREMENT}" != "${H3_VERSION}" ]; then
+    fail "ssh3-h3 requires h3 ${MANIFEST_REQUIREMENT}, but the shim is recorded for h3 ${H3_VERSION}"
+fi
+
+LOCKED_VERSION="$(awk '
+    /^name = "h3"$/ { in_h3 = 1; next }
+    in_h3 && /^version = / { gsub(/"/, "", $3); print $3; exit }
+' "${LOCKFILE}")"
+[ -n "${LOCKED_VERSION}" ] || fail "no h3 package found in ${LOCKFILE}"
+if [ "${LOCKED_VERSION}" != "${H3_VERSION}" ]; then
+    fail "the lockfile resolves h3 ${LOCKED_VERSION}, but the shim is recorded for h3 ${H3_VERSION}"
+fi
+
+if ! awk '
+    /^name = "h3-quinn"$/ { in_h3quinn = 1; next }
+    in_h3quinn && /^ "h3",$/ { found = 1; exit }
+    in_h3quinn && /^\[\[package\]\]/ { exit }
+    END { exit found ? 0 : 1 }
+' "${LOCKFILE}"; then
+    fail "h3-quinn does not depend on h3 in ${LOCKFILE}: the h3-quinn and h3 versions must stay in sync"
+fi
+
 echo "verify-h3-shim: OK - vendor/h3 matches h3-${H3_VERSION} + the recorded patch"
