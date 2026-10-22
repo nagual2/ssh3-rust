@@ -208,13 +208,6 @@ pub(crate) struct AgentForwarding {
 }
 
 #[cfg(unix)]
-impl AgentForwarding {
-    fn socket_path(&self) -> &Path {
-        &self.socket_path
-    }
-}
-
-#[cfg(unix)]
 impl Drop for AgentForwarding {
     fn drop(&mut self) {
         self.listener_task.abort();
@@ -244,13 +237,19 @@ impl AgentForwardingSlot {
     }
 
     /// Returns the path of the forwarded agent socket, if it was opened.
-    #[cfg(unix)]
     pub(crate) fn socket_path(&self) -> Option<PathBuf> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .map(|forwarding| forwarding.socket_path().to_path_buf())
+        #[cfg(unix)]
+        {
+            self.inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .map(|forwarding| forwarding.socket_path.clone())
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 
     /// Takes ownership of the forwarded agent socket.
