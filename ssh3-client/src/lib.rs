@@ -85,6 +85,15 @@ pub use strict_host_key::{
     Ssh3StrictHostKeyCheckingError, decide_host_key, resolve_strict_host_key_checking,
 };
 
+/// The version string of the client, in the format of the Go implementation.
+///
+/// The format is the one of `version.go`: the name of the protocol, the
+/// version of the protocol, the name of the implementation and its version,
+/// followed by the version of the experimental specification. The string is
+/// the one the client announces during the handshake, so the banner and the
+/// negotiated version never disagree.
+pub const SSH3_CLIENT_VERSION_STRING: &str = SSH3_VERSION_STRING;
+
 const DEFAULT_USER_AGENT: &str = SSH3_VERSION_STRING;
 const DEFAULT_OIDC_SCOPE: &str = "openid email";
 const OIDC_CALLBACK_PATH: &str = "/ssh";
@@ -181,6 +190,13 @@ pub struct Ssh3ClientConfig {
     pub reverse_forwards: Vec<Ssh3ReverseForwardSpec>,
     /// The dynamic forwards (`-D`) the session opens.
     pub dynamic_forwards: Vec<Ssh3DynamicForwardSpec>,
+    /// The proxy jump chain the client is asked to use.
+    ///
+    /// The value is the one of the `ProxyJump` keyword of the ssh_config
+    /// file or of the `-o ProxyJump=` option; the chain is validated like the
+    /// Go implementation does, but the transport of the jump itself is not
+    /// implemented yet.
+    pub proxy_jump: Option<String>,
 }
 
 impl Ssh3ClientConfig {
@@ -209,6 +225,7 @@ impl Ssh3ClientConfig {
             local_forwards: Vec::new(),
             reverse_forwards: Vec::new(),
             dynamic_forwards: Vec::new(),
+            proxy_jump: None,
         }
     }
 }
@@ -1581,6 +1598,60 @@ pub async fn run_session_stdio(
     let result = run_stdio_on_client(&client, config, request).await;
     client.shutdown().await;
     result
+}
+
+/// Opens the connection, registers the forwards and holds the connection
+/// open until it is closed or the client is interrupted.
+///
+/// This is the mode of the `-N` flag of ssh(1): no session is opened, so the
+/// connection only carries the forwards.
+pub async fn run_forwards_only(config: &Ssh3ClientConfig) -> Result<(), Ssh3ClientError> {
+    let client = connect_client(config).await?;
+    let result = hold_forwards(&client, config).await;
+    client.shutdown().await;
+    result
+}
+
+/// Registers the forwards of the configuration and waits for the end of the
+/// connection.
+async fn hold_forwards(
+    client: &ActiveClient,
+    config: &Ssh3ClientConfig,
+) -> Result<(), Ssh3ClientError> {
+    let mut tasks = start_local_forwards(client, config).await?;
+    let dynamic = start_dynamic_forwards(client, config).await?;
+    tasks.extend(dynamic.tasks);
+    start_reverse_forwards(client, config).await?;
+    wait_for_termination(&client.connection).await;
+    Ok(())
+}
+
+/// Waits for the end of the connection or for an interruption of the client.
+///
+/// The Go implementation waits for the `SIGINT` and the `SIGTERM` signals;
+/// the `SIGINT` one is the only one a terminal sends.
+async fn wait_for_termination(connection: &Connection) {
+    #[cfg(unix)]
+    {
+        let mut terminate = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = connection.closed() => {}
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                match terminate.as_mut() {
+                    Some(terminate) => { terminate.recv().await; }
+                    None => std::future::pending().await,
+                }
+            } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            _ = connection.closed() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
 }
 
 async fn connect_client(config: &Ssh3ClientConfig) -> Result<ActiveClient, Ssh3ClientError> {
@@ -4465,6 +4536,58 @@ mod tests {
     }
 
     // --- interop scenarios ---
+
+    #[tokio::test]
+    async fn the_forwards_only_mode_holds_the_connection_open() {
+        let (server_config, server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = tokio::time::timeout(Duration::from_secs(5), server_endpoint.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = tokio::time::timeout(Duration::from_secs(5), incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                serve_connection(connection, Ssh3ServerConfig::default()),
+            )
+            .await;
+        });
+
+        let mut config = Ssh3ClientConfig::new(
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
+                .parse()
+                .unwrap(),
+        );
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
+        // A local forward is the payload of the mode: the connection stays
+        // open for it, without any session.
+        config.local_forwards =
+            vec![crate::parse_local_forward_spec("127.0.0.1:0:example.com:80").unwrap()];
+
+        // The mode ends when the connection is closed, so the server is
+        // dropped to release it.
+        let client = crate::connect_client(&config).await.unwrap();
+        let forwards = crate::start_local_forwards(&client, &config).await.unwrap();
+        assert_eq!(forwards.len(), 1);
+        client.shutdown().await;
+        for task in forwards {
+            task.abort();
+        }
+
+        server_task.abort();
+    }
 
     #[tokio::test]
     async fn exec_capture_round_trips_against_the_rust_server() {

@@ -5,19 +5,21 @@ use std::time::Duration;
 use clap::{ArgGroup, CommandFactory, Parser, ValueHint, error::ErrorKind};
 use http::Uri;
 use ssh3_client::{
-    DEFAULT_HANDSHAKE_IDLE_TIMEOUT, DEFAULT_MAX_IDLE_TIMEOUT, Ssh3AgentSelection, Ssh3ClientConfig,
-    Ssh3ClientError, Ssh3DynamicForwardSpec, Ssh3KnownHostsTrust, Ssh3LocalForwardSpec,
-    Ssh3OidcConfig, Ssh3PtyPolicy, Ssh3ReverseForwardSpec, Ssh3SessionRequest,
-    Ssh3StrictHostKeyChecking, Ssh3TrustStrategy, default_known_hosts_path,
-    default_ssh_config_path, exit_code_for_exit_signal, load_certificates, load_ssh_config,
-    parse_duration, parse_dynamic_forward_spec, parse_escape_char, parse_local_forward_spec,
-    parse_reverse_forward_spec, resolve_strict_host_key_checking, run_session_stdio,
+    DEFAULT_HANDSHAKE_IDLE_TIMEOUT, DEFAULT_MAX_IDLE_TIMEOUT, SSH3_CLIENT_VERSION_STRING,
+    Ssh3AgentSelection, Ssh3ClientConfig, Ssh3ClientError, Ssh3DynamicForwardSpec,
+    Ssh3KnownHostsTrust, Ssh3LocalForwardSpec, Ssh3OidcConfig, Ssh3PtyPolicy,
+    Ssh3ReverseForwardSpec, Ssh3SessionRequest, Ssh3StrictHostKeyChecking, Ssh3TrustStrategy,
+    SshConfig, default_known_hosts_path, default_ssh_config_path, exit_code_for_exit_signal,
+    load_certificates, load_ssh_config, parse_duration, parse_dynamic_forward_spec,
+    parse_escape_char, parse_local_forward_spec, parse_reverse_forward_spec,
+    resolve_strict_host_key_checking, run_forwards_only, run_session_stdio,
 };
 
 #[derive(Debug, Parser)]
 #[command(
     name = "ssh3-rust-client",
-    version,
+    version = SSH3_CLIENT_VERSION_STRING,
+    disable_version_flag = true,
     about = "Connects to an SSH3 server over QUIC/HTTP3. If COMMAND is omitted, requests a shell.",
     group(
         ArgGroup::new("auth")
@@ -137,8 +139,8 @@ struct Cli {
     #[arg(long, conflicts_with = "ca_cert")]
     insecure: bool,
 
-    #[arg(value_name = "URL")]
-    url: Uri,
+    #[arg(value_name = "URL", required_unless_present = "print_version")]
+    url: Option<Uri>,
 
     /// Force the allocation of a pseudo-terminal.
     #[arg(short = 't', conflicts_with = "no_pty")]
@@ -149,9 +151,24 @@ struct Cli {
     no_pty: bool,
 
     /// Set an option: RequestTTY=auto|yes|no|force, Term=<type>, EscapeChar=<char>,
-    /// StrictHostKeyChecking=ask|yes|accept-new|no.
+    /// StrictHostKeyChecking=ask|yes|accept-new|no, LocalForward=<spec>,
+    /// RemoteForward=<spec>, DynamicForward=<spec>, ProxyJump=<chain>,
+    /// ServerAliveInterval=<seconds>.
     #[arg(short = 'o', value_name = "KEY=VALUE")]
     option: Vec<String>,
+
+    /// Do not execute a remote command or session; hold the connection open
+    /// for the forwards.
+    #[arg(short = 'N')]
+    no_session: bool,
+
+    /// Print the version string of the client and exit.
+    ///
+    /// The string has the format of the Go implementation: the name of the
+    /// protocol, the version of the protocol, the name of the implementation
+    /// and its version, then the version of the experimental specification.
+    #[arg(short = 'V', long = "version")]
+    print_version: bool,
 
     /// The policy of the known_hosts check: ask, yes, accept-new or no.
     ///
@@ -165,7 +182,14 @@ struct Cli {
     known_hosts: Option<PathBuf>,
 
     /// The ssh_config file of the user.
-    #[arg(long = "ssh-config", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    ///
+    /// The `-F` option names another file, like the Go implementation does.
+    #[arg(
+        short = 'F',
+        long = "ssh-config",
+        value_name = "PATH",
+        value_hint = ValueHint::FilePath
+    )]
     ssh_config: Option<PathBuf>,
 
     /// Forward a local port to the remote host: [bind_address:]port:host:hostport.
@@ -204,6 +228,11 @@ struct OptionOverrides {
     term: Option<String>,
     escape_char: Option<u8>,
     strict_host_key_checking: Option<String>,
+    local_forwards: Vec<Ssh3LocalForwardSpec>,
+    reverse_forwards: Vec<Ssh3ReverseForwardSpec>,
+    dynamic_forwards: Vec<Ssh3DynamicForwardSpec>,
+    proxy_jump: Option<String>,
+    server_alive_interval: Option<Duration>,
 }
 
 /// Parses the `-o KEY=VALUE` options.
@@ -247,6 +276,37 @@ fn parse_options(options: &[String]) -> Result<OptionOverrides, clap::Error> {
                     .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))?;
                 overrides.strict_host_key_checking = Some(value);
             }
+            "localforward" => {
+                overrides.local_forwards.push(
+                    parse_local_forward_spec(&value)
+                        .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))?,
+                );
+            }
+            "remoteforward" => {
+                overrides.reverse_forwards.push(
+                    parse_reverse_forward_spec(&value)
+                        .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))?,
+                );
+            }
+            "dynamicforward" => {
+                overrides.dynamic_forwards.push(
+                    parse_dynamic_forward_spec(&value)
+                        .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))?,
+                );
+            }
+            "proxyjump" => {
+                // The chain is validated like the Go implementation does: a
+                // comma-separated list of non-empty destinations.
+                validate_proxy_jump(&value)
+                    .map_err(|err| cli_error(ErrorKind::ValueValidation, err))?;
+                overrides.proxy_jump = Some(value);
+            }
+            "serveraliveinterval" => {
+                overrides.server_alive_interval = Some(
+                    parse_timeout(&value)
+                        .map_err(|err| cli_error(ErrorKind::ValueValidation, err))?,
+                );
+            }
             other => {
                 return Err(cli_error(
                     ErrorKind::ValueValidation,
@@ -256,6 +316,30 @@ fn parse_options(options: &[String]) -> Result<OptionOverrides, clap::Error> {
         }
     }
     Ok(overrides)
+}
+
+/// Validates the value of a `ProxyJump` keyword.
+///
+/// The value is a comma-separated list of destinations, like the `-J` option
+/// of ssh(1); no destination may be empty or hold a space.
+fn validate_proxy_jump(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("empty ProxyJump value: want a destination, e.g. jump.example.org".to_string());
+    }
+    for hop in value.split(',') {
+        let hop = hop.trim();
+        if hop.is_empty() {
+            return Err(format!(
+                "invalid ProxyJump value {value:?}: empty destination"
+            ));
+        }
+        if hop.contains([' ', '\t']) {
+            return Err(format!(
+                "invalid ProxyJump destination {hop:?} in {value:?}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Parses a timeout value.
@@ -298,42 +382,125 @@ fn read_secret_file(path: &Path, label: &str) -> Result<String, clap::Error> {
         .map_err(|err| cli_error(ErrorKind::Io, format!("failed to read {label}: {err}")))
 }
 
-/// The value of the `StrictHostKeyChecking` keyword of the ssh_config file.
+/// The values the ssh_config file of the user provides.
 ///
-/// The file of the user is read when the caller does not name another one,
-/// and the keyword of the block that matches the host is the value of the
-/// configuration.
-fn ssh_config_strict_host_key_checking(
-    path: Option<&Path>,
-    host: Option<&str>,
-) -> Result<Option<String>, clap::Error> {
-    let default_path;
-    let path = match path {
-        Some(path) => path,
-        None => {
-            default_path = default_ssh_config_path();
-            match default_path.as_deref() {
-                Some(path) => path,
-                None => return Ok(None),
-            }
-        }
-    };
-    let configuration = load_ssh_config(path).map_err(|err| {
-        cli_error(
-            ErrorKind::Io,
-            format!("failed to read {}: {err}", path.display()),
-        )
-    })?;
-    let Some(host) = host else {
-        return Ok(None);
-    };
-    Ok(configuration
-        .get(host, "StrictHostKeyChecking")
-        .map(str::to_string))
+/// The keywords are read for the host of the connection and for the user of
+/// the connection, like the Go implementation does.
+struct SshConfigValues {
+    strict_host_key_checking: Option<String>,
+    request_tty: Option<Ssh3PtyPolicy>,
+    term: Option<String>,
+    escape_char: Option<u8>,
+    forward_agent: bool,
+    server_alive_interval: Option<Duration>,
+    proxy_jump: Option<String>,
 }
 
-fn build_config(cli: Cli) -> Result<(Ssh3ClientConfig, Ssh3SessionRequest), clap::Error> {
-    let mut config = Ssh3ClientConfig::new(cli.url);
+/// Loads the ssh_config file of the user.
+///
+/// A file that cannot be read is ignored, like the Go implementation does:
+/// the error goes to the standard error and the connection goes on. A file
+/// that does not exist is skipped silently.
+fn load_user_ssh_config(path: Option<&Path>) -> SshConfig {
+    let path = match path {
+        Some(path) => path.to_path_buf(),
+        None => match default_ssh_config_path() {
+            Some(path) => path,
+            None => return SshConfig::default(),
+        },
+    };
+    match load_ssh_config(&path) {
+        Ok(configuration) => configuration,
+        Err(err) => {
+            eprintln!(
+                "ssh3-rust-client: could not open {}: {err}, ignoring config",
+                path.display()
+            );
+            SshConfig::default()
+        }
+    }
+}
+
+/// Reads the keywords of the ssh_config file the client uses.
+///
+/// The host is the one of the connection and the user the one of the
+/// connection; an empty user means the local user of the process.
+fn ssh_config_values(
+    configuration: &SshConfig,
+    host: Option<&str>,
+    user: Option<&str>,
+) -> Result<SshConfigValues, clap::Error> {
+    let mut values = SshConfigValues {
+        strict_host_key_checking: None,
+        request_tty: None,
+        term: None,
+        escape_char: None,
+        forward_agent: false,
+        server_alive_interval: None,
+        proxy_jump: None,
+    };
+    let Some(host) = host else {
+        return Ok(values);
+    };
+    let user = user.unwrap_or("");
+    let get = |keyword: &str| -> Option<String> {
+        configuration
+            .get_for_user(host, user, keyword)
+            .map(str::to_string)
+    };
+
+    if let Some(value) = get("StrictHostKeyChecking") {
+        values.strict_host_key_checking = Some(value);
+    }
+    if let Some(value) = get("RequestTTY") {
+        values.request_tty = Some(
+            Ssh3PtyPolicy::parse(&value)
+                .map_err(|err| cli_error(ErrorKind::ValueValidation, err))?,
+        );
+    }
+    if let Some(value) = get("Term") {
+        if value.is_empty() {
+            return Err(cli_error(
+                ErrorKind::ValueValidation,
+                "empty Term value: want a terminal name, e.g. xterm-256color",
+            ));
+        }
+        values.term = Some(value);
+    }
+    if let Some(value) = get("EscapeChar") {
+        values.escape_char = Some(
+            parse_escape_char(&value)
+                .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))?,
+        );
+    }
+    if let Some(value) = get("ForwardAgent") {
+        // The Go implementation only reads the affirmative value.
+        values.forward_agent = value.eq_ignore_ascii_case("yes");
+    }
+    if let Some(value) = get("ServerAliveInterval") {
+        // The value of the keyword is a number of seconds; the Go
+        // implementation ignores a value it cannot read.
+        if let Ok(seconds) = value.trim().parse::<u64>() {
+            if seconds > 0 {
+                values.server_alive_interval = Some(Duration::from_secs(seconds));
+            }
+        }
+    }
+    if let Some(value) = get("UDPProxyJump").or_else(|| get("ProxyJump")) {
+        validate_proxy_jump(&value).map_err(|err| cli_error(ErrorKind::ValueValidation, err))?;
+        values.proxy_jump = Some(value);
+    }
+    Ok(values)
+}
+
+fn build_config(cli: Cli) -> Result<(Ssh3ClientConfig, Ssh3SessionRequest, bool), clap::Error> {
+    let url = cli.url.clone().ok_or_else(|| {
+        cli_error(
+            ErrorKind::MissingRequiredArgument,
+            "the following required arguments were not provided: <URL>",
+        )
+    })?;
+    let mut config = Ssh3ClientConfig::new(url);
     config.server_name = cli.server_name;
     config.username = cli.user;
     config.identity_file = cli.identity;
@@ -373,6 +540,15 @@ fn build_config(cli: Cli) -> Result<(Ssh3ClientConfig, Ssh3SessionRequest), clap
     };
     let overrides = parse_options(&cli.option)?;
 
+    // The configuration file of the user. The `-F` option names another
+    // file; the default one is read when it is not given.
+    let ssh_config = load_user_ssh_config(cli.ssh_config.as_deref());
+    let ssh_config_values = ssh_config_values(
+        &ssh_config,
+        config.target_url.host(),
+        config.username.as_deref(),
+    )?;
+
     // The certificate authorities the server chain may be verified against.
     let authorities = match cli.ca_cert.as_ref() {
         Some(path) => load_certificates(path).map_err(|err| {
@@ -389,17 +565,15 @@ fn build_config(cli: Cli) -> Result<(Ssh3ClientConfig, Ssh3SessionRequest), clap
     // ssh_config file. The known_hosts check only runs when one of the
     // sources sets the policy, so that the default behaviour of the client
     // stays the one it had before.
-    let ssh_config_policy =
-        ssh_config_strict_host_key_checking(cli.ssh_config.as_deref(), config.target_url.host())?;
     let policy = resolve_strict_host_key_checking(
         cli.strict_host_key_checking.as_deref(),
         overrides.strict_host_key_checking.as_deref(),
-        ssh_config_policy.as_deref(),
+        ssh_config_values.strict_host_key_checking.as_deref(),
     )
     .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))?;
     let policy_is_set = cli.strict_host_key_checking.is_some()
         || overrides.strict_host_key_checking.is_some()
-        || ssh_config_policy.is_some();
+        || ssh_config_values.strict_host_key_checking.is_some();
 
     config.trust = if cli.insecure {
         Ssh3TrustStrategy::Insecure
@@ -420,46 +594,74 @@ fn build_config(cli: Cli) -> Result<(Ssh3ClientConfig, Ssh3SessionRequest), clap
     };
 
     // The RequestTTY precedence follows OpenSSH: the `-T` and `-t` flags are
-    // the absolutes, the `-o RequestTTY=` option comes next and `auto` is the
-    // default.
-    config.pty_policy = overrides.request_tty.unwrap_or(Ssh3PtyPolicy::Auto);
+    // the absolutes, the `-o RequestTTY=` option comes next, the keyword of
+    // the ssh_config file follows and `auto` is the default.
+    config.pty_policy = overrides
+        .request_tty
+        .or(ssh_config_values.request_tty)
+        .unwrap_or(Ssh3PtyPolicy::Auto);
     if cli.no_pty {
         config.pty_policy = Ssh3PtyPolicy::No;
     }
     if cli.force_pty {
         config.pty_policy = Ssh3PtyPolicy::Force;
     }
-    config.term_type = overrides.term;
-    if let Some(escape_char) = overrides.escape_char {
+    config.term_type = overrides.term.or(ssh_config_values.term);
+    if let Some(escape_char) = overrides.escape_char.or(ssh_config_values.escape_char) {
         config.escape_char = escape_char;
     }
+    // The agent forwarding is enabled by the flag or by the keyword of the
+    // ssh_config file.
+    config.forward_agent = cli.forward_agent || ssh_config_values.forward_agent;
+    // The keepalive period comes from the `-o` option first and from the
+    // keyword of the ssh_config file next.
+    if let Some(interval) = overrides
+        .server_alive_interval
+        .or(ssh_config_values.server_alive_interval)
+    {
+        config.keep_alive_interval = Some(interval);
+    }
+    // The proxy jump chain comes from the `-o` option first and from the
+    // keyword of the ssh_config file next.
+    config.proxy_jump = overrides.proxy_jump.or(ssh_config_values.proxy_jump);
 
-    config.local_forwards = cli
-        .local_forward
-        .iter()
-        .map(|spec| {
-            parse_local_forward_spec(spec)
-                .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))
-        })
-        .collect::<Result<Vec<Ssh3LocalForwardSpec>, clap::Error>>()?;
+    // The forwards follow the same precedence as the other options: the
+    // command line wins over the `-o` options.
+    config.local_forwards = if cli.local_forward.is_empty() {
+        overrides.local_forwards
+    } else {
+        cli.local_forward
+            .iter()
+            .map(|spec| {
+                parse_local_forward_spec(spec)
+                    .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))
+            })
+            .collect::<Result<Vec<Ssh3LocalForwardSpec>, clap::Error>>()?
+    };
 
-    config.reverse_forwards = cli
-        .reverse_forward
-        .iter()
-        .map(|spec| {
-            parse_reverse_forward_spec(spec)
-                .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))
-        })
-        .collect::<Result<Vec<Ssh3ReverseForwardSpec>, clap::Error>>()?;
+    config.reverse_forwards = if cli.reverse_forward.is_empty() {
+        overrides.reverse_forwards
+    } else {
+        cli.reverse_forward
+            .iter()
+            .map(|spec| {
+                parse_reverse_forward_spec(spec)
+                    .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))
+            })
+            .collect::<Result<Vec<Ssh3ReverseForwardSpec>, clap::Error>>()?
+    };
 
-    config.dynamic_forwards = cli
-        .dynamic_forward
-        .iter()
-        .map(|spec| {
-            parse_dynamic_forward_spec(spec)
-                .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))
-        })
-        .collect::<Result<Vec<Ssh3DynamicForwardSpec>, clap::Error>>()?;
+    config.dynamic_forwards = if cli.dynamic_forward.is_empty() {
+        overrides.dynamic_forwards
+    } else {
+        cli.dynamic_forward
+            .iter()
+            .map(|spec| {
+                parse_dynamic_forward_spec(spec)
+                    .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))
+            })
+            .collect::<Result<Vec<Ssh3DynamicForwardSpec>, clap::Error>>()?
+    };
 
     config.handshake_idle_timeout = resolve_timeout(
         cli.handshake_idle_timeout.as_deref(),
@@ -472,21 +674,43 @@ fn build_config(cli: Cli) -> Result<(Ssh3ClientConfig, Ssh3SessionRequest), clap
         DEFAULT_MAX_IDLE_TIMEOUT,
     )?;
 
+    // The `-N` flag holds the connection open for the forwards: no session is
+    // opened, so a remote command makes no sense.
+    if cli.no_session && !cli.command.is_empty() {
+        return Err(cli_error(
+            ErrorKind::ArgumentConflict,
+            "-N does not accept a remote command",
+        ));
+    }
     let request = if cli.command.is_empty() {
         Ssh3SessionRequest::Shell
     } else {
         Ssh3SessionRequest::Exec(cli.command.join(" "))
     };
-    Ok((config, request))
-}
-
-fn parse_args() -> Result<(Ssh3ClientConfig, Ssh3SessionRequest), clap::Error> {
-    build_config(Cli::try_parse()?)
+    Ok((config, request, cli.no_session))
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let (config, request) = match parse_args() {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            let status = match err.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            };
+            err.print().ok();
+            return status;
+        }
+    };
+    // The version string is printed on the standard output, like the Go
+    // implementation does, and the connection is not opened.
+    if cli.print_version {
+        println!("{SSH3_CLIENT_VERSION_STRING}");
+        return ExitCode::SUCCESS;
+    }
+
+    let (config, request, no_session) = match build_config(cli) {
         Ok(parsed) => parsed,
         Err(err) => {
             let status = match err.kind() {
@@ -497,6 +721,16 @@ async fn main() -> ExitCode {
             return status;
         }
     };
+
+    if no_session {
+        return match run_forwards_only(&config).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("ssh3-rust-client failed: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     match run_session_stdio(&config, request).await {
         Ok(status) => ExitCode::from(status as u8),
@@ -518,8 +752,8 @@ mod tests {
     use super::{Cli, build_config};
     use clap::{Parser, error::ErrorKind};
     use ssh3_client::{
-        Ssh3ForwardProtocol, Ssh3PtyPolicy, Ssh3ReverseForwardProtocol, Ssh3StrictHostKeyChecking,
-        Ssh3TrustStrategy,
+        SSH3_CLIENT_VERSION_STRING, Ssh3ForwardProtocol, Ssh3PtyPolicy, Ssh3ReverseForwardProtocol,
+        Ssh3StrictHostKeyChecking, Ssh3TrustStrategy,
     };
     use std::time::Duration;
 
@@ -529,6 +763,16 @@ mod tests {
         argv.push("https://localhost:4433/ssh3-term");
         let cli = Cli::try_parse_from(argv).unwrap();
         build_config(cli).unwrap().0
+    }
+
+    /// The three values the command line parsing produces.
+    fn parsed_of(arguments: &[&str]) -> (ssh3_client::Ssh3ClientConfig, bool) {
+        let mut argv = vec!["ssh3-rust-client"];
+        argv.extend_from_slice(arguments);
+        argv.push("https://localhost:4433/ssh3-term");
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let (config, _, no_session) = build_config(cli).unwrap();
+        (config, no_session)
     }
 
     /// The policy of the known_hosts check of a configuration.
@@ -752,7 +996,7 @@ mod tests {
             "https://localhost:4433/ssh3-term",
         ])
         .unwrap();
-        let (config, _) = build_config(cli).unwrap();
+        let (config, _, _) = build_config(cli).unwrap();
 
         assert_eq!(config.password.as_deref(), Some("secret-password"));
     }
@@ -774,7 +1018,7 @@ mod tests {
             "https://localhost:4433/ssh3-term",
         ])
         .unwrap();
-        let (config, _) = build_config(cli).unwrap();
+        let (config, _, _) = build_config(cli).unwrap();
 
         assert_eq!(
             config
@@ -880,5 +1124,229 @@ mod tests {
         .unwrap();
         let err = build_config(err).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_no_session_flag_is_parsed() {
+        let (_, no_session) = parsed_of(&["-N"]);
+        assert!(no_session);
+        let (_, no_session) = parsed_of(&[]);
+        assert!(!no_session);
+    }
+
+    #[test]
+    fn the_no_session_flag_refuses_a_remote_command() {
+        let err = Cli::try_parse_from([
+            "ssh3-rust-client",
+            "-N",
+            "ls",
+            "https://localhost:4433/ssh3-term",
+        ])
+        .unwrap();
+        let err = build_config(err).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn the_config_file_option_is_parsed() {
+        let cli = Cli::try_parse_from([
+            "ssh3-rust-client",
+            "-F",
+            "/tmp/ssh_config",
+            "https://localhost:4433/ssh3-term",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.ssh_config.as_deref(),
+            Some(std::path::Path::new("/tmp/ssh_config"))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_config_file_does_not_stop_the_client() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config");
+        // A directory cannot be read as a file: the client ignores the
+        // configuration and goes on.
+        std::fs::create_dir(&path).unwrap();
+
+        let config = config_of(&["--ssh-config", path.to_str().unwrap()]);
+        assert_eq!(config.pty_policy, Ssh3PtyPolicy::Auto);
+    }
+
+    #[test]
+    fn the_local_forward_option_is_parsed() {
+        let config = config_of(&["-o", "LocalForward=8080:example.com:80"]);
+        assert_eq!(config.local_forwards.len(), 1);
+        assert_eq!(config.local_forwards[0].bind_port, 8080);
+        assert_eq!(config.local_forwards[0].target_host, "example.com");
+    }
+
+    #[test]
+    fn the_remote_forward_option_is_parsed() {
+        let config = config_of(&["-o", "RemoteForward=8081:example.com:81"]);
+        assert_eq!(config.reverse_forwards.len(), 1);
+        assert_eq!(config.reverse_forwards[0].bind_port, 8081);
+    }
+
+    #[test]
+    fn the_dynamic_forward_option_is_parsed() {
+        let config = config_of(&["-o", "DynamicForward=1080"]);
+        assert_eq!(config.dynamic_forwards.len(), 1);
+        assert_eq!(config.dynamic_forwards[0].bind_port, 1080);
+    }
+
+    #[test]
+    fn a_malformed_forward_option_is_refused() {
+        let err = Cli::try_parse_from([
+            "ssh3-rust-client",
+            "-o",
+            "LocalForward=8080",
+            "https://localhost:4433/ssh3-term",
+        ])
+        .unwrap();
+        let err = build_config(err).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_proxy_jump_option_is_parsed() {
+        let config = config_of(&["-o", "ProxyJump=jump.example.org"]);
+        assert_eq!(config.proxy_jump.as_deref(), Some("jump.example.org"));
+    }
+
+    #[test]
+    fn a_malformed_proxy_jump_option_is_refused() {
+        let err = Cli::try_parse_from([
+            "ssh3-rust-client",
+            "-o",
+            "ProxyJump=jump one",
+            "https://localhost:4433/ssh3-term",
+        ])
+        .unwrap();
+        let err = build_config(err).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_server_alive_interval_option_is_parsed() {
+        let config = config_of(&["-o", "ServerAliveInterval=30"]);
+        assert_eq!(config.keep_alive_interval, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn the_command_line_wins_over_the_forward_options() {
+        let config = config_of(&[
+            "-L",
+            "9090:example.com:90",
+            "-o",
+            "LocalForward=8080:example.com:80",
+        ]);
+        assert_eq!(config.local_forwards.len(), 1);
+        assert_eq!(config.local_forwards[0].bind_port, 9090);
+    }
+
+    #[test]
+    fn the_forward_options_are_used_when_the_command_line_is_silent() {
+        let config = config_of(&["-o", "LocalForward=8080:example.com:80"]);
+        assert_eq!(config.local_forwards.len(), 1);
+        assert_eq!(config.local_forwards[0].bind_port, 8080);
+    }
+
+    #[test]
+    fn the_config_file_provides_the_forward_agent_keyword() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config");
+        std::fs::write(&path, "Host localhost\n  ForwardAgent yes\n").unwrap();
+
+        let config = config_of(&["--ssh-config", path.to_str().unwrap()]);
+        assert!(config.forward_agent);
+    }
+
+    #[test]
+    fn the_config_file_provides_the_server_alive_interval_keyword() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config");
+        std::fs::write(&path, "Host localhost\n  ServerAliveInterval 45\n").unwrap();
+
+        let config = config_of(&["--ssh-config", path.to_str().unwrap()]);
+        assert_eq!(config.keep_alive_interval, Some(Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn the_forward_option_wins_over_the_config_file_keyword() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config");
+        std::fs::write(&path, "Host localhost\n  ServerAliveInterval 45\n").unwrap();
+
+        let config = config_of(&[
+            "--ssh-config",
+            path.to_str().unwrap(),
+            "-o",
+            "ServerAliveInterval=30",
+        ]);
+        assert_eq!(config.keep_alive_interval, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn the_config_file_provides_the_proxy_jump_keyword() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config");
+        std::fs::write(&path, "Host localhost\n  ProxyJump jump.example.org\n").unwrap();
+
+        let config = config_of(&["--ssh-config", path.to_str().unwrap()]);
+        assert_eq!(config.proxy_jump.as_deref(), Some("jump.example.org"));
+    }
+
+    #[test]
+    fn the_proxy_jump_option_wins_over_the_config_file_keyword() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config");
+        std::fs::write(&path, "Host localhost\n  ProxyJump jump.example.org\n").unwrap();
+
+        let config = config_of(&[
+            "--ssh-config",
+            path.to_str().unwrap(),
+            "-o",
+            "ProxyJump=other.example.org",
+        ]);
+        assert_eq!(config.proxy_jump.as_deref(), Some("other.example.org"));
+    }
+
+    #[test]
+    fn the_config_file_provides_the_request_tty_keyword() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config");
+        std::fs::write(&path, "Host localhost\n  RequestTTY force\n").unwrap();
+
+        let config = config_of(&["--ssh-config", path.to_str().unwrap()]);
+        assert_eq!(config.pty_policy, Ssh3PtyPolicy::Force);
+    }
+
+    #[test]
+    fn the_version_flag_is_parsed_without_a_url() {
+        let cli = Cli::try_parse_from(["ssh3-rust-client", "-V"]).unwrap();
+        assert!(cli.print_version);
+        let cli = Cli::try_parse_from(["ssh3-rust-client", "--version"]).unwrap();
+        assert!(cli.print_version);
+    }
+
+    #[test]
+    fn the_url_is_required_without_the_version_flag() {
+        let err = Cli::try_parse_from(["ssh3-rust-client"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn the_version_string_has_the_format_of_the_go_implementation() {
+        // The Go implementation announces the name of the protocol, the
+        // version of the protocol, the name of the implementation and its
+        // version, then the version of the experimental specification.
+        let fields: Vec<&str> = SSH3_CLIENT_VERSION_STRING.split(' ').collect();
+        assert_eq!(fields[0], "SSH");
+        assert_eq!(fields[1], "3.0");
+        assert_eq!(fields[2], "ssh3-rust");
+        assert!(fields[3].starts_with("0."));
+        assert_eq!(fields[4], "experimental_spec_version=alpha-00");
     }
 }
