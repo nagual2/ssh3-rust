@@ -1,0 +1,677 @@
+# Copyright 2026 The nagual2 ssh3 Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release
+
+# The release pipeline of the Rust line of SSH3.
+#
+# The Rust implementation is the second stack of the SSH3 family: the shipped
+# product is the Go implementation of nagual2/ssh3-go. The releases of this
+# repository are therefore published as *pre-releases* until the parity audit
+# of the roadmap is closed; promoting a pre-release to a full release is a
+# manual act in the GitHub UI.
+#
+# The pipeline turns a `v*` tag into:
+#   * one archive per target (linux x86_64/aarch64, windows x86_64, macOS
+#     x86_64/aarch64) with the client, the server, the license, the notice,
+#     the README and the SBOM of the target;
+#   * a Debian package of the server for the linux targets (amd64, arm64);
+#   * a `checksums.txt` over every published file;
+#   * a build provenance attestation (Sigstore, keyless, GitHub OIDC) over
+#     the published binaries.
+#
+# The binaries are built from the pinned toolchain of `rust-toolchain.toml`
+# with the reproducible `[profile.release]` of the workspace (no incremental
+# compilation, one codegen unit, fat LTO, stripped symbols), with the paths
+# of the build machine trimmed (`--remap-path-prefix`, the stable spelling of
+# the mechanism behind `-C trimpath`) and with a fixed `SOURCE_DATE_EPOCH`
+# (the commit time of the released tag), so two builds of the same tag
+# produce the same bytes.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (vX.Y.Z)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # The releases of this repository are pre-releases until the audit of the
+  # roadmap is done (see the body of the release below).
+  RELEASE_PRERELEASE: 'true'
+
+jobs:
+  # ---------------------------------------------------------------------
+  # prepare: the version, the timestamp and the sanity checks of the tag
+  # ---------------------------------------------------------------------
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      source_date_epoch: ${{ steps.version.outputs.source_date_epoch }}
+    steps:
+      - name: Check out the workspace
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the version of the release
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+          fi
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*)
+              ;;
+            *)
+              echo "::error::the release tag must look like vX.Y.Z (got '$tag')"
+              exit 1
+              ;;
+          esac
+          if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::the tag '$tag' does not exist in the repository"
+            exit 1
+          fi
+          version="${tag#v}"
+          # The timestamp of the tagged commit is the epoch of the build: it
+          # is the only input of the archives that has to be fixed for the
+          # build to be reproducible.
+          epoch="$(git log -1 --format=%ct "$tag")"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "source_date_epoch=$epoch"
+          } >>"$GITHUB_OUTPUT"
+          echo "release $tag (version $version, epoch $epoch)"
+
+      - name: Check the version against the workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          for crate in ssh3-client ssh3-server; do
+            crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$crate/Cargo.toml" | head -n1)"
+            if [ "$crate_version" != "$version" ]; then
+              echo "::error::the tag $version does not match the version $crate_version of $crate/Cargo.toml: bump the crate versions before tagging"
+              exit 1
+            fi
+          done
+          echo "the crate versions match the tag $version"
+
+  # ---------------------------------------------------------------------
+  # build: the binaries, the SBOM and the archives of every target
+  # ---------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The linux x86_64 artifacts are built on a native runner, the
+          # linux aarch64 artifacts are cross compiled on the same runner
+          # (the cross toolchain of the target is installed by the job).
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+            archive: tar.gz
+            native: true
+            windows: false
+            cross: false
+            python: python3
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            os: linux
+            arch: aarch64
+            archive: tar.gz
+            native: false
+            windows: false
+            cross: true
+            python: python3
+          # The windows artifacts are built on a native runner: the msvc
+          # toolchain of the runner is the reference toolchain of the
+          # target.
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            os: windows
+            arch: x86_64
+            archive: zip
+            native: true
+            windows: true
+            cross: false
+            python: python
+          # The macOS artifacts of the two architectures are built on the
+          # arm64 runner: the x86_64 leg is a cross build (the clang of the
+          # runner compiles and links for x86_64).
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            os: macos
+            arch: aarch64
+            archive: tar.gz
+            native: true
+            windows: false
+            cross: false
+            python: python3
+          - target: x86_64-apple-darwin
+            runner: macos-15
+            os: macos
+            arch: x86_64
+            archive: tar.gz
+            native: false
+            windows: false
+            cross: true
+            python: python3
+    env:
+      # The epoch of the build: the commit time of the released tag. It is
+      # the only input that the toolchain and the archivers take from the
+      # clock, so it makes the artifacts reproducible.
+      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+      TZ: UTC
+      LC_ALL: C
+      # The incremental compilation is off in the release profile of the
+      # workspace; the variable repeats it for the build scripts.
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Check out the workspace
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          targets: ${{ matrix.target }}
+
+      - name: Install the cross toolchain of the target
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            cmake \
+            nasm \
+            perl
+
+      - name: Install the build prerequisites of the target
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cmake ships with the runner image; nasm is needed by the
+          # `aws-lc-sys` build when it does not use the prebuilt objects.
+          cmake --version
+          if ! command -v nasm >/dev/null 2>&1; then
+            choco install nasm --no-progress -y
+          fi
+          nasm -v
+
+      - name: Configure the build flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The paths of the build machine are trimmed out of the binaries:
+          # `--remap-path-prefix` is the stable spelling of the mechanism
+          # behind `-C trimpath`, and it is the only one the pinned
+          # toolchain accepts. The workspace, the cargo home and the
+          # sysroot are remapped, so the binaries do not depend on where
+          # the runner built them.
+          workspace="$GITHUB_WORKSPACE"
+          cargo_home="${CARGO_HOME:-}"
+          if [ -z "$cargo_home" ]; then
+            cargo_home="$(cygpath -w "$HOME/.cargo" 2>/dev/null || echo "$HOME/.cargo")"
+          fi
+          sysroot="$(rustc --print sysroot)"
+          remap="--remap-path-prefix=$workspace=. --remap-path-prefix=$cargo_home=cargo --remap-path-prefix=$sysroot=rustup"
+          {
+            echo "RUSTFLAGS=$remap"
+            # The target specific flags replace the global ones, so the
+            # trimming is repeated for the cross leg of macOS.
+            echo "CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=$remap -C link-arg=-arch -C link-arg=x86_64"
+          } >>"$GITHUB_ENV"
+          echo "RUSTFLAGS: $remap"
+
+      - name: Configure the cross toolchain
+        if: matrix.cross
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The variables are exported to the following steps through the
+          # environment file of the runner: the Rust linker, the C compiler
+          # of the `cc` crate and the cmake toolchain of `aws-lc-sys` have
+          # to agree on the target of the leg.
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)
+              {
+                echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+                echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++"
+                echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+                echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+                echo "CMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/packaging/cross/aarch64-unknown-linux-gnu.cmake"
+              } >>"$GITHUB_ENV"
+              ;;
+            x86_64-apple-darwin)
+              {
+                echo "CC_x86_64_apple_darwin=clang -arch x86_64"
+                echo "CXX_x86_64_apple_darwin=clang++ -arch x86_64"
+                echo "AR_x86_64_apple_darwin=ar"
+                echo "CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=clang"
+                echo "CMAKE_OSX_ARCHITECTURES=x86_64"
+                echo "MACOSX_DEPLOYMENT_TARGET=11.0"
+              } >>"$GITHUB_ENV"
+              ;;
+          esac
+
+      - name: Build the release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --workspace --locked --release --bins --target "${{ matrix.target }}"
+
+      - name: Check the architecture of the binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${{ matrix.python }}" packaging/check-arch.py "${{ matrix.target }}" "target/${{ matrix.target }}/release"
+
+      - name: Smoke test the binaries
+        if: matrix.native
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The binaries of a native leg have to start: a release must not
+          # publish a binary that does not answer `--version`.
+          directory="target/${{ matrix.target }}/release"
+          for name in ssh3-rust-client ssh3-rust-server; do
+            binary="$directory/$name"
+            if [ ! -f "$binary" ]; then
+              binary="$binary.exe"
+            fi
+            echo "::group::$binary --version"
+            "$binary" --version
+            echo "::endgroup::"
+            "$binary" --help >/dev/null
+          done
+
+      - name: Stage the release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="stage/${{ matrix.target }}"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          directory="target/${{ matrix.target }}/release"
+          for name in ssh3-rust-client ssh3-rust-server; do
+            if [ -f "$directory/$name" ]; then
+              cp "$directory/$name" "$stage/$name"
+            else
+              cp "$directory/$name.exe" "$stage/$name.exe"
+            fi
+          done
+          # `install` is not part of the minimal environment of the windows
+          # runner: the copy and the mode are set separately.
+          cp LICENSE NOTICE README.md "$stage/"
+          chmod 0644 "$stage/LICENSE" "$stage/NOTICE" "$stage/README.md"
+          # The lock file is the source of the SBOM: it describes the exact
+          # dependency tree of the binaries.
+          cp Cargo.lock "$stage/Cargo.lock"
+
+      - name: Generate the SBOM
+        if: ${{ !matrix.windows }}
+        uses: anchore/sbom-action@v0
+        with:
+          path: stage/${{ matrix.target }}
+          format: spdx-json
+          output-file: sbom-${{ matrix.target }}.spdx.json
+          artifact-name: sbom-${{ matrix.target }}
+          # The SBOM is published inside the archive of the target, the
+          # action does not have to upload it a second time.
+          upload-artifact: false
+          output-reproducible: true
+
+      - name: Install syft
+        if: matrix.windows
+        # `anchore/sbom-action` is a docker action and cannot run on the
+        # windows runners, so the syft binary is used directly there.
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate the SBOM
+        if: matrix.windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          syft scan "stage/${{ matrix.target }}" -o "spdx-json=sbom-${{ matrix.target }}.spdx.json"
+
+      - name: Build the release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          stage="stage/${{ matrix.target }}"
+          # The SBOM travels with the binaries of the target.
+          cp "sbom-${{ matrix.target }}.spdx.json" "$stage/sbom.spdx.json"
+          archive="ssh3-rust_${version}_${{ matrix.os }}_${{ matrix.arch }}.${{ matrix.archive }}"
+          mkdir -p dist
+          "${{ matrix.python }}" packaging/make-archive.py \
+            --format "${{ matrix.archive }}" \
+            --output "dist/$archive" \
+            --root-dir "ssh3-rust-$version-${{ matrix.os }}-${{ matrix.arch }}" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            "$stage"/*
+
+      - name: Compute the checksums of the target
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum \
+            "ssh3-rust_${{ needs.prepare.outputs.version }}_${{ matrix.os }}_${{ matrix.arch }}.${{ matrix.archive }}" \
+            "sbom-${{ matrix.target }}.spdx.json" \
+            >"checksums-${{ matrix.target }}.txt"
+          cat "checksums-${{ matrix.target }}.txt"
+
+      - name: Upload the artifacts of the target
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------
+  # deb: the Debian package of the server for the linux targets
+  # ---------------------------------------------------------------------
+  deb:
+    name: deb
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the workspace
+        uses: actions/checkout@v7
+
+      - name: Download the linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*-unknown-linux-gnu
+          path: artifacts
+
+      - name: Build the Debian packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          epoch="${{ needs.prepare.outputs.source_date_epoch }}"
+          mkdir -p dist
+          for pair in x86_64:amd64 aarch64:arm64; do
+            target="${pair%%:*}"
+            arch="${pair##*:}"
+            shopt -s nullglob
+            archives=(artifacts/release-"$target"/ssh3-rust_*_linux_"$target".tar.gz)
+            shopt -u nullglob
+            if [ "${#archives[@]}" -ne 1 ]; then
+              echo "::error::expected one archive for $target, found ${#archives[@]}"
+              exit 1
+            fi
+            archive="${archives[0]}"
+            rm -rf "unpack/$arch"
+            mkdir -p "unpack/$arch"
+            tar -xzf "$archive" -C "unpack/$arch" --strip-components=1
+            # The package is built from the published binary, not from a
+            # new build: the package carries exactly the released bits.
+            sh packaging/build-deb.sh \
+              --binary "unpack/$arch/ssh3-rust-server" \
+              --arch "$arch" \
+              --version "$version" \
+              --output-dir dist \
+              --source-date-epoch "$epoch"
+          done
+
+      - name: Inspect the Debian packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          for package in dist/*.deb; do
+            echo "== $package"
+            dpkg-deb --info "$package"
+            dpkg-deb --contents "$package"
+          done
+
+      - name: Lint the Debian packages
+        continue-on-error: true
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lintian
+          # lintian is advisory: the findings are reported, the release is
+          # not blocked by them.
+          lintian dist/*.deb || true
+
+      - name: Upload the Debian packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs
+          path: dist/*.deb
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------
+  # verify: the published artifacts are checked before they are released
+  # ---------------------------------------------------------------------
+  verify:
+    name: verify
+    needs: [prepare, build, deb]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download the release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: artifacts
+
+      - name: Download the Debian packages
+        uses: actions/download-artifact@v4
+        with:
+          name: debs
+          path: debs
+
+      - name: Verify the checksums of the targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for directory in artifacts/release-*; do
+            echo "== $directory"
+            (cd "$directory" && sha256sum --check --strict checksums-*.txt)
+          done
+
+      - name: Run the published binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The binaries of the published archive, not of the build tree:
+          # this is the check of the bits the users download.
+          shopt -s nullglob
+          archives=(artifacts/release-x86_64-unknown-linux-gnu/ssh3-rust_*_linux_x86_64.tar.gz)
+          shopt -u nullglob
+          if [ "${#archives[@]}" -ne 1 ]; then
+            echo "::error::expected one archive for the linux x86_64 target, found ${#archives[@]}"
+            exit 1
+          fi
+          archive="${archives[0]}"
+          rm -rf unpack
+          mkdir -p unpack
+          tar -xzf "$archive" -C unpack --strip-components=1
+          ./unpack/ssh3-rust-client --version
+          ./unpack/ssh3-rust-server --version
+          ./unpack/ssh3-rust-client --help >/dev/null
+          ./unpack/ssh3-rust-server --help >/dev/null
+
+      - name: Verify the Debian packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          for package in debs/*.deb; do
+            echo "== $package"
+            # The output is captured before it is filtered: a pipe into
+            # `grep -q` would kill `dpkg-deb` with SIGPIPE and the check
+            # would fail for the wrong reason.
+            info="$(dpkg-deb --info "$package")"
+            listing="$(dpkg-deb --contents "$package")"
+            grep -qE "^[[:space:]]*Package: ssh3-rust-server$" <<<"$info"
+            grep -q "usr/bin/ssh3-rust-server$" <<<"$listing"
+            grep -q "usr/lib/systemd/system/ssh3-rust-server.service$" <<<"$listing"
+            grep -q "etc/ssh3/ssh3-rust-server.env$" <<<"$listing"
+            grep -q "usr/share/doc/ssh3-rust-server/LICENSE$" <<<"$listing"
+          done
+
+      - name: Verify the SBOMs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c "
+          import glob, json, sys
+          files = sorted(glob.glob('artifacts/release-*/sbom-*.spdx.json'))
+          if not files:
+              sys.exit('no SBOM found')
+          for path in files:
+              with open(path, encoding='utf-8') as handle:
+                  document = json.load(handle)
+              packages = document.get('packages', [])
+              if not packages:
+                  sys.exit(path + ': the SBOM has no packages')
+              print(path + ': ' + str(len(packages)) + ' packages')
+          "
+
+  # ---------------------------------------------------------------------
+  # attest: the build provenance of the published artifacts
+  # ---------------------------------------------------------------------
+  attest:
+    name: attest
+    needs: [prepare, build, deb]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The attestation is signed with the keyless Sigstore flow of GitHub:
+      # the OIDC token of the runner is the identity, there is no key
+      # material in the repository.
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: artifacts
+
+      - name: Download the Debian packages
+        uses: actions/download-artifact@v4
+        with:
+          name: debs
+          path: debs
+
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            artifacts/release-*/*
+            debs/*.deb
+
+  # ---------------------------------------------------------------------
+  # release: the publication of the release
+  # ---------------------------------------------------------------------
+  release:
+    name: release
+    needs: [prepare, verify, attest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Download the Debian packages
+        uses: actions/download-artifact@v4
+        with:
+          name: debs
+          path: release
+          merge-multiple: true
+
+      - name: Compute the checksums of the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          rm -f checksums.txt
+          files=()
+          for file in *; do
+            if [ "$file" != "checksums.txt" ]; then
+              files+=("$file")
+            fi
+          done
+          sha256sum "${files[@]}" >checksums.txt
+          cat checksums.txt
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ssh3-rust ${{ needs.prepare.outputs.version }}
+          # The Rust line is not the shipped product: the release stays a
+          # pre-release until the audit of the roadmap is closed.
+          prerelease: ${{ env.RELEASE_PRERELEASE }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release/*
+          body: |
+            The Rust implementation of SSH3, the second stack of the SSH3
+            family. The shipped product is the Go implementation of
+            [nagual2/ssh3-go](https://github.com/nagual2/ssh3-go); this
+            release is published as a **pre-release** while the parity audit
+            of the roadmap is still open.
+
+            The archives carry the client, the server, the license, the
+            notice, the README and the SBOM of the target. The Debian
+            package of the server is published for the linux targets.
+
+            The provenance of the binaries is attested (Sigstore, keyless):
+            `gh attestation verify <file> --repo nagual2/ssh3-rust`.
+
+            The changes are listed in [CHANGELOG.md](https://github.com/nagual2/ssh3-rust/blob/${{ needs.prepare.outputs.tag }}/CHANGELOG.md).

@@ -1,0 +1,21 @@
+# Copyright 2026 The nagual2 ssh3 Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+#!/bin/sh
+# Post installation script of the `ssh3-rust-server` package.
+#
+# The daemon is enabled but not started: it listens on port 443 by default
+# and it generates a self-signed certificate on the first start, so the
+# operator has to decide whether the service may run on this host.
+set -e
+
+case "$1" in
+  configure|1)
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl enable ssh3-rust-server.service >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0

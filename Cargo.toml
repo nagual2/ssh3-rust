@@ -15,3 +15,32 @@ resolver = "3"
 
 [patch.crates-io]
 h3 = { path = "vendor/h3" }
+
+# Release profile of the workspace.
+#
+# The binaries that ship in a release must be reproducible: two builds of the
+# same commit, on the same pinned toolchain, have to produce the same bytes.
+# The settings below give that property:
+#
+#   * `incremental = false` keeps the incremental compilation cache out of the
+#     release artifacts;
+#   * `codegen-units = 1` and `lto = "fat"` make the code generation
+#     deterministic and independent of the order in which the codegen units
+#     are compiled;
+#   * `strip = "symbols"` keeps the symbol table out of the shipped
+#     binaries (the debug information is not needed at runtime).
+#
+# The paths of the build machine are trimmed with `--remap-path-prefix` (the
+# stable spelling of the mechanism behind `-C trimpath`): the flag is not a
+# setting of a cargo profile, so the release pipeline passes it through
+# `RUSTFLAGS` (`CARGO_TARGET_<triple>_RUSTFLAGS` on the cross legs).
+#
+# The reproducibility of the archives additionally relies on a fixed
+# `SOURCE_DATE_EPOCH` (the commit time of the released tag), which the
+# release pipeline exports to every build step.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+incremental = false
+strip = "symbols"

@@ -1,0 +1,18 @@
+# Copyright 2026 The nagual2 ssh3 Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+#!/bin/sh
+# Removal script of the `ssh3-rust-server` package.
+#
+# The service is stopped and disabled before the binaries disappear, so that
+# a removal never leaves a half removed daemon behind.
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "upgrade" ]; then
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop ssh3-rust-server.service >/dev/null 2>&1 || true
+    systemctl disable ssh3-rust-server.service >/dev/null 2>&1 || true
+  fi
+fi
+
+exit 0

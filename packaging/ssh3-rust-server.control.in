@@ -1,0 +1,26 @@
+Package: ssh3-rust-server
+Version: @VERSION@-1
+Section: net
+Priority: optional
+Architecture: @ARCH@
+Maintainer: nagual2 <912140+nagual2@users.noreply.github.com>
+Installed-Size: @INSTALLED_SIZE@
+Depends: systemd, libcrypt1
+Homepage: https://github.com/nagual2/ssh3-rust
+Description: SSH3 server (Rust implementation) - SSH over QUIC/HTTP-3
+ The Rust implementation of the SSH3 server: the SSH3 protocol carried over
+ HTTP/3 (QUIC) with the RFC 9220 extended CONNECT. Public keys authenticate
+ out of the box; password login is off by default and can be turned on with
+ --enable-password-login (or with SSH3_ENABLE_PASSWORD_LOGIN=1 in
+ /etc/ssh3/ssh3-rust-server.env). The root account never authenticates by
+ password.
+ .
+ The daemon starts as root and drops to the uid/gid of the authenticated
+ user for every session. The systemd unit is installed as
+ /usr/lib/systemd/system/ssh3-rust-server.service and the instance
+ configuration as /etc/ssh3/ssh3-rust-server.env; both are shipped by this
+ package.
+ .
+ This package is the second implementation of SSH3: the shipped product is
+ the Go implementation of nagual2/ssh3-go, this Rust line is the independent
+ reference implementation of the protocol.

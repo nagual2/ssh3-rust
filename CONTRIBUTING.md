@@ -195,6 +195,90 @@ The following rules apply:
   `main`: the matrix is verified against a concrete release, and a moving
   reference turns a regression of this workspace into a moving target.
 
+## Releasing
+
+The releases of this repository are cut from the tags of `main`. The Rust line
+is the second stack of the SSH3 family — the shipped product is the Go
+implementation of [`nagual2/ssh3-go`](https://github.com/nagual2/ssh3-go) — so
+every release of this repository is published as a **pre-release** until the
+parity audit of [`ROADMAP.md`](ROADMAP.md) is closed. The promotion of a
+pre-release to a full release is a manual act (see *Promoting a release*).
+
+### 1. Prepare
+
+| № | Step | What to do |
+|---|---|---|
+| 1 | Green `main` | The seven jobs of `.github/workflows/ci.yml` (`build`, `test`, `cross-build`, `interop`, `audit`, `deny`, `shim`) have to be green on the commit that is tagged. The `deny` job is the blocking dependency gate. |
+| 2 | Version of the crates | The version of the tag has to match the version of `ssh3-client/Cargo.toml` and `ssh3-server/Cargo.toml`. The pipeline refuses a tag whose version differs from the version of the crates, so the versions are bumped in the preparation commit. |
+| 3 | Changelog | The entries of the `Unreleased` section of [`CHANGELOG.md`](CHANGELOG.md) move under the version of the release. |
+| 4 | Version of the workspace | The `[profile.release]` of the workspace (`Cargo.toml`) is the reproducible one; do not change it in a release commit. |
+
+### 2. Tag
+
+```bash
+git tag -a v0.2.0 -m "ssh3-rust 0.2.0"
+git push origin v0.2.0
+```
+
+The tag has to be an annotated tag of the form `vX.Y.Z` that points to a
+commit of `main`; the pipeline rejects any other spelling and any tag that
+does not exist in the repository. Deleting the tag and pushing it again is
+the way to restart a release that failed before the publication.
+
+### 3. What the pipeline does
+
+`.github/workflows/release.yml` runs on the tag and publishes a pre-release
+with the following jobs:
+
+| Job | What it does | Output |
+|---|---|---|
+| `prepare` | Resolves the version and the commit time of the tag (`SOURCE_DATE_EPOCH`), checks the version against the crates | The version and the epoch for the other jobs |
+| `build` | Builds the client and the server for the five targets of the matrix (linux x86_64 and aarch64, windows x86_64, macOS x86_64 and aarch64), checks the architecture of the binaries, runs `--version` and `--help` on the binaries of the native legs, generates the SBOM and builds the reproducible archive | One archive, one SBOM and one checksum file per target |
+| `deb` | Builds the Debian package of the server from the published linux binaries (the unit of `packaging/ssh3-rust-server.service`, the environment file, the binary, the license and the README) | `ssh3-rust-server_<version>-1_<arch>.deb` for amd64 and arm64 |
+| `verify` | Verifies the checksums, runs the published linux binaries, inspects the content of the Debian packages and the SBOMs | Nothing is published if a check fails |
+| `attest` | Publishes the build provenance of the artifacts (Sigstore, keyless, GitHub OIDC) | The attestation of the release |
+| `release` | Computes `checksums.txt` over every published file and publishes the release with `softprops/action-gh-release` | The GitHub release (a pre-release) |
+
+The linux aarch64 artifacts are cross compiled on the x86_64 runner, the
+macOS x86_64 artifacts are cross compiled on the arm64 runner.
+
+### 4. What to expect from the CI
+
+| № | Expectation | Reaction |
+|---|---|---|
+| 1 | The `build` job takes the longest (the fat LTO of the release profile) | Nothing, it is normal |
+| 2 | The `prepare` job fails when the version of the tag does not match the version of the crates | Bump the versions of the crates, delete the tag, tag again |
+| 3 | A cross leg fails when the toolchain of the target is not installed on the runner | The `build` job installs the cross toolchain; check the log of the leg before touching the pipeline |
+| 4 | The release is published as a pre-release | This is the intended state of the Rust line |
+| 5 | The first release of a new target combination is a rehearsal | Check the artifacts locally before announcing the release |
+
+### 5. Signing and verification
+
+The artifacts are not signed with a GPG key: the provenance is attested with
+the keyless Sigstore flow of GitHub, so there is no key material in the
+repository and no secret to rotate. The verification of a downloaded file is:
+
+```bash
+gh attestation verify ssh3-rust_0.2.0_linux_x86_64.tar.gz --repo nagual2/ssh3-rust
+sha256sum --check checksums.txt
+```
+
+### 6. Rollback
+
+| № | Situation | What to do |
+|---|---|---|
+| 1 | The pipeline failed before the publication | Fix the cause, delete the tag (`git push --delete origin v0.2.0`), tag again |
+| 2 | The release is published, but a file is wrong | Delete the release and the tag, tag a new patch version (`v0.2.1`): a published release is not replaced, the tag stays in the history |
+| 3 | The release is published and must not be visible | Mark the release as a draft in the GitHub UI (it disappears from the release page, the tag stays) |
+| 4 | The Debian package is broken | Delete the `.deb` from the release, publish a new patch version; the packages that were already installed are updated with `apt install ./ssh3-rust-server_<version>-1_<arch>.deb` |
+
+### Promoting a release
+
+When the audit of the roadmap is closed, a pre-release is promoted in the
+GitHub UI: *Edit release* → uncheck *Set as a pre-release* and drop the
+"second stack" paragraph from the description. The pipeline itself always
+publishes pre-releases.
+
 ## Style
 
 - Rust: `cargo fmt --all` and `cargo clippy --workspace --all-targets` must be
