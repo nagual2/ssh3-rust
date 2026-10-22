@@ -6,9 +6,12 @@ use clap::{ArgGroup, CommandFactory, Parser, ValueHint, error::ErrorKind};
 use http::Uri;
 use ssh3_client::{
     DEFAULT_HANDSHAKE_IDLE_TIMEOUT, DEFAULT_MAX_IDLE_TIMEOUT, Ssh3AgentSelection, Ssh3ClientConfig,
-    Ssh3ClientError, Ssh3LocalForwardSpec, Ssh3OidcConfig, Ssh3PtyPolicy, Ssh3SessionRequest,
-    Ssh3TrustStrategy, exit_code_for_exit_signal, load_certificates, parse_duration,
-    parse_escape_char, parse_local_forward_spec, run_session_stdio,
+    Ssh3ClientError, Ssh3DynamicForwardSpec, Ssh3KnownHostsTrust, Ssh3LocalForwardSpec,
+    Ssh3OidcConfig, Ssh3PtyPolicy, Ssh3ReverseForwardSpec, Ssh3SessionRequest,
+    Ssh3StrictHostKeyChecking, Ssh3TrustStrategy, default_known_hosts_path,
+    default_ssh_config_path, exit_code_for_exit_signal, load_certificates, load_ssh_config,
+    parse_duration, parse_dynamic_forward_spec, parse_escape_char, parse_local_forward_spec,
+    parse_reverse_forward_spec, resolve_strict_host_key_checking, run_session_stdio,
 };
 
 #[derive(Debug, Parser)]
@@ -145,13 +148,38 @@ struct Cli {
     #[arg(short = 'T', conflicts_with = "force_pty")]
     no_pty: bool,
 
-    /// Set an option: RequestTTY=auto|yes|no|force, Term=<type>, EscapeChar=<char>.
+    /// Set an option: RequestTTY=auto|yes|no|force, Term=<type>, EscapeChar=<char>,
+    /// StrictHostKeyChecking=ask|yes|accept-new|no.
     #[arg(short = 'o', value_name = "KEY=VALUE")]
     option: Vec<String>,
+
+    /// The policy of the known_hosts check: ask, yes, accept-new or no.
+    ///
+    /// The flag wins over the `-o StrictHostKeyChecking` option, which wins
+    /// over the keyword of the same name of the ssh_config file.
+    #[arg(long = "strict-host-key-checking", value_name = "VALUE")]
+    strict_host_key_checking: Option<String>,
+
+    /// The known_hosts file that pins the certificates of the servers.
+    #[arg(long = "known-hosts", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    known_hosts: Option<PathBuf>,
+
+    /// The ssh_config file of the user.
+    #[arg(long = "ssh-config", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    ssh_config: Option<PathBuf>,
 
     /// Forward a local port to the remote host: [bind_address:]port:host:hostport.
     #[arg(short = 'L', value_name = "SPEC")]
     local_forward: Vec<String>,
+
+    /// Ask the server to bind a port and forward it to a local target:
+    /// [bind_address:]bind_port[/udp]:target_host:target_port.
+    #[arg(short = 'R', value_name = "SPEC")]
+    reverse_forward: Vec<String>,
+
+    /// Forward a local SOCKS5 proxy to the remote host: [bind_address:]port.
+    #[arg(short = 'D', value_name = "SPEC")]
+    dynamic_forward: Vec<String>,
 
     /// The timeout of the QUIC handshake.
     #[arg(long, value_name = "DURATION")]
@@ -175,6 +203,7 @@ struct OptionOverrides {
     request_tty: Option<Ssh3PtyPolicy>,
     term: Option<String>,
     escape_char: Option<u8>,
+    strict_host_key_checking: Option<String>,
 }
 
 /// Parses the `-o KEY=VALUE` options.
@@ -210,6 +239,13 @@ fn parse_options(options: &[String]) -> Result<OptionOverrides, clap::Error> {
                     parse_escape_char(&value)
                         .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))?,
                 );
+            }
+            "stricthostkeychecking" => {
+                // The value is checked right away: a typo must cost a process
+                // start and nothing else.
+                Ssh3StrictHostKeyChecking::parse(&value)
+                    .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))?;
+                overrides.strict_host_key_checking = Some(value);
             }
             other => {
                 return Err(cli_error(
@@ -262,6 +298,40 @@ fn read_secret_file(path: &Path, label: &str) -> Result<String, clap::Error> {
         .map_err(|err| cli_error(ErrorKind::Io, format!("failed to read {label}: {err}")))
 }
 
+/// The value of the `StrictHostKeyChecking` keyword of the ssh_config file.
+///
+/// The file of the user is read when the caller does not name another one,
+/// and the keyword of the block that matches the host is the value of the
+/// configuration.
+fn ssh_config_strict_host_key_checking(
+    path: Option<&Path>,
+    host: Option<&str>,
+) -> Result<Option<String>, clap::Error> {
+    let default_path;
+    let path = match path {
+        Some(path) => path,
+        None => {
+            default_path = default_ssh_config_path();
+            match default_path.as_deref() {
+                Some(path) => path,
+                None => return Ok(None),
+            }
+        }
+    };
+    let configuration = load_ssh_config(path).map_err(|err| {
+        cli_error(
+            ErrorKind::Io,
+            format!("failed to read {}: {err}", path.display()),
+        )
+    })?;
+    let Some(host) = host else {
+        return Ok(None);
+    };
+    Ok(configuration
+        .get(host, "StrictHostKeyChecking")
+        .map(str::to_string))
+}
+
 fn build_config(cli: Cli) -> Result<(Ssh3ClientConfig, Ssh3SessionRequest), clap::Error> {
     let mut config = Ssh3ClientConfig::new(cli.url);
     config.server_name = cli.server_name;
@@ -301,20 +371,53 @@ fn build_config(cli: Cli) -> Result<(Ssh3ClientConfig, Ssh3SessionRequest), clap
         (None, None) => None,
         (Some(_), None) | (None, Some(_)) => unreachable!("clap enforces OIDC requirements"),
     };
-    config.trust = if cli.insecure {
-        Ssh3TrustStrategy::Insecure
-    } else if let Some(path) = cli.ca_cert {
-        Ssh3TrustStrategy::Certificates(load_certificates(&path).map_err(|err| {
+    let overrides = parse_options(&cli.option)?;
+
+    // The certificate authorities the server chain may be verified against.
+    let authorities = match cli.ca_cert.as_ref() {
+        Some(path) => load_certificates(path).map_err(|err| {
             cli_error(
                 ErrorKind::ValueValidation,
                 format!("failed to load CA certificate: {err}"),
             )
-        })?)
+        })?,
+        None => Vec::new(),
+    };
+
+    // The StrictHostKeyChecking policy is resolved like OpenSSH does: the
+    // flag wins over the `-o` option, which wins over the keyword of the
+    // ssh_config file. The known_hosts check only runs when one of the
+    // sources sets the policy, so that the default behaviour of the client
+    // stays the one it had before.
+    let ssh_config_policy =
+        ssh_config_strict_host_key_checking(cli.ssh_config.as_deref(), config.target_url.host())?;
+    let policy = resolve_strict_host_key_checking(
+        cli.strict_host_key_checking.as_deref(),
+        overrides.strict_host_key_checking.as_deref(),
+        ssh_config_policy.as_deref(),
+    )
+    .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))?;
+    let policy_is_set = cli.strict_host_key_checking.is_some()
+        || overrides.strict_host_key_checking.is_some()
+        || ssh_config_policy.is_some();
+
+    config.trust = if cli.insecure {
+        Ssh3TrustStrategy::Insecure
+    } else if policy_is_set {
+        Ssh3TrustStrategy::KnownHosts(Ssh3KnownHostsTrust {
+            policy,
+            path: cli
+                .known_hosts
+                .clone()
+                .or_else(default_known_hosts_path)
+                .unwrap_or_else(|| PathBuf::from(".ssh3").join("known_hosts")),
+            authorities,
+        })
+    } else if !authorities.is_empty() {
+        Ssh3TrustStrategy::Certificates(authorities)
     } else {
         Ssh3TrustStrategy::WebPkiRoots
     };
-
-    let overrides = parse_options(&cli.option)?;
 
     // The RequestTTY precedence follows OpenSSH: the `-T` and `-t` flags are
     // the absolutes, the `-o RequestTTY=` option comes next and `auto` is the
@@ -339,6 +442,24 @@ fn build_config(cli: Cli) -> Result<(Ssh3ClientConfig, Ssh3SessionRequest), clap
                 .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))
         })
         .collect::<Result<Vec<Ssh3LocalForwardSpec>, clap::Error>>()?;
+
+    config.reverse_forwards = cli
+        .reverse_forward
+        .iter()
+        .map(|spec| {
+            parse_reverse_forward_spec(spec)
+                .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))
+        })
+        .collect::<Result<Vec<Ssh3ReverseForwardSpec>, clap::Error>>()?;
+
+    config.dynamic_forwards = cli
+        .dynamic_forward
+        .iter()
+        .map(|spec| {
+            parse_dynamic_forward_spec(spec)
+                .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))
+        })
+        .collect::<Result<Vec<Ssh3DynamicForwardSpec>, clap::Error>>()?;
 
     config.handshake_idle_timeout = resolve_timeout(
         cli.handshake_idle_timeout.as_deref(),
@@ -396,7 +517,10 @@ async fn main() -> ExitCode {
 mod tests {
     use super::{Cli, build_config};
     use clap::{Parser, error::ErrorKind};
-    use ssh3_client::{Ssh3ForwardProtocol, Ssh3PtyPolicy};
+    use ssh3_client::{
+        Ssh3ForwardProtocol, Ssh3PtyPolicy, Ssh3ReverseForwardProtocol, Ssh3StrictHostKeyChecking,
+        Ssh3TrustStrategy,
+    };
     use std::time::Duration;
 
     fn config_of(arguments: &[&str]) -> ssh3_client::Ssh3ClientConfig {
@@ -405,6 +529,14 @@ mod tests {
         argv.push("https://localhost:4433/ssh3-term");
         let cli = Cli::try_parse_from(argv).unwrap();
         build_config(cli).unwrap().0
+    }
+
+    /// The policy of the known_hosts check of a configuration.
+    fn policy_of(config: &ssh3_client::Ssh3ClientConfig) -> Option<Ssh3StrictHostKeyChecking> {
+        match &config.trust {
+            Ssh3TrustStrategy::KnownHosts(trust) => Some(trust.policy),
+            _ => None,
+        }
     }
 
     #[test]
@@ -480,6 +612,82 @@ mod tests {
             "ssh3-rust-client",
             "-L",
             "8080",
+            "https://localhost:4433/ssh3-term",
+        ])
+        .unwrap();
+        let err = build_config(err).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_reverse_forwards_are_parsed() {
+        let config = config_of(&[
+            "-R",
+            "8080:example.com:80",
+            "-R",
+            "127.0.0.1:8081/udp:example.com:53",
+            "-R",
+            "*:0:[2001:db8::1]:443",
+        ]);
+        assert_eq!(config.reverse_forwards.len(), 3);
+        assert_eq!(config.reverse_forwards[0].bind_port, 8080);
+        assert_eq!(config.reverse_forwards[0].target_host, "example.com");
+        assert_eq!(config.reverse_forwards[0].target_port, 80);
+        assert_eq!(
+            config.reverse_forwards[0].protocol,
+            Ssh3ReverseForwardProtocol::Tcp
+        );
+        assert_eq!(
+            config.reverse_forwards[1].bind_address.as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            config.reverse_forwards[1].protocol,
+            Ssh3ReverseForwardProtocol::Udp
+        );
+        assert_eq!(
+            config.reverse_forwards[2].bind_address.as_deref(),
+            Some("*")
+        );
+        assert_eq!(config.reverse_forwards[2].target_host, "2001:db8::1");
+    }
+
+    #[test]
+    fn a_malformed_reverse_forward_is_refused() {
+        let err = Cli::try_parse_from([
+            "ssh3-rust-client",
+            "-R",
+            "8080",
+            "https://localhost:4433/ssh3-term",
+        ])
+        .unwrap();
+        let err = build_config(err).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn the_dynamic_forwards_are_parsed() {
+        let config = config_of(&["-D", "1080", "-D", "*:1081", "-D", "[::1]:1082"]);
+        assert_eq!(config.dynamic_forwards.len(), 3);
+        assert_eq!(config.dynamic_forwards[0].bind_address, None);
+        assert_eq!(config.dynamic_forwards[0].bind_port, 1080);
+        assert_eq!(
+            config.dynamic_forwards[1].bind_address.as_deref(),
+            Some("*")
+        );
+        assert_eq!(
+            config.dynamic_forwards[2].bind_address.as_deref(),
+            Some("::1")
+        );
+        assert_eq!(config.dynamic_forwards[2].bind_port, 1082);
+    }
+
+    #[test]
+    fn a_malformed_dynamic_forward_is_refused() {
+        let err = Cli::try_parse_from([
+            "ssh3-rust-client",
+            "-D",
+            "::1:1080",
             "https://localhost:4433/ssh3-term",
         ])
         .unwrap();
@@ -590,5 +798,87 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn the_known_hosts_check_is_off_until_a_policy_is_set() {
+        let config = config_of(&[]);
+        assert!(matches!(config.trust, Ssh3TrustStrategy::WebPkiRoots));
+        assert_eq!(policy_of(&config), None);
+    }
+
+    #[test]
+    fn the_strict_host_key_checking_option_enables_the_known_hosts_check() {
+        let config = config_of(&["-o", "StrictHostKeyChecking=accept-new"]);
+        assert_eq!(
+            policy_of(&config),
+            Some(Ssh3StrictHostKeyChecking::AcceptNew)
+        );
+        match &config.trust {
+            Ssh3TrustStrategy::KnownHosts(trust) => {
+                assert!(trust.path.ends_with("known_hosts"));
+            }
+            other => panic!("the known_hosts check was expected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_strict_host_key_checking_flag_wins_over_the_option() {
+        let config = config_of(&[
+            "--strict-host-key-checking",
+            "yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+        ]);
+        assert_eq!(policy_of(&config), Some(Ssh3StrictHostKeyChecking::Yes));
+    }
+
+    #[test]
+    fn the_ssh_config_keyword_sets_the_policy() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config");
+        std::fs::write(
+            &path,
+            "Host localhost\n  StrictHostKeyChecking accept-new\n",
+        )
+        .unwrap();
+
+        let config = config_of(&["--ssh-config", path.to_str().unwrap()]);
+        assert_eq!(
+            policy_of(&config),
+            Some(Ssh3StrictHostKeyChecking::AcceptNew)
+        );
+    }
+
+    #[test]
+    fn the_option_wins_over_the_ssh_config_keyword() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config");
+        std::fs::write(
+            &path,
+            "Host localhost\n  StrictHostKeyChecking accept-new\n",
+        )
+        .unwrap();
+
+        let config = config_of(&[
+            "--ssh-config",
+            path.to_str().unwrap(),
+            "-o",
+            "StrictHostKeyChecking=no",
+        ]);
+        assert_eq!(policy_of(&config), Some(Ssh3StrictHostKeyChecking::No));
+    }
+
+    #[test]
+    fn an_invalid_strict_host_key_checking_value_is_refused() {
+        let err = Cli::try_parse_from([
+            "ssh3-rust-client",
+            "-o",
+            "StrictHostKeyChecking=maybe",
+            "https://localhost:4433/ssh3-term",
+        ])
+        .unwrap();
+        let err = build_config(err).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
     }
 }

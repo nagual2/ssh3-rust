@@ -43,22 +43,46 @@ use ssh3_quinn::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
-use tokio::net::UnixStream;
-#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use url::Url;
 
 mod agent;
 mod duration;
+mod dynamic;
 mod escape;
 mod forward;
+mod forwarding_wire;
+mod host_key;
+mod incoming;
+mod known_hosts;
+mod reverse;
+mod ssh_config;
+mod strict_host_key;
 
 pub use agent::Ssh3AgentSelection;
 use agent::{build_agent_bearer_token, resolve_agent_socket_path};
 pub use duration::{Ssh3DurationError, parse_duration};
+pub use dynamic::{
+    Ssh3DynamicForwardParseError, Ssh3DynamicForwardSpec, parse_dynamic_forward_spec,
+};
 pub use escape::{Ssh3EscapeAction, Ssh3EscapeCharError, Ssh3EscapeFilter, parse_escape_char};
 pub use forward::{
     Ssh3ForwardParseError, Ssh3ForwardProtocol, Ssh3LocalForwardSpec, parse_local_forward_spec,
+};
+pub use host_key::{Ssh3HostKeyPromptError, Ssh3KnownHostsTrust};
+pub use known_hosts::{
+    HostCertificateStatus, KnownHosts, Ssh3KnownHostsError, append_known_host, canonical_host_key,
+    certificate_fingerprint, default_known_hosts_path,
+};
+use reverse::{Ssh3ResolvedReverseForward, Ssh3ReverseForwardHandle};
+pub use reverse::{
+    Ssh3ReverseForwardParseError, Ssh3ReverseForwardProtocol, Ssh3ReverseForwardSpec,
+    parse_reverse_forward_spec,
+};
+pub use ssh_config::{SshConfig, default_ssh_config_path, load_ssh_config};
+pub use strict_host_key::{
+    HostKeyContext, HostKeyDecision, HostKeyOutcome, Ssh3StrictHostKeyChecking,
+    Ssh3StrictHostKeyCheckingError, decide_host_key, resolve_strict_host_key_checking,
 };
 
 const DEFAULT_USER_AGENT: &str = SSH3_VERSION_STRING;
@@ -94,11 +118,23 @@ const DEFAULT_PTY_ROWS: u16 = 24;
 /// local environment provides one.
 const DEFAULT_TERM_TYPE: &str = "xterm-256color";
 
+/// The trust the client has in the certificate of the server.
 #[derive(Clone, Debug)]
 pub enum Ssh3TrustStrategy {
+    /// The certificate of the server is verified against the built-in roots
+    /// of the certificate authorities.
     WebPkiRoots,
+    /// The certificate of the server is verified against the given
+    /// certificate authorities.
     Certificates(Vec<CertificateDer<'static>>),
+    /// The certificate of the server is not verified at all.
     Insecure,
+    /// The certificate of the server is pinned in the known_hosts file.
+    ///
+    /// The certificate the server presents is compared with the certificates
+    /// pinned for the host, and the `StrictHostKeyChecking` policy of the
+    /// trust decides what happens when they do not match.
+    KnownHosts(Ssh3KnownHostsTrust),
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +177,10 @@ pub struct Ssh3ClientConfig {
     pub keep_alive_interval: Option<Duration>,
     /// The local forwards (`-L`) the session opens.
     pub local_forwards: Vec<Ssh3LocalForwardSpec>,
+    /// The reverse forwards (`-R`) the session requests.
+    pub reverse_forwards: Vec<Ssh3ReverseForwardSpec>,
+    /// The dynamic forwards (`-D`) the session opens.
+    pub dynamic_forwards: Vec<Ssh3DynamicForwardSpec>,
 }
 
 impl Ssh3ClientConfig {
@@ -167,6 +207,8 @@ impl Ssh3ClientConfig {
             max_idle_timeout: DEFAULT_MAX_IDLE_TIMEOUT,
             keep_alive_interval: Some(DEFAULT_KEEP_ALIVE_INTERVAL),
             local_forwards: Vec::new(),
+            reverse_forwards: Vec::new(),
+            dynamic_forwards: Vec::new(),
         }
     }
 }
@@ -440,6 +482,33 @@ pub enum Ssh3ClientError {
     ExitSignal(Ssh3ExitSignalRequest),
     /// The QUIC handshake did not finish within the handshake timeout.
     HandshakeTimeout(Duration),
+    /// The certificate of the server was refused by the known_hosts check.
+    HostKeyRejected(String),
+    /// The known_hosts file could not be read or written.
+    KnownHosts(Ssh3KnownHostsError),
+    /// The server refused a reverse forwarding request.
+    ReverseForwardRefused {
+        /// The specification of the refused forward.
+        spec: String,
+        /// The reason the server gave.
+        reason: String,
+    },
+    /// The server refused a dynamic forwarding request.
+    DynamicForwardRefused {
+        /// The specification of the refused forward.
+        spec: String,
+        /// The reason the server gave.
+        reason: String,
+    },
+    /// The server could not dial the target of a dynamic forwarding request.
+    DynamicForwardDial {
+        /// The target the server was asked to dial.
+        target: String,
+        /// The reason the server gave.
+        reason: String,
+    },
+    /// A forwarding payload of the peer could not be decoded.
+    ForwardingProtocol(String),
 }
 
 impl fmt::Display for Ssh3ClientError {
@@ -493,6 +562,24 @@ impl fmt::Display for Ssh3ClientError {
             Self::HandshakeTimeout(timeout) => {
                 write!(f, "the QUIC handshake timed out after {timeout:?}")
             }
+            Self::HostKeyRejected(message) => write!(f, "{message}"),
+            Self::KnownHosts(err) => write!(f, "{err}"),
+            Self::ReverseForwardRefused { spec, reason } => {
+                write!(
+                    f,
+                    "the server refused the reverse forwarding {spec}: {reason}"
+                )
+            }
+            Self::DynamicForwardRefused { spec, reason } => {
+                write!(
+                    f,
+                    "the server refused the dynamic forwarding {spec}: {reason}"
+                )
+            }
+            Self::DynamicForwardDial { target, reason } => {
+                write!(f, "could not reach {target} through the server: {reason}")
+            }
+            Self::ForwardingProtocol(message) => write!(f, "{message}"),
         }
     }
 }
@@ -527,6 +614,12 @@ impl std::error::Error for Ssh3ClientError {
             Self::ConflictingAuthenticationMethods => None,
             Self::ExitSignal(_) => None,
             Self::HandshakeTimeout(_) => None,
+            Self::HostKeyRejected(_) => None,
+            Self::KnownHosts(err) => Some(err),
+            Self::ReverseForwardRefused { .. } => None,
+            Self::DynamicForwardRefused { .. } => None,
+            Self::DynamicForwardDial { .. } => None,
+            Self::ForwardingProtocol(_) => None,
         }
     }
 }
@@ -656,6 +749,17 @@ struct ActiveClient {
     driver_task: tokio::task::JoinHandle<()>,
     incoming_channels_task: tokio::task::JoinHandle<()>,
     incoming_datagrams_task: tokio::task::JoinHandle<()>,
+    dispatcher_task: tokio::task::JoinHandle<()>,
+    /// The reverse forwards the client requested.
+    ///
+    /// The dispatcher of the server-initiated channels checks the target of
+    /// every forwarded channel against this list.
+    reverse_forwards: Arc<std::sync::RwLock<Vec<Ssh3ResolvedReverseForward>>>,
+    /// The control channels of the reverse and dynamic forwards.
+    ///
+    /// They stay open for the whole session: the lifetime of a forward is the
+    /// lifetime of its control channel.
+    forward_control_channels: std::sync::Mutex<Vec<Arc<Ssh3Channel>>>,
     server_header: Option<String>,
     max_packet_size: u64,
     default_datagrams_queue_size: usize,
@@ -667,6 +771,7 @@ impl ActiveClient {
         let _ = self.driver_task.await;
         let _ = self.incoming_channels_task.await;
         let _ = self.incoming_datagrams_task.await;
+        let _ = self.dispatcher_task.await;
         self.endpoint.wait_idle().await;
     }
 
@@ -894,7 +999,7 @@ fn spawn_signal_forwarders(_channel: Arc<Ssh3Channel>) -> Vec<tokio::task::JoinH
 }
 
 fn build_session_runtime(
-    client: &ActiveClient,
+    _client: &ActiveClient,
     config: &Ssh3ClientConfig,
     channel: Arc<Ssh3Channel>,
     pty: Option<&PtySpec>,
@@ -920,11 +1025,11 @@ fn build_session_runtime(
     }
 
     if config.forward_agent {
+        // The agent connections are served by the dispatcher of the
+        // server-initiated channels; the socket is resolved here so that a
+        // missing agent is reported before the session starts.
         #[cfg(unix)]
-        runtime.background_tasks.push(spawn_agent_forwarder(
-            client.conversation.clone(),
-            resolve_agent_socket_path(config)?,
-        ));
+        let _ = resolve_agent_socket_path(config)?;
 
         #[cfg(not(unix))]
         return Err(Ssh3ClientError::AgentUnavailable);
@@ -954,6 +1059,121 @@ async fn start_local_forwards(
         tasks.push(task);
     }
     Ok(tasks)
+}
+
+/// Requests the reverse forwards (`-R`) of the configuration.
+///
+/// The targets are resolved on the client, like OpenSSH resolves the `-R`
+/// target on the machine where the client runs, and every forward gets its
+/// own control channel: the server answers with the port it bound.
+async fn start_reverse_forwards(
+    client: &ActiveClient,
+    config: &Ssh3ClientConfig,
+) -> Result<Vec<Ssh3ReverseForwardHandle>, Ssh3ClientError> {
+    let mut handles = Vec::new();
+    for spec in &config.reverse_forwards {
+        let resolved = reverse::resolve_reverse_forward(spec).await?;
+        let (bound_port, control_channel) = reverse::request_reverse_forward(
+            client.conversation.as_ref(),
+            &client.connection,
+            &resolved,
+            config.max_packet_size,
+            config.default_datagrams_queue_size,
+        )
+        .await?;
+        if bound_port == spec.bind_port {
+            eprintln!("ssh3-rust-client server bound -R {}", spec.spec_string());
+        } else {
+            eprintln!(
+                "ssh3-rust-client server bound -R {} on ephemeral port {bound_port}",
+                spec.spec_string()
+            );
+        }
+        client
+            .forward_control_channels
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(control_channel);
+        handles.push(Ssh3ReverseForwardHandle {
+            forward: resolved,
+            bound_port,
+        });
+    }
+
+    // The dispatcher of the server-initiated channels checks the target of
+    // every forwarded channel against this list: only the targets the client
+    // asked for may be bridged.
+    let registered: Vec<Ssh3ResolvedReverseForward> = handles
+        .iter()
+        .map(|handle| handle.forward.clone())
+        .collect();
+    let mut guard = client
+        .reverse_forwards
+        .write()
+        .unwrap_or_else(|error| error.into_inner());
+    *guard = registered;
+    Ok(handles)
+}
+
+/// Opens the local SOCKS listeners of the `-D` forwards of the configuration.
+///
+/// Every listener is announced to the server on its own control channel, and
+/// every connection it accepts is dialed by the server.
+async fn start_dynamic_forwards(
+    client: &ActiveClient,
+    config: &Ssh3ClientConfig,
+) -> Result<dynamic::Ssh3DynamicForwards, Ssh3ClientError> {
+    let mut handles = Vec::new();
+    let mut tasks = Vec::new();
+    for spec in &config.dynamic_forwards {
+        let (listener, control_channel) = dynamic::start_dynamic_forward(
+            client.conversation.as_ref(),
+            &client.connection,
+            spec,
+            config.max_packet_size,
+            config.default_datagrams_queue_size,
+        )
+        .await?;
+        let listen_addr = listener
+            .local_addr()
+            .map_err(Ssh3ClientError::Io)
+            .unwrap_or_else(|_| {
+                SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    spec.bind_port,
+                )
+            });
+        eprintln!(
+            "ssh3-rust-client dynamic port forwarding: SOCKS5 proxy listening on {listen_addr}"
+        );
+        client
+            .forward_control_channels
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(control_channel);
+        handles.push(dynamic::Ssh3DynamicForwardHandle {
+            spec: spec.clone(),
+            listen_addr,
+        });
+
+        let conversation = client.conversation.clone();
+        let connection = client.connection.clone();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                let (stream, _peer) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(_) => return,
+                };
+                let conversation = conversation.clone();
+                let connection = connection.clone();
+                tokio::spawn(async move {
+                    dynamic::serve_socks5_connection(conversation.as_ref(), &connection, stream)
+                        .await;
+                });
+            }
+        }));
+    }
+    Ok(dynamic::Ssh3DynamicForwards { handles, tasks })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1239,8 +1459,8 @@ fn activate_client(
     send_request: Ssh3SendRequest,
     driver_task: tokio::task::JoinHandle<()>,
     established: Ssh3EstablishedClientConversation,
-    max_packet_size: u64,
-    default_datagrams_queue_size: usize,
+    config: &Ssh3ClientConfig,
+    agent_socket: Option<PathBuf>,
 ) -> ActiveClient {
     let channel_router = Arc::new(Ssh3IncomingChannelRouter::new());
     channel_router.register_conversation(established.conversation.clone());
@@ -1282,6 +1502,27 @@ fn activate_client(
         }
     });
 
+    // The channels the server opens towards the client are dispatched by a
+    // single task: the reverse forwarding bridges and the agent connections
+    // share the queue of the conversation, so two consumers would steal the
+    // channels of each other.
+    let reverse_forwards = Arc::new(std::sync::RwLock::new(Vec::new()));
+    let dispatcher_task = tokio::spawn({
+        let conversation = established.conversation.clone();
+        let connection = connection.clone();
+        let reverse_forwards = reverse_forwards.clone();
+        async move {
+            incoming::IncomingChannels::new(
+                conversation,
+                connection,
+                reverse_forwards,
+                agent_socket,
+            )
+            .run()
+            .await;
+        }
+    });
+
     ActiveClient {
         endpoint,
         connection,
@@ -1291,9 +1532,12 @@ fn activate_client(
         driver_task,
         incoming_channels_task,
         incoming_datagrams_task,
+        dispatcher_task,
+        reverse_forwards,
+        forward_control_channels: std::sync::Mutex::new(Vec::new()),
         server_header: response_server_header(&established.response).map(str::to_owned),
-        max_packet_size,
-        default_datagrams_queue_size,
+        max_packet_size: config.max_packet_size,
+        default_datagrams_queue_size: config.default_datagrams_queue_size,
     }
 }
 
@@ -1352,17 +1596,42 @@ async fn connect_client_with_browser_opener(
     let resolved = resolve_target(&config.target_url, config.server_name.as_deref()).await?;
     let bind_addr = client_bind_addr(resolved.remote_addr);
     let mut endpoint = Endpoint::client(bind_addr).map_err(Ssh3ClientError::Endpoint)?;
-    endpoint.set_default_client_config(client_quinn_config(config)?);
+    let (quinn_config, host_key_state) = client_quinn_config(config)?;
+    endpoint.set_default_client_config(quinn_config);
 
-    let connection = tokio::time::timeout(
+    let connection = match tokio::time::timeout(
         config.handshake_idle_timeout,
         endpoint
             .connect(resolved.remote_addr, &resolved.server_name)
             .map_err(Ssh3ClientError::Connect)?,
     )
     .await
-    .map_err(|_| Ssh3ClientError::HandshakeTimeout(config.handshake_idle_timeout))?
-    .map_err(Ssh3ClientError::Connection)?;
+    {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(err)) => {
+            // The known_hosts check refuses the certificate during the
+            // handshake: the reason of the refusal is more precise than the
+            // transport error of the handshake.
+            if let Some(message) = host_key_state.as_ref().and_then(|state| state.refusal()) {
+                return Err(Ssh3ClientError::HostKeyRejected(message));
+            }
+            return Err(Ssh3ClientError::Connection(err));
+        }
+        Err(_) => {
+            return Err(Ssh3ClientError::HandshakeTimeout(
+                config.handshake_idle_timeout,
+            ));
+        }
+    };
+
+    // The certificate the handshake accepted is pinned once the connection is
+    // established: the pin is only useful for the next session.
+    if let Some(state) = host_key_state.as_ref()
+        && let Some(certificate) = state.take_to_pin()
+    {
+        known_hosts::append_known_host(&state.path(), &state.host(), &certificate)
+            .map_err(Ssh3ClientError::KnownHosts)?;
+    }
 
     let (mut driver, mut send_request) = new_client(connection.clone()).await?;
     let driver_task = tokio::spawn(async move {
@@ -1429,32 +1698,75 @@ async fn connect_client_with_browser_opener(
         config.default_datagrams_queue_size,
     )
     .await?;
-    driver_task.abort();
+    // The HTTP/3 driver stays alive for the whole session: its control
+    // stream carries the SETTINGS frame, and a peer that sees it closed
+    // treats the connection as broken (H3_CLOSED_CRITICAL_STREAM). The
+    // driver never accepts a bidirectional stream (the vendored h3 shim
+    // leaves them to the SSH3 layer), so it does not steal the channels the
+    // server opens towards the client.
+    //
+    // The socket of the agent is resolved before the dispatcher starts: the
+    // agent connections are served by the dispatcher of the channels the
+    // server opens towards the client.
+    let agent_socket = if config.forward_agent {
+        resolve_agent_socket_path(config).ok()
+    } else {
+        None
+    };
     Ok(activate_client(
         endpoint,
         connection,
         send_request,
         driver_task,
         established,
-        config.max_packet_size,
-        config.default_datagrams_queue_size,
+        config,
+        agent_socket,
     ))
 }
 
-fn client_quinn_config(config: &Ssh3ClientConfig) -> Result<quinn::ClientConfig, Ssh3ClientError> {
-    let mut client_config = match &config.trust {
-        Ssh3TrustStrategy::WebPkiRoots => {
-            client_config_with_webpki_roots().map_err(Ssh3ClientError::from)?
-        }
+fn client_quinn_config(
+    config: &Ssh3ClientConfig,
+) -> Result<(quinn::ClientConfig, Option<Arc<host_key::HostKeyState>>), Ssh3ClientError> {
+    let (mut client_config, host_key_state) = match &config.trust {
+        Ssh3TrustStrategy::WebPkiRoots => (
+            client_config_with_webpki_roots().map_err(Ssh3ClientError::from)?,
+            None,
+        ),
         Ssh3TrustStrategy::Certificates(certificates) => {
             let mut roots = RootCertStore::empty();
             let (added, _) = roots.add_parsable_certificates(certificates.iter().cloned());
             if added == 0 {
                 return Err(Ssh3ClientError::InvalidCertificateBundle);
             }
-            client_config_with_roots(roots).map_err(Ssh3ClientError::from)?
+            (
+                client_config_with_roots(roots).map_err(Ssh3ClientError::from)?,
+                None,
+            )
         }
-        Ssh3TrustStrategy::Insecure => client_config_insecure().map_err(Ssh3ClientError::from)?,
+        Ssh3TrustStrategy::Insecure => (
+            client_config_insecure().map_err(Ssh3ClientError::from)?,
+            None,
+        ),
+        Ssh3TrustStrategy::KnownHosts(trust) => {
+            let host =
+                canonical_host_key(&config.target_url).ok_or(Ssh3ClientError::MissingHost)?;
+            let (known_hosts, invalid_lines) =
+                KnownHosts::load(&trust.path).map_err(Ssh3ClientError::KnownHosts)?;
+            for line in invalid_lines {
+                eprintln!(
+                    "ssh3-rust-client: invalid known host line {} of {}",
+                    line + 1,
+                    trust.path.display()
+                );
+            }
+            let state = Arc::new(host_key::HostKeyState::new(
+                host,
+                trust.path.clone(),
+                known_hosts,
+            ));
+            let client_config = host_key::known_hosts_client_config(trust, state.clone())?;
+            (client_config, Some(state))
+        }
     };
 
     // The idle timeout of the ssh2 canon is an idle session that is never
@@ -1472,7 +1784,7 @@ fn client_quinn_config(config: &Ssh3ClientConfig) -> Result<quinn::ClientConfig,
     transport.keep_alive_interval(config.keep_alive_interval);
     client_config.transport_config(Arc::new(transport));
 
-    Ok(client_config)
+    Ok((client_config, host_key_state))
 }
 
 async fn resolve_target(
@@ -1524,6 +1836,11 @@ async fn run_capture_on_client(
     session_runtime
         .background_tasks
         .extend(start_local_forwards(client, config).await?);
+    let dynamic_forwards = start_dynamic_forwards(client, config).await?;
+    session_runtime
+        .background_tasks
+        .extend(dynamic_forwards.tasks);
+    start_reverse_forwards(client, config).await?;
     send_initial_session_requests(channel.as_ref(), &request, pty.as_ref()).await?;
     if !config.forward_agent {
         channel.close().await?;
@@ -1587,6 +1904,11 @@ async fn run_stdio_on_client(
     session_runtime
         .background_tasks
         .extend(start_local_forwards(client, config).await?);
+    let dynamic_forwards = start_dynamic_forwards(client, config).await?;
+    session_runtime
+        .background_tasks
+        .extend(dynamic_forwards.tasks);
+    start_reverse_forwards(client, config).await?;
 
     // The escape sequences only arm for an interactive pty session: the
     // traffic of an exec session stays byte-exact.
@@ -1841,94 +2163,6 @@ fn is_benign_conversation_error(error: &Ssh3ConversationError) -> bool {
     }
 }
 
-#[cfg(unix)]
-fn spawn_agent_forwarder(
-    conversation: Arc<Ssh3Conversation>,
-    agent_socket: PathBuf,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let channel = match conversation.accept_channel().await {
-                Ok(channel) => channel,
-                Err(_) => return,
-            };
-            if channel.channel_type() != b"agent-connection" {
-                let _ = channel.close().await;
-                continue;
-            }
-
-            if let Err(err) = forward_agent_channel(channel, &agent_socket).await {
-                if is_benign_client_error(&err) {
-                    continue;
-                }
-                eprintln!("ssh3-rust-client agent forwarding error: {err}");
-                return;
-            }
-        }
-    })
-}
-
-#[cfg(unix)]
-async fn forward_agent_channel(
-    channel: Arc<Ssh3Channel>,
-    agent_socket: &Path,
-) -> Result<(), Ssh3ClientError> {
-    let stream = UnixStream::connect(agent_socket).await?;
-    let (mut reader, mut writer) = stream.into_split();
-
-    let mut to_agent = tokio::spawn({
-        let channel = channel.clone();
-        async move {
-            loop {
-                let message = channel.next_message().await?;
-                if let Ssh3Message::Data(data) = message
-                    && data.data_type == SSH_EXTENDED_DATA_NONE
-                {
-                    writer.write_all(&data.data).await?;
-                    writer.flush().await?;
-                }
-            }
-            #[allow(unreachable_code)]
-            Ok::<(), Ssh3ClientError>(())
-        }
-    });
-
-    let mut from_agent = tokio::spawn({
-        let channel = channel.clone();
-        async move {
-            let mut buf = vec![
-                0;
-                usize::try_from(channel.max_packet_size())
-                    .unwrap_or(30_000)
-                    .max(1)
-            ];
-            loop {
-                let n = reader.read(&mut buf).await?;
-                if n == 0 {
-                    let _ = channel.close().await;
-                    return Ok::<(), Ssh3ClientError>(());
-                }
-                channel
-                    .write_data(&buf[..n], SSH_EXTENDED_DATA_NONE)
-                    .await?;
-            }
-        }
-    });
-
-    tokio::select! {
-        result = &mut to_agent => {
-            from_agent.abort();
-            let _ = channel.close().await;
-            result.map_err(|err| Ssh3ClientError::Io(io::Error::other(err.to_string())))?
-        }
-        result = &mut from_agent => {
-            to_agent.abort();
-            let _ = channel.close().await;
-            result.map_err(|err| Ssh3ClientError::Io(io::Error::other(err.to_string())))?
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // The interop scenarios of this module are written for clarity, not for
@@ -1985,7 +2219,7 @@ mod tests {
         establish_client_conversation, generate_conversation_id, is_ssh3_connect, new_client,
         new_server, response_with_server_header,
     };
-    use ssh3_proto::{SSH_EXTENDED_DATA_NONE, Ssh3ChannelRequest, Ssh3Message};
+    use ssh3_proto::{SSH_EXTENDED_DATA_NONE, Ssh3ChannelHeader, Ssh3ChannelRequest, Ssh3Message};
     use ssh3_quinn::{
         accept_bi_channel, open_tcp_forwarding_channel, open_udp_forwarding_channel,
         self_signed_server_config,
@@ -2005,13 +2239,14 @@ mod tests {
 
     use super::{
         LocalTerminalInfo, PtySpec, Ssh3CapturedSession, Ssh3ClientConfig, Ssh3ClientError,
-        Ssh3ForwardProtocol, Ssh3LocalForwardSpec, Ssh3OidcConfig, Ssh3OidcError, Ssh3PtyPolicy,
-        Ssh3SessionRequest, Ssh3TrustStrategy, TerminalSize, activate_client,
-        build_session_runtime, client_bind_addr, client_quinn_config, connect_client,
-        conversation_id_base64, exit_code_for_exit_signal, resolve_pty, resolve_target,
+        Ssh3ForwardProtocol, Ssh3KnownHostsTrust, Ssh3LocalForwardSpec, Ssh3OidcConfig,
+        Ssh3OidcError, Ssh3PtyPolicy, Ssh3SessionRequest, Ssh3StrictHostKeyChecking,
+        Ssh3TrustStrategy, TerminalSize, activate_client, build_session_runtime, client_bind_addr,
+        client_quinn_config, connect_client, conversation_id_base64, exit_code_for_exit_signal,
+        parse_dynamic_forward_spec, parse_reverse_forward_spec, resolve_pty, resolve_target,
         run_capture_on_client, run_exec_capture, run_exec_capture_with_browser_opener,
         send_forward_agent_request, send_initial_session_requests, send_signal_request,
-        send_window_change_request,
+        send_window_change_request, start_dynamic_forwards, start_reverse_forwards,
     };
 
     /// Builds the pty request of a session out of the metadata of a console.
@@ -2119,7 +2354,7 @@ mod tests {
         let resolved = resolve_target(&config.target_url, config.server_name.as_deref()).await?;
         let bind_addr = client_bind_addr(resolved.remote_addr);
         let mut endpoint = Endpoint::client(bind_addr).map_err(Ssh3ClientError::Endpoint)?;
-        endpoint.set_default_client_config(client_quinn_config(config)?);
+        endpoint.set_default_client_config(client_quinn_config(config)?.0);
 
         let connection = endpoint
             .connect(resolved.remote_addr, &resolved.server_name)
@@ -2160,8 +2395,8 @@ mod tests {
             send_request,
             driver_task,
             established,
-            config.max_packet_size,
-            config.default_datagrams_queue_size,
+            config,
+            None,
         ))
     }
 
@@ -2290,10 +2525,33 @@ mod tests {
     /// can never be mistaken for a scenario that really passed.
     #[cfg(unix)]
     fn skip_interop(scenario: &str) {
-        log_interop(&format!(
-            "skipping: {scenario}: {}",
-            go_unavailable_reason()
-        ));
+        skip_interop_with_reason(scenario, &go_unavailable_reason());
+    }
+
+    /// Reports that a cross-implementation scenario was skipped for a reason
+    /// other than a missing Go reference repository.
+    #[cfg(unix)]
+    fn skip_interop_with_reason(scenario: &str, reason: &str) {
+        log_interop(&format!("skipping: {scenario}: {reason}"));
+    }
+
+    /// Reads the software version of the Go reference repository.
+    ///
+    /// The version lives in `version.go` as three integer constants.
+    #[cfg(unix)]
+    fn go_reference_version(go_root: &Path) -> Option<(u32, u32, u32)> {
+        let source = std::fs::read_to_string(go_root.join("version.go")).ok()?;
+        let constant = |name: &str| -> Option<u32> {
+            source.lines().find_map(|line| {
+                let rest = line.trim().strip_prefix(&format!("const {name} int = "))?;
+                rest.trim().parse().ok()
+            })
+        };
+        Some((
+            constant("SOFTWARE_MAJOR")?,
+            constant("SOFTWARE_MINOR")?,
+            constant("SOFTWARE_PATCH")?,
+        ))
     }
 
     /// Root of the Go reference repository that the cross-implementation
@@ -6751,5 +7009,678 @@ mod tests {
         }
 
         client.shutdown().await;
+    }
+
+    /// Builds a QUIC server that presents a self-signed certificate.
+    fn self_signed_quic_server(
+        names: Vec<String>,
+    ) -> (
+        quinn::Endpoint,
+        SocketAddr,
+        rustls::pki_types::CertificateDer<'static>,
+    ) {
+        let (server_config, server_certificate) = self_signed_server_config(names).unwrap();
+        let endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let address = endpoint.local_addr().unwrap();
+        (endpoint, address, server_certificate)
+    }
+
+    #[tokio::test]
+    async fn the_known_hosts_check_pins_the_certificate_of_an_unknown_host() {
+        let (server_endpoint, server_addr, server_certificate) =
+            self_signed_quic_server(vec!["localhost".to_string(), "127.0.0.1".to_string()]);
+        let server_task = tokio::spawn(async move {
+            let incoming = server_endpoint.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            // The connection stays alive until the client closes it.
+            let _ = connection.closed().await;
+        });
+
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("known_hosts");
+        let mut config = Ssh3ClientConfig::new(
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
+                .parse()
+                .unwrap(),
+        );
+        config.trust = Ssh3TrustStrategy::KnownHosts(Ssh3KnownHostsTrust {
+            policy: Ssh3StrictHostKeyChecking::AcceptNew,
+            path: path.clone(),
+            authorities: Vec::new(),
+        });
+
+        let (quinn_config, state) = client_quinn_config(&config).unwrap();
+        let mut endpoint =
+            Endpoint::client(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))).unwrap();
+        endpoint.set_default_client_config(quinn_config);
+        let connection = endpoint
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .expect("the self-signed certificate of an unknown host is accepted");
+
+        // The certificate the server presented is the one that is pinned.
+        let pinned = state
+            .as_ref()
+            .expect("the known_hosts check is active")
+            .take_to_pin()
+            .expect("the certificate is pinned");
+        assert_eq!(pinned.as_ref(), server_certificate.as_ref());
+
+        let host = format!("127.0.0.1:{}/ssh3-term", server_addr.port());
+        crate::known_hosts::append_known_host(&path, &host, &pinned).unwrap();
+
+        // The next session finds the pinned certificate and trusts it.
+        let (known_hosts, invalid_lines) = crate::known_hosts::KnownHosts::load(&path).unwrap();
+        assert!(invalid_lines.is_empty());
+        assert_eq!(
+            known_hosts.check_certificate(&host, &server_certificate),
+            crate::known_hosts::HostCertificateStatus::Matches
+        );
+
+        connection.close(0u32.into(), b"done");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_known_hosts_check_refuses_a_host_that_presents_another_certificate() {
+        let (server_endpoint, server_addr, _server_certificate) =
+            self_signed_quic_server(vec!["localhost".to_string(), "127.0.0.1".to_string()]);
+        let server_task = tokio::spawn(async move {
+            let incoming = server_endpoint.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            let _ = connection.closed().await;
+        });
+
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("known_hosts");
+        let host = format!("127.0.0.1:{}/ssh3-term", server_addr.port());
+        // Another certificate is pinned for the host.
+        let other = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+        crate::known_hosts::append_known_host(
+            &path,
+            &host,
+            &rustls::pki_types::CertificateDer::from(other.der().to_vec()),
+        )
+        .unwrap();
+
+        let mut config = Ssh3ClientConfig::new(
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
+                .parse()
+                .unwrap(),
+        );
+        config.trust = Ssh3TrustStrategy::KnownHosts(Ssh3KnownHostsTrust {
+            policy: Ssh3StrictHostKeyChecking::Yes,
+            path: path.clone(),
+            authorities: Vec::new(),
+        });
+
+        let (quinn_config, state) = client_quinn_config(&config).unwrap();
+        let mut endpoint =
+            Endpoint::client(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))).unwrap();
+        endpoint.set_default_client_config(quinn_config);
+        let error = endpoint
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .expect_err("the certificate of the host does not match the pinned one");
+
+        // The refusal names the two fingerprints.
+        let refusal = state
+            .as_ref()
+            .expect("the known_hosts check is active")
+            .refusal()
+            .expect("the host was refused");
+        assert!(refusal.contains("SHA256:"));
+
+        drop(error);
+        server_task.abort();
+    }
+
+    /// Spawns a TCP echo server that answers every byte it receives.
+    async fn spawn_portable_tcp_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(stream) => stream,
+                    Err(_) => return,
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0; 4096];
+                    loop {
+                        let n = match stream.read(&mut buf).await {
+                            Ok(n) => n,
+                            Err(_) => return,
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                        let _ = stream.flush().await;
+                    }
+                });
+            }
+        });
+        (addr, task)
+    }
+
+    /// Starts a Rust server that serves one conversation.
+    async fn spawn_rust_server() -> (
+        SocketAddr,
+        rustls::pki_types::CertificateDer<'static>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (server_config, server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let incoming = timeout(Duration::from_secs(5), server_endpoint.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = timeout(Duration::from_secs(5), incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            let config = Ssh3ServerConfig::default();
+            let _ = serve_connection(connection, config).await;
+        });
+        (server_addr, server_certificate, task)
+    }
+
+    #[tokio::test]
+    async fn rust_client_reverse_forward_round_trips_against_the_rust_server() {
+        let (server_addr, server_certificate, server_task) = spawn_rust_server().await;
+
+        let (echo_addr, echo_task) = spawn_portable_tcp_echo_server().await;
+
+        let mut config = Ssh3ClientConfig::new(
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
+                .parse()
+                .unwrap(),
+        );
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
+        // The server binds an ephemeral port and forwards it to the local
+        // echo server.
+        config.reverse_forwards = vec![
+            parse_reverse_forward_spec(&format!("127.0.0.1:0:127.0.0.1:{}", echo_addr.port()))
+                .unwrap(),
+        ];
+
+        let client = connect_client(&config).await.unwrap();
+        let handles = start_reverse_forwards(&client, &config).await.unwrap();
+        assert_eq!(handles.len(), 1);
+        let bound_port = handles[0].bound_port;
+        assert_ne!(bound_port, 0);
+
+        // The connection the server accepts on the bound port is mirrored to
+        // the client and bridged to the local target.
+        let mut stream = timeout(
+            Duration::from_secs(10),
+            TcpStream::connect(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                bound_port,
+            ))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let payload = b"reverse forward round trip";
+        stream.write_all(payload).await.unwrap();
+        let mut buffer = vec![0u8; 64];
+        let read = timeout(Duration::from_secs(10), stream.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..read], payload);
+
+        client.shutdown().await;
+        echo_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn rust_client_refuses_a_forwarded_channel_of_an_unrequested_target() {
+        // The listener stands for an endpoint of the client the peer must not
+        // reach: it is bound on another loopback address than the one of the
+        // session.
+        let forbidden = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(127, 0, 0, 9),
+            0,
+        )))
+        .await
+        .unwrap();
+        let forbidden_addr = forbidden.local_addr().unwrap();
+
+        let (server_config, server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = timeout(Duration::from_secs(5), server_endpoint.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = timeout(Duration::from_secs(5), incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut server = new_server(connection.clone()).await.unwrap();
+            let mut accepted = timeout(
+                Duration::from_secs(5),
+                accept_server_conversation(&mut server, connection.clone(), 30_000, 10),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            accepted
+                .control_stream
+                .send_response(
+                    response_with_server_header(StatusCode::OK, SSH3_VERSION_STRING).unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // The peer opens a forwarded channel towards an endpoint the
+            // client never requested.
+            let (mut send, mut recv) = connection.open_bi().await.unwrap();
+            let header = Ssh3ChannelHeader {
+                conversation_stream_id: accepted.conversation.control_stream_id(),
+                channel_type: b"forwarded-tcp".to_vec(),
+                max_packet_size: 1024,
+            };
+            let additional_bytes = ssh3_proto::build_forwarding_additional_bytes(
+                forbidden_addr.ip(),
+                forbidden_addr.port(),
+            );
+            send.write_all(&header.encode(Some(&additional_bytes)))
+                .await
+                .unwrap();
+
+            // The client confirms the channel and refuses the bridge: the
+            // channel carries no data.
+            let mut buffer = vec![0u8; 256];
+            let mut payload = Vec::new();
+            loop {
+                match recv.read(&mut buffer).await {
+                    Ok(None) => break,
+                    Ok(Some(read)) => payload.extend_from_slice(&buffer[..read]),
+                    Err(_) => break,
+                }
+            }
+            payload
+        });
+
+        let mut config = Ssh3ClientConfig::new(
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
+                .parse()
+                .unwrap(),
+        );
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
+        // The client only asked for a forward towards the loopback.
+        config.reverse_forwards =
+            vec![parse_reverse_forward_spec("127.0.0.1:0:127.0.0.1:22").unwrap()];
+
+        let client = connect_client(&config).await.unwrap();
+
+        // The forbidden endpoint is never reached.
+        let accepted = timeout(Duration::from_secs(3), forbidden.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "the client must not connect to an endpoint it did not request"
+        );
+
+        client.shutdown().await;
+        let _ = server_task.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rust_client_reverse_forward_round_trips_against_the_real_go_server() {
+        let _guard = lock_go_binary_tests();
+        // The Go implementation gained the reverse forwarding in v0.1.23. The
+        // pinned reference predates it and refuses the request, so the
+        // scenario is skipped instead of failing there.
+        if let Some(go_root) = go_repo_root() {
+            if go_reference_version(&go_root).is_none_or(|version| version < (0, 1, 23)) {
+                skip_interop_with_reason(
+                    "rust_client_reverse_forward_round_trips_against_the_real_go_server",
+                    "the Go reference repository predates the reverse forwarding (v0.1.23)",
+                );
+                return;
+            }
+        }
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let tempdir = TempDir::new().unwrap();
+        let home_dir = tempdir.path().join("home");
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::write(
+            home_dir.join(".ssh").join("authorized_keys"),
+            fs::read(&fixture.authorized_identities_path).unwrap(),
+        )
+        .unwrap();
+
+        let bind_port = reserve_udp_port();
+        let bind_addr = format!("127.0.0.1:{bind_port}");
+        let cert_path = tempdir.path().join("cert.pem");
+        let key_path = tempdir.path().join("key.pem");
+        let log_path = tempdir.path().join("go-server.log");
+        let (echo_addr, echo_task) = spawn_portable_tcp_echo_server().await;
+
+        let Some(mut server) = spawn_go_cli_server(
+            &bind_addr,
+            &fixture.username,
+            &home_dir,
+            &cert_path,
+            &key_path,
+            &log_path,
+        )
+        .await
+        else {
+            skip_interop("rust_client_reverse_forward_round_trips_against_the_real_go_server");
+            return;
+        };
+
+        let mut config = Ssh3ClientConfig::new(
+            format!(
+                "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
+                fixture.username
+            )
+            .parse()
+            .unwrap(),
+        );
+        config.trust = Ssh3TrustStrategy::Insecure;
+        config.username = Some(fixture.username.clone());
+        config.identity_file = Some(fixture.private_key_path.clone());
+        config.reverse_forwards = vec![
+            parse_reverse_forward_spec(&format!("127.0.0.1:0:127.0.0.1:{}", echo_addr.port()))
+                .unwrap(),
+        ];
+
+        let client = connect_client(&config).await.unwrap();
+        let handles = start_reverse_forwards(&client, &config).await.unwrap();
+        let bound_port = handles[0].bound_port;
+
+        // The listener the Go server bound is reachable and the connection is
+        // bridged to the local target by the Rust client.
+        let mut stream = timeout(
+            Duration::from_secs(20),
+            TcpStream::connect(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                bound_port,
+            ))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let payload = b"reverse forward against the real go server";
+        stream.write_all(payload).await.unwrap();
+        let mut buffer = vec![0u8; 64];
+        let read = timeout(Duration::from_secs(20), stream.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..read], payload);
+
+        client.shutdown().await;
+        echo_task.abort();
+        let _ = server.kill().await;
+        let _ = server.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rust_client_dynamic_forward_dials_through_the_real_go_server() {
+        let _guard = lock_go_binary_tests();
+        // The Go implementation gained the dynamic forwarding in v0.1.24.
+        if let Some(go_root) = go_repo_root() {
+            if go_reference_version(&go_root).is_none_or(|version| version < (0, 1, 24)) {
+                skip_interop_with_reason(
+                    "rust_client_dynamic_forward_dials_through_the_real_go_server",
+                    "the Go reference repository predates the dynamic forwarding (v0.1.24)",
+                );
+                return;
+            }
+        }
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let tempdir = TempDir::new().unwrap();
+        let home_dir = tempdir.path().join("home");
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::write(
+            home_dir.join(".ssh").join("authorized_keys"),
+            fs::read(&fixture.authorized_identities_path).unwrap(),
+        )
+        .unwrap();
+
+        let bind_port = reserve_udp_port();
+        let bind_addr = format!("127.0.0.1:{bind_port}");
+        let cert_path = tempdir.path().join("cert.pem");
+        let key_path = tempdir.path().join("key.pem");
+        let log_path = tempdir.path().join("go-server.log");
+        let (echo_addr, echo_task) = spawn_portable_tcp_echo_server().await;
+
+        let Some(mut server) = spawn_go_cli_server(
+            &bind_addr,
+            &fixture.username,
+            &home_dir,
+            &cert_path,
+            &key_path,
+            &log_path,
+        )
+        .await
+        else {
+            skip_interop("rust_client_dynamic_forward_dials_through_the_real_go_server");
+            return;
+        };
+
+        let mut config = Ssh3ClientConfig::new(
+            format!(
+                "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
+                fixture.username
+            )
+            .parse()
+            .unwrap(),
+        );
+        config.trust = Ssh3TrustStrategy::Insecure;
+        config.username = Some(fixture.username.clone());
+        config.identity_file = Some(fixture.private_key_path.clone());
+        config.dynamic_forwards = vec![parse_dynamic_forward_spec("127.0.0.1:0").unwrap()];
+
+        let client = connect_client(&config).await.unwrap();
+        let forwards = start_dynamic_forwards(&client, &config).await.unwrap();
+        let proxy_addr = forwards.handles[0].listen_addr;
+
+        let mut stream = timeout(Duration::from_secs(20), TcpStream::connect(proxy_addr))
+            .await
+            .unwrap()
+            .unwrap();
+        stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method = [0u8; 2];
+        timeout(Duration::from_secs(20), stream.read_exact(&mut method))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(method, [0x05, 0x00]);
+
+        let mut request = vec![0x05, 0x01, 0x00, 0x01];
+        request.extend_from_slice(
+            &echo_addr
+                .ip()
+                .to_string()
+                .parse::<std::net::Ipv4Addr>()
+                .unwrap()
+                .octets(),
+        );
+        request.extend_from_slice(&echo_addr.port().to_be_bytes());
+        stream.write_all(&request).await.unwrap();
+
+        let mut reply = [0u8; 10];
+        timeout(Duration::from_secs(20), stream.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], 0x00, "the reply must be a success");
+
+        let payload = b"dynamic forward against the real go server";
+        stream.write_all(payload).await.unwrap();
+        let mut buffer = vec![0u8; 64];
+        let read = timeout(Duration::from_secs(20), stream.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..read], payload);
+
+        client.shutdown().await;
+        echo_task.abort();
+        for task in forwards.tasks {
+            task.abort();
+        }
+        let _ = server.kill().await;
+        let _ = server.wait().await;
+    }
+
+    #[tokio::test]
+    async fn rust_client_dynamic_forward_dials_through_the_rust_server() {
+        let (server_addr, server_certificate, server_task) = spawn_rust_server().await;
+
+        let (echo_addr, echo_task) = spawn_portable_tcp_echo_server().await;
+
+        let mut config = Ssh3ClientConfig::new(
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
+                .parse()
+                .unwrap(),
+        );
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
+        config.dynamic_forwards = vec![parse_dynamic_forward_spec("127.0.0.1:0").unwrap()];
+
+        let client = connect_client(&config).await.unwrap();
+        let forwards = start_dynamic_forwards(&client, &config).await.unwrap();
+        assert_eq!(forwards.handles.len(), 1);
+        let proxy_addr = forwards.handles[0].listen_addr;
+
+        // The SOCKS5 proxy of the client asks the server to dial the target.
+        let mut stream = timeout(Duration::from_secs(10), TcpStream::connect(proxy_addr))
+            .await
+            .unwrap()
+            .unwrap();
+        stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method = [0u8; 2];
+        timeout(Duration::from_secs(10), stream.read_exact(&mut method))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(method, [0x05, 0x00]);
+
+        let mut request = vec![0x05, 0x01, 0x00, 0x01];
+        request.extend_from_slice(
+            &echo_addr
+                .ip()
+                .to_string()
+                .parse::<std::net::Ipv4Addr>()
+                .unwrap()
+                .octets(),
+        );
+        request.extend_from_slice(&echo_addr.port().to_be_bytes());
+        stream.write_all(&request).await.unwrap();
+
+        let mut reply = [0u8; 10];
+        timeout(Duration::from_secs(10), stream.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], 0x00, "the reply must be a success");
+
+        let payload = b"dynamic forward round trip";
+        stream.write_all(payload).await.unwrap();
+        let mut buffer = vec![0u8; 64];
+        let read = timeout(Duration::from_secs(10), stream.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..read], payload);
+
+        client.shutdown().await;
+        echo_task.abort();
+        for task in forwards.tasks {
+            task.abort();
+        }
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn rust_client_dynamic_forward_reports_the_failure_of_the_server() {
+        let (server_addr, server_certificate, server_task) = spawn_rust_server().await;
+
+        let mut config = Ssh3ClientConfig::new(
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
+                .parse()
+                .unwrap(),
+        );
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
+        config.dynamic_forwards = vec![parse_dynamic_forward_spec("127.0.0.1:0").unwrap()];
+
+        let client = connect_client(&config).await.unwrap();
+        let forwards = start_dynamic_forwards(&client, &config).await.unwrap();
+        let proxy_addr = forwards.handles[0].listen_addr;
+
+        let mut stream = timeout(Duration::from_secs(10), TcpStream::connect(proxy_addr))
+            .await
+            .unwrap()
+            .unwrap();
+        stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method = [0u8; 2];
+        timeout(Duration::from_secs(10), stream.read_exact(&mut method))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(method, [0x05, 0x00]);
+
+        // A port nothing listens on: the server refuses the dial and the
+        // SOCKS client gets the matching reply code.
+        let mut request = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+        request.extend_from_slice(&9u16.to_be_bytes());
+        stream.write_all(&request).await.unwrap();
+
+        let mut reply = [0u8; 10];
+        timeout(Duration::from_secs(10), stream.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], 0x05, "the reply must be a refused connection");
+
+        client.shutdown().await;
+        for task in forwards.tasks {
+            task.abort();
+        }
+        let _ = server_task.await;
     }
 }
