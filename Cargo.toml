@@ -8,6 +8,9 @@ members = [
     "ssh3-quinn",
     "ssh3-server",
 ]
+# The fuzz crate is built on its own, with the nightly toolchain that
+# `cargo fuzz` requires; it is not a member of the workspace.
+exclude = ["fuzz"]
 resolver = "3"
 
 [patch.crates-io]

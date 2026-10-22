@@ -1,0 +1,47 @@
+[package]
+name = "ssh3-rust-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+description = "Fuzz targets of the parsers of the SSH3 wire format"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ssh3-proto = { path = "../ssh3-proto" }
+
+[[bin]]
+name = "parse_ssh_string"
+path = "fuzz_targets/parse_ssh_string.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_var_int"
+path = "fuzz_targets/parse_var_int.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_message"
+path = "fuzz_targets/parse_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_channel_request"
+path = "fuzz_targets/parse_channel_request.rs"
+test = false
+doc = false
+bench = false
+
+# The fuzz crate is built on its own, with the nightly toolchain that
+# `cargo fuzz` requires, and it is not a member of the workspace of the
+# project.
+[workspace]

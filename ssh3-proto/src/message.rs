@@ -764,8 +764,21 @@ impl TryFrom<u64> for Ssh3ForwardingAddressFamily {
 
 /// Request to forward a port of the server (`forward-port`).
 ///
-/// Wire layout: the protocol, the address family, the address octets and the
-/// port in network byte order, in that order.
+/// Wire layout: the address family, the protocol, the address octets and the
+/// port in network byte order.
+///
+/// The reference implementation writes the address family before the protocol
+/// (`nagual2/ssh3-go`, `message/channel_request.go`, `ForwardingRequest.Write`)
+/// and reads the protocol before the address family (`ParseForwardingRequest`).
+/// The encoder follows the order of the reference encoder, and the decoder
+/// accepts both orders: the protocol is `0` or `1` and the address family is
+/// `4` or `6`, so the two values never collide and the order of the first
+/// field tells which one comes next.
+///
+/// The request type is an extension of the Rust implementation: the reference
+/// implementation has no `forward-port` entry in its map of the channel
+/// request types, so a reference peer refuses the request by its type name
+/// before it looks at the payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ssh3ForwardingRequest {
     /// Transport protocol of the forwarded port.
@@ -778,8 +791,7 @@ pub struct Ssh3ForwardingRequest {
 
 impl Ssh3ForwardingRequest {
     fn parse<R: Read>(reader: &mut R) -> Ssh3Result<Self> {
-        let protocol = Ssh3ForwardingProtocol::try_from(read_var_int(reader)?)?;
-        let family = Ssh3ForwardingAddressFamily::try_from(read_var_int(reader)?)?;
+        let (protocol, family) = Self::parse_protocol_and_family(reader)?;
         let mut octets = vec![0; family.octet_len()];
         reader.read_exact(&mut octets)?;
         let ip_address = match family {
@@ -800,6 +812,32 @@ impl Ssh3ForwardingRequest {
         })
     }
 
+    /// Reads the protocol and the address family of a forwarding request.
+    ///
+    /// The first field tells which one comes first: the protocol is `0`
+    /// (UDP) or `1` (TCP), the address family is `4` (IPv4) or `6` (IPv6).
+    /// Both orders are accepted, so a payload written by the encoder of the
+    /// reference implementation and a payload written by its parser are both
+    /// read back correctly.
+    fn parse_protocol_and_family<R: Read>(
+        reader: &mut R,
+    ) -> Ssh3Result<(Ssh3ForwardingProtocol, Ssh3ForwardingAddressFamily)> {
+        let first = read_var_int(reader)?;
+        match first {
+            0 | 1 => {
+                let protocol = Ssh3ForwardingProtocol::try_from(first)?;
+                let family = Ssh3ForwardingAddressFamily::try_from(read_var_int(reader)?)?;
+                Ok((protocol, family))
+            }
+            4 | 6 => {
+                let family = Ssh3ForwardingAddressFamily::try_from(first)?;
+                let protocol = Ssh3ForwardingProtocol::try_from(read_var_int(reader)?)?;
+                Ok((protocol, family))
+            }
+            other => Err(Ssh3Error::InvalidForwardingProtocol(other)),
+        }
+    }
+
     fn encoded_len(&self) -> usize {
         let family = Ssh3ForwardingAddressFamily::from_ip(self.ip_address);
         var_int_len(self.protocol.as_u64()) + var_int_len(family.as_u64()) + family.octet_len() + 2
@@ -807,8 +845,8 @@ impl Ssh3ForwardingRequest {
 
     fn encode(&self, out: &mut Vec<u8>) {
         let family = Ssh3ForwardingAddressFamily::from_ip(self.ip_address);
-        append_var_int(out, self.protocol.as_u64());
         append_var_int(out, family.as_u64());
+        append_var_int(out, self.protocol.as_u64());
         match self.ip_address {
             IpAddr::V4(address) => out.extend_from_slice(&address.octets()),
             IpAddr::V6(address) => out.extend_from_slice(&address.octets()),
@@ -1052,8 +1090,8 @@ mod tests {
 
         let forwarding_payload = {
             let mut payload = Vec::new();
-            append_var_int(&mut payload, Ssh3ForwardingProtocol::Tcp as u64);
             append_var_int(&mut payload, 4);
+            append_var_int(&mut payload, Ssh3ForwardingProtocol::Tcp as u64);
             payload.extend_from_slice(&[192, 0, 2, 10]);
             payload.extend_from_slice(&443u16.to_be_bytes());
             payload
@@ -1120,5 +1158,58 @@ mod tests {
         assert_eq!(message.encoded_len(), expected.len());
         assert_eq!(message.to_vec(), expected);
         assert_eq!(parse_message(&expected), message);
+    }
+
+    /// The encoder of the reference implementation writes the address family
+    /// before the protocol (`message/channel_request.go`,
+    /// `ForwardingRequest.Write`).
+    #[test]
+    fn writes_the_forwarding_request_in_the_order_of_the_reference_encoder() {
+        let message = Ssh3Message::ChannelRequest(Ssh3ChannelRequestMessage {
+            want_reply: false,
+            request: Ssh3ChannelRequest::ForwardPort(Ssh3ForwardingRequest {
+                protocol: Ssh3ForwardingProtocol::Tcp,
+                ip_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                port: 443,
+            }),
+        });
+
+        let mut expected = Vec::new();
+        append_var_int(&mut expected, SSH_MSG_CHANNEL_REQUEST);
+        append_ssh_bytes(&mut expected, b"forward-port");
+        write_bool(&mut expected, false);
+        // The address family comes first, then the protocol.
+        append_var_int(&mut expected, 4);
+        append_var_int(&mut expected, 1);
+        expected.extend_from_slice(&[192, 0, 2, 10]);
+        expected.extend_from_slice(&443u16.to_be_bytes());
+
+        assert_eq!(message.encoded_len(), expected.len());
+        assert_eq!(message.to_vec(), expected);
+        assert_eq!(parse_message(&expected), message);
+    }
+
+    /// The parser of the reference implementation reads the protocol before
+    /// the address family (`message/channel_request.go`,
+    /// `ParseForwardingRequest`): a payload written in that order must still
+    /// be read back correctly.
+    #[test]
+    fn reads_the_forwarding_request_in_the_order_of_the_reference_parser() {
+        let mut payload = Vec::new();
+        append_var_int(&mut payload, 1);
+        append_var_int(&mut payload, 4);
+        payload.extend_from_slice(&[192, 0, 2, 10]);
+        payload.extend_from_slice(&443u16.to_be_bytes());
+
+        let bytes = encode_request_bytes(b"forward-port", false, &payload);
+        let expected = Ssh3Message::ChannelRequest(Ssh3ChannelRequestMessage {
+            want_reply: false,
+            request: Ssh3ChannelRequest::ForwardPort(Ssh3ForwardingRequest {
+                protocol: Ssh3ForwardingProtocol::Tcp,
+                ip_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                port: 443,
+            }),
+        });
+        assert_eq!(parse_message(&bytes), expected);
     }
 }

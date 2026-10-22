@@ -943,9 +943,26 @@ async fn read_channel_request(
             })
         }
         b"forward-port" => {
-            let protocol = ssh3_proto::Ssh3ForwardingProtocol::try_from(read_var_int(recv).await?)?;
-            let family =
-                ssh3_proto::Ssh3ForwardingAddressFamily::try_from(read_var_int(recv).await?)?;
+            // The protocol is `0` or `1` and the address family is `4` or
+            // `6`, so the first field tells which one comes first: both the
+            // order of the encoder and the order of the parser of the
+            // reference implementation are accepted.
+            let first = read_var_int(recv).await?;
+            let (protocol, family) = match first {
+                0 | 1 => (
+                    ssh3_proto::Ssh3ForwardingProtocol::try_from(first)?,
+                    ssh3_proto::Ssh3ForwardingAddressFamily::try_from(read_var_int(recv).await?)?,
+                ),
+                4 | 6 => (
+                    ssh3_proto::Ssh3ForwardingProtocol::try_from(read_var_int(recv).await?)?,
+                    ssh3_proto::Ssh3ForwardingAddressFamily::try_from(first)?,
+                ),
+                other => {
+                    return Err(Ssh3ChannelError::Proto(
+                        ssh3_proto::Ssh3Error::InvalidForwardingProtocol(other),
+                    ));
+                }
+            };
             let mut octets = vec![
                 0;
                 match family {
@@ -1036,14 +1053,15 @@ async fn read_ssh_bytes(recv: &mut dyn Ssh3ReceiveStream) -> Result<Vec<u8>, Ssh
     Ok(out)
 }
 
+/// Reads a boolean field of a message.
+///
+/// A boolean is encoded as a single byte: `0` is false and every other byte
+/// is true, the semantics of the reference implementation
+/// (`nagual2/ssh3-go`), where the field is decoded with `encoding/binary`
+/// into a `bool`.
 async fn read_bool(recv: &mut dyn Ssh3ReceiveStream) -> Result<bool, Ssh3ChannelError> {
-    match read_byte(recv).await? {
-        0 => Ok(false),
-        1 => Ok(true),
-        value => Err(Ssh3ChannelError::Proto(ssh3_proto::Ssh3Error::InvalidBool(
-            value,
-        ))),
-    }
+    let value = read_byte(recv).await?;
+    Ok(value != 0)
 }
 
 async fn read_byte(recv: &mut dyn Ssh3ReceiveStream) -> Result<u8, Ssh3ChannelError> {
@@ -1067,7 +1085,7 @@ mod tests {
 
     use super::{
         MIN_MAX_PACKET_SIZE, Ssh3Channel, Ssh3ChannelError, clamp_local_max_packet_size,
-        clamp_peer_max_packet_size,
+        clamp_peer_max_packet_size, parse_message,
     };
     use crate::conversation::Ssh3ConversationDatagramSender;
     use crate::transport::Ssh3ReceiveStream;
@@ -1228,6 +1246,87 @@ mod tests {
         assert_eq!(clamp_local_max_packet_size(0), MIN_MAX_PACKET_SIZE);
         assert_eq!(clamp_local_max_packet_size(2048), MIN_MAX_PACKET_SIZE);
         assert_eq!(clamp_local_max_packet_size(30_000), 30_000);
+    }
+
+    /// Builds the bytes of a channel request with the given request type and
+    /// `want_reply` flag.
+    fn channel_request_bytes(request_type: &[u8], want_reply: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        append_var_int(&mut out, ssh3_proto::SSH_MSG_CHANNEL_REQUEST);
+        ssh3_proto::append_ssh_bytes(&mut out, request_type);
+        out.push(want_reply);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// The reference implementation decodes a boolean into a number and
+    /// compares it against zero, so every byte other than `0` is true.
+    #[tokio::test]
+    async fn a_boolean_that_is_not_zero_is_true() {
+        for byte in [0x01, 0x02, 0x7f, 0x80, 0xff] {
+            let bytes = channel_request_bytes(b"shell", byte, &[]);
+            let (mut recv, _) = BytesReceiveStream::new(bytes);
+            let message = parse_message(&mut recv).await.unwrap();
+            match message {
+                Ssh3Message::ChannelRequest(request) => assert!(
+                    request.want_reply,
+                    "the byte {byte:#04x} must be read as true"
+                ),
+                other => panic!("expected a channel request, got {other:?}"),
+            }
+        }
+    }
+
+    /// The `forward-port` request is read in the order of the encoder and in
+    /// the order of the parser of the reference implementation.
+    #[tokio::test]
+    async fn the_forwarding_request_is_read_in_both_orders() {
+        let mut protocol_first = Vec::new();
+        append_var_int(&mut protocol_first, 1);
+        append_var_int(&mut protocol_first, 4);
+        protocol_first.extend_from_slice(&[192, 0, 2, 10]);
+        protocol_first.extend_from_slice(&443u16.to_be_bytes());
+
+        let mut family_first = Vec::new();
+        append_var_int(&mut family_first, 4);
+        append_var_int(&mut family_first, 1);
+        family_first.extend_from_slice(&[192, 0, 2, 10]);
+        family_first.extend_from_slice(&443u16.to_be_bytes());
+
+        for payload in [protocol_first, family_first] {
+            let bytes = channel_request_bytes(b"forward-port", 0, &payload);
+            let (mut recv, _) = BytesReceiveStream::new(bytes);
+            let message = parse_message(&mut recv).await.unwrap();
+            match message {
+                Ssh3Message::ChannelRequest(request) => {
+                    assert_eq!(
+                        request.request,
+                        Ssh3ChannelRequest::ForwardPort(ssh3_proto::Ssh3ForwardingRequest {
+                            protocol: ssh3_proto::Ssh3ForwardingProtocol::Tcp,
+                            ip_address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                                192, 0, 2, 10
+                            ),),
+                            port: 443,
+                        })
+                    );
+                }
+                other => panic!("expected a channel request, got {other:?}"),
+            }
+        }
+    }
+
+    /// A request type the implementation does not know is refused with an
+    /// error, without a panic and without an allocation of the payload.
+    #[tokio::test]
+    async fn an_unknown_request_type_is_refused() {
+        let bytes = channel_request_bytes(b"no-such-request", 0, &[]);
+        let (mut recv, _) = BytesReceiveStream::new(bytes);
+        match parse_message(&mut recv).await {
+            Err(Ssh3ChannelError::Proto(ssh3_proto::Ssh3Error::UnknownRequestType(reported))) => {
+                assert_eq!(reported, b"no-such-request")
+            }
+            other => panic!("expected the request type to be refused, got {other:?}"),
+        }
     }
 
     #[tokio::test]

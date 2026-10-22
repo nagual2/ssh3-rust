@@ -1,0 +1,7 @@
+[toolchain]
+# The fuzz targets are built by `cargo fuzz`, which needs the nightly
+# compiler for the sanitizer and the coverage instrumentation. The crate is
+# outside the workspace of the project, so the pinned toolchain of the
+# workspace (see `rust-toolchain.toml` in the root) does not apply here.
+channel = "nightly"
+profile = "minimal"

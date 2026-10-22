@@ -1062,4 +1062,35 @@ mod tests {
         let channel = accepted.channel();
         assert_eq!(channel.max_packet_size(), local_max_packet_size);
     }
+
+    /// A peer that announces a maximum packet size below the floor does not
+    /// starve the channel: the value is raised to the floor, and the channel
+    /// still works.
+    #[tokio::test]
+    async fn incoming_channels_floor_the_max_packet_size_of_the_peer() {
+        let (_client_endpoint, _server_endpoint, client_connection, server_connection) =
+            loopback().await;
+
+        let local_max_packet_size = 30_000;
+        let conversation = Ssh3Conversation::new(
+            5,
+            conversation_id(),
+            local_max_packet_size,
+            8,
+            Arc::new(Ssh3QuinnDatagramSender::new(client_connection.clone())),
+        );
+        let router = Ssh3IncomingChannelRouter::new();
+        router.register_conversation(Arc::new(conversation));
+
+        // The peer announces a value below the floor of the protocol.
+        let _raw = open_raw_channel(&client_connection, 5, 0).await;
+
+        let conversation = router
+            .accept_and_route_channel(&server_connection)
+            .await
+            .unwrap();
+        let accepted = conversation.accept_channel_with_metadata().await.unwrap();
+        let channel = accepted.channel();
+        assert_eq!(channel.max_packet_size(), ssh3_core::MIN_MAX_PACKET_SIZE);
+    }
 }

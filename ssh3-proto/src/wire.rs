@@ -40,8 +40,6 @@ pub type Ssh3Result<T> = std::result::Result<T, Ssh3Error>;
 pub enum Ssh3Error {
     /// The underlying reader failed.
     Io(io::Error),
-    /// A boolean field carried a byte other than `0` or `1`.
-    InvalidBool(u8),
     /// A string length did not fit into the address space of the process.
     InvalidLength(u64),
     /// A string length exceeded [`MAX_SSH_STRING_LEN`].
@@ -65,7 +63,6 @@ impl fmt::Display for Ssh3Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "{err}"),
-            Self::InvalidBool(value) => write!(f, "invalid SSH boolean byte: {value}"),
             Self::InvalidLength(length) => {
                 write!(f, "SSH string length does not fit in memory: {length}")
             }
@@ -270,14 +267,17 @@ pub fn ssh_string_len(bytes: &[u8]) -> usize {
 
 /// Reads a boolean field from `reader`.
 ///
-/// A boolean is encoded as a single byte: `0` is false, `1` is true. Any
-/// other value is rejected with [`Ssh3Error::InvalidBool`].
+/// A boolean is encoded as a single byte: `0` is false and **every** other
+/// byte is true.
+///
+/// This is the semantics of the reference implementation
+/// (`nagual2/ssh3-go`), where the field is decoded with `encoding/binary`
+/// into a `bool`: the byte is read as a number and compared against zero, so
+/// `0xff` is true there. Refusing such a byte would tear down a channel that
+/// the reference implementation keeps running.
 pub fn read_bool<R: Read>(reader: &mut R) -> Ssh3Result<bool> {
-    match read_byte(reader)? {
-        0 => Ok(false),
-        1 => Ok(true),
-        value => Err(Ssh3Error::InvalidBool(value)),
-    }
+    let value = read_byte(reader)?;
+    Ok(value != 0)
 }
 
 /// Writes a boolean field to `out` as a single byte (`0` or `1`).
@@ -302,7 +302,7 @@ mod tests {
 
     use super::{
         MAX_SSH_STRING_LEN, MAX_VARINT, Ssh3Error, append_ssh_bytes, append_var_int,
-        append_var_int_with_len, min_u64, read_ssh_bytes, read_var_int, ssh_string_len,
+        append_var_int_with_len, min_u64, read_bool, read_ssh_bytes, read_var_int, ssh_string_len,
         var_int_len,
     };
 
@@ -342,6 +342,19 @@ mod tests {
         let mut encoded = Vec::new();
         append_var_int_with_len(&mut encoded, 63, 2);
         assert_eq!(encoded, vec![0x40, 0x3f]);
+    }
+
+    /// A boolean is a single byte: `0` is false and every other byte is
+    /// true, the semantics of the reference implementation.
+    #[test]
+    fn booleans_are_read_like_the_reference_implementation() {
+        for byte in [0x01, 0x02, 0x7f, 0x80, 0xff] {
+            assert!(
+                read_bool(&mut Cursor::new([byte])).unwrap(),
+                "byte {byte:#04x}"
+            );
+        }
+        assert!(!read_bool(&mut Cursor::new([0x00])).unwrap());
     }
 
     #[test]
