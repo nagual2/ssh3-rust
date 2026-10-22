@@ -19,6 +19,8 @@ use ssh3_quinn::{
     Ssh3AcceptChannelError, Ssh3ConfigError, Ssh3OpenChannelError, Ssh3RouteAcceptedChannelError,
 };
 
+use crate::forwarding_wire::Ssh3ForwardingWireError;
+
 /// Every failure that the server can surface to its caller.
 ///
 /// The variants mirror the layer that produced the failure (configuration,
@@ -54,6 +56,8 @@ pub enum Ssh3ServerError {
     Conversation(Ssh3ConversationError),
     /// The channel failed.
     Channel(Ssh3ChannelError),
+    /// A forwarding payload of the peer could not be decoded.
+    ForwardingWire(Ssh3ForwardingWireError),
 }
 
 impl fmt::Display for Ssh3ServerError {
@@ -73,6 +77,7 @@ impl fmt::Display for Ssh3ServerError {
             Self::DatagramDispatch(err) => write!(f, "{err}"),
             Self::Conversation(err) => write!(f, "{err}"),
             Self::Channel(err) => write!(f, "{err}"),
+            Self::ForwardingWire(err) => write!(f, "{err}"),
         }
     }
 }
@@ -94,6 +99,7 @@ impl std::error::Error for Ssh3ServerError {
             Self::DatagramDispatch(err) => Some(err),
             Self::Conversation(err) => Some(err),
             Self::Channel(err) => Some(err),
+            Self::ForwardingWire(err) => Some(err),
         }
     }
 }

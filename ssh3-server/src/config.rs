@@ -25,6 +25,54 @@ use crate::forwarding::ForwardPolicy;
 /// `crypt(3)`.
 pub type Ssh3PasswordVerifier = Arc<dyn Fn(&str, &str) -> io::Result<bool> + Send + Sync + 'static>;
 
+/// The `GatewayPorts` policy of the reverse forwards.
+///
+/// The policy follows the `sshd_config` semantics: `no` (the default) forces
+/// every client-requested bind back to the loopback, `clientspecified` honors
+/// the bind address the client asked for and `yes` binds the wildcard
+/// address regardless of the request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GatewayPortsPolicy {
+    /// Force every client-requested bind back to the loopback.
+    #[default]
+    No,
+    /// Honor the bind address the client asked for.
+    ClientSpecified,
+    /// Bind the wildcard address regardless of the request.
+    Yes,
+}
+
+impl GatewayPortsPolicy {
+    /// Parses the policy of the `GatewayPorts` directive.
+    ///
+    /// The accepted spellings are `no`, `clientspecified` and `yes`.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        match spec.trim() {
+            "no" => Ok(Self::No),
+            "clientspecified" => Ok(Self::ClientSpecified),
+            "yes" => Ok(Self::Yes),
+            other => Err(format!(
+                "invalid GatewayPorts policy {other:?}: want no, clientspecified or yes"
+            )),
+        }
+    }
+
+    /// Returns the canonical spelling of the policy.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::No => "no",
+            Self::ClientSpecified => "clientspecified",
+            Self::Yes => "yes",
+        }
+    }
+}
+
+impl fmt::Display for GatewayPortsPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Everything that describes how an SSH3 server behaves.
 ///
 /// The struct is cheap to clone: it is cloned per accepted connection, so all
@@ -69,6 +117,15 @@ pub struct Ssh3ServerConfig {
     ///
     /// `None` keeps the historical unrestricted behavior.
     pub permit_listen: Option<ForwardPolicy>,
+    /// The `GatewayPorts` policy of the reverse forwards.
+    ///
+    /// The default forces every client-requested bind back to the loopback.
+    pub gateway_ports: GatewayPortsPolicy,
+    /// Maximum number of active reverse-forward listeners one user may hold.
+    ///
+    /// The listeners of a user are counted across their conversations; a
+    /// request over the cap is refused with a readable reason.
+    pub max_reverse_forwards_per_user: usize,
     /// Maximum number of conversations that may wait for their authentication.
     ///
     /// A conversation over the cap is refused with `503 Service Unavailable`
@@ -112,6 +169,11 @@ impl fmt::Debug for Ssh3ServerConfig {
             .field("url_path", &self.url_path)
             .field("permit_open", &self.permit_open)
             .field("permit_listen", &self.permit_listen)
+            .field("gateway_ports", &self.gateway_ports)
+            .field(
+                "max_reverse_forwards_per_user",
+                &self.max_reverse_forwards_per_user,
+            )
             .field(
                 "max_unauthenticated_conversations",
                 &self.max_unauthenticated_conversations,
@@ -142,6 +204,8 @@ impl Default for Ssh3ServerConfig {
             url_path: DEFAULT_URL_PATH.to_string(),
             permit_open: None,
             permit_listen: None,
+            gateway_ports: GatewayPortsPolicy::default(),
+            max_reverse_forwards_per_user: DEFAULT_MAX_REVERSE_FORWARDS_PER_USER,
             max_unauthenticated_conversations: DEFAULT_MAX_UNAUTHENTICATED_CONVERSATIONS,
             max_password_failures: DEFAULT_MAX_PASSWORD_FAILURES,
             password_lockout: DEFAULT_PASSWORD_LOCKOUT,
@@ -169,6 +233,9 @@ pub const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60)
 
 /// The default handshake timeout of a connection (the ssh2 `LoginGraceTime` scale).
 pub const DEFAULT_HANDSHAKE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The default number of active reverse-forward listeners one user may hold.
+pub const DEFAULT_MAX_REVERSE_FORWARDS_PER_USER: usize = 10;
 
 /// Returns the name of the user the server process runs as.
 ///

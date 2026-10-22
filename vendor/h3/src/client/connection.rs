@@ -472,15 +472,13 @@ where
         //# receipt of a server-initiated bidirectional stream as a connection
         //# error of type H3_STREAM_CREATION_ERROR unless such an extension has
         //# been negotiated.
-        if self.inner.poll_accept_bi(cx).is_ready() {
-            return Poll::Ready(
-                self.inner
-                    .handle_connection_error(InternalConnectionError::new(
-                        Code::H3_STREAM_CREATION_ERROR,
-                        "client received a server-initiated bidirectional stream".to_string(),
-                    )),
-            );
-        }
+        //
+        // SSH3 negotiates no such extension: the protocol carries its own
+        // channels on the server-initiated bidirectional streams (the reverse
+        // forwarding bridges the server opens towards the client). The HTTP/3
+        // layer must leave those streams to the SSH3 layer, which accepts
+        // them on the raw QUIC connection: accepting the stream here would
+        // consume it, and refusing it would kill the connection.
 
         Poll::Pending
     }

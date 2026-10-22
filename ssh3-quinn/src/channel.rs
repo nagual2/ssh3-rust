@@ -21,6 +21,27 @@ pub struct Ssh3IncomingChannel {
     pub forwarding_target: Option<SocketAddr>,
 }
 
+/// Tells whether the header of a channel of that type carries the address of
+/// a forwarding target.
+///
+/// The `direct-*` channels are opened by the client and the `forwarded-*`
+/// channels by the server: both carry the address of the target in the
+/// additional bytes of their header.
+fn carries_forwarding_target(channel_type: &[u8]) -> bool {
+    matches!(
+        channel_type,
+        b"direct-tcp" | b"direct-udp" | b"forwarded-tcp" | b"forwarded-udp"
+    )
+}
+
+/// Tells whether the channel of that type carries datagrams.
+///
+/// The `forwarded-udp` channels are opened by the server towards the client,
+/// but they carry datagrams exactly like the `direct-udp` ones.
+fn carries_datagrams(channel_type: &[u8]) -> bool {
+    matches!(channel_type, b"direct-udp" | b"forwarded-udp")
+}
+
 impl Ssh3IncomingChannel {
     pub fn into_accepted_channel(
         self,
@@ -51,7 +72,7 @@ impl Ssh3IncomingChannel {
         recv: quinn::RecvStream,
         send: quinn::SendStream,
     ) -> Ssh3AcceptedChannel {
-        let datagram_sender = (self.header.channel_type.as_slice() == b"direct-udp")
+        let datagram_sender = carries_datagrams(self.header.channel_type.as_slice())
             .then(|| conversation.datagram_sender_for_channel(self.stream_id));
         // The peer must not pick the size of the buffers of this endpoint:
         // its value is bounded by the value this endpoint announces.
@@ -82,7 +103,7 @@ impl Ssh3IncomingChannel {
         let stream_id = self.stream_id;
         let forwarding_target = self.forwarding_target;
         let channel_type = self.header.channel_type.clone();
-        let datagram_sender = if channel_type.as_slice() == b"direct-udp" {
+        let datagram_sender = if carries_datagrams(channel_type.as_slice()) {
             datagram_sender
         } else {
             None
@@ -104,14 +125,18 @@ impl Ssh3IncomingChannel {
         ));
 
         match (channel_type.as_slice(), forwarding_target) {
-            (b"direct-udp", Some(remote_addr)) => Ssh3AcceptedChannel::UdpForwarding {
-                channel,
-                remote_addr,
-            },
-            (b"direct-tcp", Some(remote_addr)) => Ssh3AcceptedChannel::TcpForwarding {
-                channel,
-                remote_addr,
-            },
+            (b"direct-udp", Some(remote_addr)) | (b"forwarded-udp", Some(remote_addr)) => {
+                Ssh3AcceptedChannel::UdpForwarding {
+                    channel,
+                    remote_addr,
+                }
+            }
+            (b"direct-tcp", Some(remote_addr)) | (b"forwarded-tcp", Some(remote_addr)) => {
+                Ssh3AcceptedChannel::TcpForwarding {
+                    channel,
+                    remote_addr,
+                }
+            }
             _ => Ssh3AcceptedChannel::Channel(channel),
         }
     }
@@ -411,7 +436,9 @@ pub async fn read_incoming_channel(
     }
 
     let forwarding_target = match header.channel_type.as_slice() {
-        b"direct-udp" | b"direct-tcp" => Some(read_forwarding_target(recv).await?),
+        channel_type if carries_forwarding_target(channel_type) => {
+            Some(read_forwarding_target(recv).await?)
+        }
         _ => None,
     };
 
@@ -1013,6 +1040,66 @@ mod tests {
         };
         send.write_all(&header.encode(None)).await.unwrap();
         (send, recv)
+    }
+
+    /// Opens a stream and writes the header of a forwarded channel, with the
+    /// address of the target in the additional bytes of the header.
+    async fn open_raw_forwarded_channel(
+        connection: &quinn::Connection,
+        conversation_stream_id: u64,
+        channel_type: &[u8],
+        target: SocketAddr,
+    ) -> (quinn::SendStream, quinn::RecvStream) {
+        let (mut send, recv) = connection.open_bi().await.unwrap();
+        let header = Ssh3ChannelHeader {
+            conversation_stream_id,
+            channel_type: channel_type.to_vec(),
+            max_packet_size: 1024,
+        };
+        let additional_bytes =
+            ssh3_proto::build_forwarding_additional_bytes(target.ip(), target.port());
+        send.write_all(&header.encode(Some(&additional_bytes)))
+            .await
+            .unwrap();
+        (send, recv)
+    }
+
+    #[tokio::test]
+    async fn forwarded_channels_carry_their_target_in_the_header() {
+        let (_client_endpoint, _server_endpoint, client_connection, server_connection) =
+            loopback().await;
+
+        let target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 42), 8080));
+        let _raw =
+            open_raw_forwarded_channel(&client_connection, 5, b"forwarded-tcp", target).await;
+
+        let (incoming, send, recv) = tokio::time::timeout(
+            Duration::from_secs(5),
+            accept_bi_channel(&server_connection),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(incoming.header.channel_type, b"forwarded-tcp".to_vec());
+        assert_eq!(incoming.forwarding_target, Some(target));
+
+        let conversation = Ssh3Conversation::new(
+            5,
+            conversation_id(),
+            4096,
+            8,
+            Arc::new(Ssh3QuinnDatagramSender::new(server_connection.clone())),
+        );
+        let accepted = incoming.into_accepted_channel_for_conversation(&conversation, recv, send);
+        match accepted {
+            Ssh3AcceptedChannel::TcpForwarding { remote_addr, .. } => {
+                assert_eq!(remote_addr, target);
+            }
+            other => panic!(
+                "expected TCP forwarding channel, got the channel type {:?}",
+                other.channel().channel_type()
+            ),
+        }
     }
 
     #[tokio::test]

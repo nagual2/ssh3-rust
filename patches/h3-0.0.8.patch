@@ -2,7 +2,7 @@ Shim patch for the crates.io h3 0.0.8 crate.
 
 The workspace pins h3 through a [patch.crates-io] path override to
 vendor/h3. The vendored tree is the upstream crates.io h3 0.0.8 release
-with two local edits applied:
+with three local edits applied:
 
   * src/ext.rs            - the closed 'Protocol' enumeration is replaced by
                             an open 'Cow<str>' token, so that the SSH3 extended
@@ -12,12 +12,50 @@ with two local edits applied:
   * src/proto/headers.rs  - 'ext.get::<Protocol>().copied()' becomes
                             '.cloned()', because the open Protocol token is no
                             longer Copy.
+  * src/client/connection.rs - the client driver no longer refuses a
+                            server-initiated bidirectional stream with the
+                            H3_STREAM_CREATION_ERROR connection error of
+                            RFC 9114, section 6.1. The SSH3 protocol carries
+                            its own channels on those streams (the reverse
+                            forwarding bridges the server opens towards the
+                            client), and the SSH3 layer accepts them on the
+                            raw QUIC connection, exactly like the reference
+                            implementation does: the HTTP/3 layer must not
+                            consume them, and it must not kill the connection
+                            because of them.
 
 Apply with: patch -p1 -d <h3-0.0.8 source tree> < h3-0.0.8.patch
 Verify with: scripts/verify-h3-shim.sh
 
---- a/src/ext.rs
-+++ b/src/ext.rs
+diff -ruN --strip-trailing-cr h3-0.0.8/src/client/connection.rs h3-patched/src/client/connection.rs
+--- a/src/client/connection.rs	2026-10-22 14:42:18.872544170 +0200
++++ b/src/client/connection.rs	2026-10-22 14:42:18.854284126 +0200
+@@ -472,15 +472,13 @@
+         //# receipt of a server-initiated bidirectional stream as a connection
+         //# error of type H3_STREAM_CREATION_ERROR unless such an extension has
+         //# been negotiated.
+-        if self.inner.poll_accept_bi(cx).is_ready() {
+-            return Poll::Ready(
+-                self.inner
+-                    .handle_connection_error(InternalConnectionError::new(
+-                        Code::H3_STREAM_CREATION_ERROR,
+-                        "client received a server-initiated bidirectional stream".to_string(),
+-                    )),
+-            );
+-        }
++        //
++        // SSH3 negotiates no such extension: the protocol carries its own
++        // channels on the server-initiated bidirectional streams (the reverse
++        // forwarding bridges the server opens towards the client). The HTTP/3
++        // layer must leave those streams to the SSH3 layer, which accepts
++        // them on the raw QUIC connection: accepting the stream here would
++        // consume it, and refusing it would kill the connection.
+ 
+         Poll::Pending
+     }
+diff -ruN --strip-trailing-cr h3-0.0.8/src/ext.rs h3-patched/src/ext.rs
+--- a/src/ext.rs	2026-10-22 14:42:18.871359743 +0200
++++ b/src/ext.rs	2026-10-22 14:42:18.852754768 +0200
 @@ -1,46 +1,39 @@
  //! Extensions for the HTTP/3 protocol.
  
@@ -79,8 +117,9 @@ Verify with: scripts/verify-h3-shim.sh
 +        Ok(Self::new(s.to_owned()))
      }
  }
---- a/src/proto/headers.rs
-+++ b/src/proto/headers.rs
+diff -ruN --strip-trailing-cr h3-0.0.8/src/proto/headers.rs h3-patched/src/proto/headers.rs
+--- a/src/proto/headers.rs	2026-10-22 14:42:18.873210318 +0200
++++ b/src/proto/headers.rs	2026-10-22 14:42:18.855108122 +0200
 @@ -378,7 +378,7 @@
          //
          // See: [https://www.rfc-editor.org/rfc/rfc8441#section-4]

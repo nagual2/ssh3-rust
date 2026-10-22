@@ -4,11 +4,15 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, ValueHint, error::ErrorKind};
-use ssh3_server::{ForwardPolicy, Ssh3ServerConfig, parse_duration, run_with_self_signed};
+use ssh3_server::{
+    ForwardPolicy, GatewayPortsPolicy, Ssh3ServerConfig, parse_duration, run_with_self_signed,
+};
 
 /// The environment variables the server options can be set with.
 const ENV_PERMIT_OPEN: &str = "SSH3_PERMIT_OPEN";
 const ENV_PERMIT_LISTEN: &str = "SSH3_PERMIT_LISTEN";
+const ENV_GATEWAY_PORTS: &str = "SSH3_GATEWAY_PORTS";
+const ENV_MAX_REVERSE_FORWARDS: &str = "SSH3_MAX_REVERSE_FORWARDS";
 const ENV_URL_PATH: &str = "SSH3_URL_PATH";
 const ENV_HANDSHAKE_IDLE_TIMEOUT: &str = "SSH3_HANDSHAKE_IDLE_TIMEOUT";
 const ENV_MAX_IDLE_TIMEOUT: &str = "SSH3_MAX_IDLE_TIMEOUT";
@@ -68,6 +72,18 @@ struct Cli {
     #[arg(long = "permit-listen", value_name = "SPEC")]
     permit_listen: Option<String>,
 
+    /// The `GatewayPorts` policy of the reverse forwards.
+    ///
+    /// `no` (the default) forces every client-requested bind back to the
+    /// loopback, `clientspecified` honors the requested address and `yes`
+    /// binds the wildcard address.
+    #[arg(long = "gateway-ports", value_name = "POLICY")]
+    gateway_ports: Option<String>,
+
+    /// Maximum number of active reverse-forward listeners one user may hold.
+    #[arg(long = "max-reverse-forwards", value_name = "COUNT")]
+    max_reverse_forwards: Option<usize>,
+
     /// The secret URL path the server accepts its CONNECT requests on.
     #[arg(long = "url-path", value_name = "PATH")]
     url_path: Option<String>,
@@ -113,6 +129,8 @@ struct Cli {
 const GO_STYLE_OPTIONS: &[&str] = &[
     "permit-open",
     "permit-listen",
+    "gateway-ports",
+    "max-reverse-forwards",
     "url-path",
     "handshake-idle-timeout",
     "max-idle-timeout",
@@ -242,6 +260,25 @@ fn parse_args() -> Result<Ssh3ServerConfig, clap::Error> {
 
     if let Some(url_path) = cli.url_path.or_else(|| env_value(ENV_URL_PATH)) {
         config.url_path = url_path;
+    }
+
+    if let Some(policy) = cli.gateway_ports.or_else(|| env_value(ENV_GATEWAY_PORTS)) {
+        config.gateway_ports = match GatewayPortsPolicy::parse(&policy) {
+            Ok(policy) => policy,
+            Err(err) => {
+                return Err(clap::Error::raw(
+                    clap::error::ErrorKind::ValueValidation,
+                    err,
+                ));
+            }
+        };
+    }
+
+    if let Some(max) = cli
+        .max_reverse_forwards
+        .or_else(|| env_number(ENV_MAX_REVERSE_FORWARDS))
+    {
+        config.max_reverse_forwards_per_user = max;
     }
 
     if let Some(timeout) = cli

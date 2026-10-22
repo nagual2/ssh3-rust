@@ -45,14 +45,14 @@ use crate::forwarding::ForwardPolicy;
 use crate::runtime::serve_connection;
 use crate::session::{effective_shell, lookup_session_user};
 
-struct TestHarness {
-    client_endpoint: quinn::Endpoint,
-    client_connection: quinn::Connection,
-    conversation: Arc<Ssh3Conversation>,
+pub(crate) struct TestHarness {
+    pub(crate) client_endpoint: quinn::Endpoint,
+    pub(crate) client_connection: quinn::Connection,
+    pub(crate) conversation: Arc<Ssh3Conversation>,
     _control_stream: Ssh3ClientControlStream,
     _send_request: Ssh3SendRequest,
-    driver_task: tokio::task::JoinHandle<()>,
-    server_task: tokio::task::JoinHandle<()>,
+    pub(crate) driver_task: tokio::task::JoinHandle<()>,
+    pub(crate) server_task: tokio::task::JoinHandle<()>,
 }
 
 struct SessionOutput {
@@ -62,7 +62,7 @@ struct SessionOutput {
 }
 
 impl TestHarness {
-    async fn open_session_channel(&self) -> Arc<Ssh3Channel> {
+    pub(crate) async fn open_session_channel(&self) -> Arc<Ssh3Channel> {
         open_channel(
             self.conversation.as_ref(),
             &self.client_connection,
@@ -74,7 +74,7 @@ impl TestHarness {
         .unwrap()
     }
 
-    async fn shutdown(self) {
+    pub(crate) async fn shutdown(self) {
         self.client_connection.close(0u32.into(), b"done");
         let _ = timeout(Duration::from_secs(5), self.driver_task)
             .await
@@ -88,6 +88,24 @@ async fn attempt_harness_with_headers(
     server_config: Ssh3ServerConfig,
     requested_user: Option<&str>,
     authorization: Option<&str>,
+) -> Result<TestHarness, Ssh3ClientConversationError> {
+    attempt_harness_with_options(server_config, requested_user, authorization, true).await
+}
+
+/// Builds a harness for a server.
+///
+/// `drive_http3` tells whether the HTTP/3 client connection keeps being
+/// polled once the conversation is established. The HTTP/3 client connection
+/// refuses a bidirectional stream the server opens (RFC 9114, section 6.1),
+/// and the reverse forwarding mirrors the connections of the server towards
+/// the client with exactly such a stream: a client that asks for a reverse
+/// forwarding must therefore stop polling the HTTP/3 connection once the
+/// conversation is established.
+async fn attempt_harness_with_options(
+    server_config: Ssh3ServerConfig,
+    requested_user: Option<&str>,
+    authorization: Option<&str>,
+    drive_http3: bool,
 ) -> Result<TestHarness, Ssh3ClientConversationError> {
     let (server_config_tls, server_certificate) =
         self_signed_server_config(vec!["localhost".to_string()]).unwrap();
@@ -127,8 +145,16 @@ async fn attempt_harness_with_headers(
         .unwrap();
 
     let (mut driver, mut send_request) = new_client(client_connection.clone()).await.unwrap();
+    let (stop_driver, stop_signal) = tokio::sync::oneshot::channel::<()>();
     let driver_task = tokio::spawn(async move {
-        let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+        if drive_http3 {
+            let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+        } else {
+            tokio::select! {
+                _ = poll_fn(|cx| driver.poll_close(cx)) => {}
+                _ = stop_signal => {}
+            }
+        }
     });
     let mut request = build_connect_request(
         "https://localhost/ssh3-term".parse().unwrap(),
@@ -169,6 +195,9 @@ async fn attempt_harness_with_headers(
             return Err(err);
         }
     };
+    // the conversation is established: the HTTP/3 connection does not have to
+    // be polled anymore
+    let _ = stop_driver.send(());
 
     Ok(TestHarness {
         client_endpoint,
@@ -373,8 +402,19 @@ async fn attempt_authenticated_harness(
     })
 }
 
-async fn setup_harness(server_config: Ssh3ServerConfig) -> TestHarness {
+pub(crate) async fn setup_harness(server_config: Ssh3ServerConfig) -> TestHarness {
     attempt_harness(server_config, None).await.unwrap()
+}
+
+/// Builds a harness for a client that accepts the channels the server opens.
+///
+/// The HTTP/3 client connection is not polled once the conversation is
+/// established: it would refuse the bidirectional streams the server opens
+/// for the reverse forwarding.
+pub(crate) async fn setup_forwarding_harness(server_config: Ssh3ServerConfig) -> TestHarness {
+    attempt_harness_with_options(server_config, None, None, false)
+        .await
+        .unwrap()
 }
 
 async fn collect_session_output(channel: Arc<Ssh3Channel>) -> SessionOutput {

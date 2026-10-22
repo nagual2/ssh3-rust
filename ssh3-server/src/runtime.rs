@@ -20,11 +20,16 @@ use ssh3_quinn::Ssh3IncomingChannelRouter;
 
 use crate::auth::{AuthOutcome, authorize_request, parse_request_authorization};
 use crate::config::{Ssh3ServerConfig, validate_server_config};
+use crate::dynamic_forward::{
+    CHANNEL_TYPE_DYNAMIC_FORWARD, CHANNEL_TYPE_DYNAMIC_FORWARD_TCP, handle_dynamic_forward_channel,
+    handle_dynamic_forward_data_channel,
+};
 use crate::error::{
     Ssh3ServerError, is_benign_connection_error, is_benign_datagram_error, is_benign_route_error,
     is_benign_server_error,
 };
-use crate::forwarding::{handle_tcp_forwarding, handle_udp_forwarding};
+use crate::forwarding::{ForwardingState, handle_tcp_forwarding, handle_udp_forwarding};
+use crate::reverse_forward::{CHANNEL_TYPE_REVERSE_FORWARD, handle_reverse_forward_channel};
 use crate::session::{
     AgentForwardingSlot, SessionUser, handle_plain_channel, resolve_session_user,
 };
@@ -99,9 +104,16 @@ pub async fn serve_connection(
 async fn route_datagrams(
     connection: Connection,
     channel_router: Arc<Ssh3IncomingChannelRouter>,
+    forwarding_state: Arc<ForwardingState>,
 ) -> Result<(), Ssh3DatagramDispatchError> {
     loop {
         let datagram = connection.read_datagram().await?;
+        // The channels the server opens towards the client are not registered
+        // in the conversation of the peer, so their datagrams are routed by
+        // the state of the conversation.
+        if forwarding_state.route_datagram(&datagram).await {
+            continue;
+        }
         let _ = route_registered_datagram(channel_router.as_ref(), &datagram).await?;
     }
 }
@@ -239,11 +251,16 @@ async fn handle_conversation(
         // conversation and removed when the conversation ends
         let agent_forwarding = AgentForwardingSlot::new();
 
+        // the reverse and dynamic forwards of a conversation share their
+        // guards, so they are owned by the conversation as well
+        let forwarding_state = Arc::new(ForwardingState::new());
+
         let datagrams_task = tokio::spawn({
             let channel_router = channel_router.clone();
             let connection = connection.clone();
+            let forwarding_state = forwarding_state.clone();
             async move {
-                match route_datagrams(connection, channel_router).await {
+                match route_datagrams(connection, channel_router, forwarding_state).await {
                     Ok(()) => Ok(()),
                     Err(err) if is_benign_datagram_error(&err) => Ok(()),
                     Err(err) => Err(Ssh3ServerError::DatagramDispatch(err)),
@@ -261,6 +278,7 @@ async fn handle_conversation(
                     let conversation = accepted.conversation.clone();
                     let session_user = session_user.clone();
                     let agent_forwarding = agent_forwarding.clone();
+                    let forwarding_state = forwarding_state.clone();
                     tokio::spawn(async move {
                         if let Err(err) = handle_accepted_channel(
                             accepted_channel,
@@ -269,6 +287,7 @@ async fn handle_conversation(
                             config,
                             session_user,
                             agent_forwarding,
+                            forwarding_state,
                         )
                         .await
                         {
@@ -300,19 +319,40 @@ async fn handle_accepted_channel(
     config: Ssh3ServerConfig,
     session_user: SessionUser,
     agent_forwarding: AgentForwardingSlot,
+    forwarding_state: Arc<ForwardingState>,
 ) -> Result<(), Ssh3ServerError> {
     match accepted_channel {
-        Ssh3AcceptedChannel::Channel(channel) => {
-            handle_plain_channel(
-                channel,
-                conversation,
-                connection,
-                config,
-                session_user,
-                agent_forwarding,
-            )
-            .await
-        }
+        Ssh3AcceptedChannel::Channel(channel) => match channel.channel_type() {
+            CHANNEL_TYPE_REVERSE_FORWARD => {
+                handle_reverse_forward_channel(
+                    channel,
+                    conversation,
+                    connection,
+                    config,
+                    session_user,
+                    forwarding_state,
+                )
+                .await
+            }
+            CHANNEL_TYPE_DYNAMIC_FORWARD => {
+                handle_dynamic_forward_channel(channel, connection, forwarding_state).await
+            }
+            CHANNEL_TYPE_DYNAMIC_FORWARD_TCP => {
+                handle_dynamic_forward_data_channel(channel, connection, config, forwarding_state)
+                    .await
+            }
+            _ => {
+                handle_plain_channel(
+                    channel,
+                    conversation,
+                    connection,
+                    config,
+                    session_user,
+                    agent_forwarding,
+                )
+                .await
+            }
+        },
         Ssh3AcceptedChannel::UdpForwarding {
             channel,
             remote_addr,
