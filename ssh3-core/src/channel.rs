@@ -7,19 +7,58 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use ssh3_proto::{
     SSH_EXTENDED_DATA_NONE, Ssh3ChannelHeader, Ssh3ChannelOpenConfirmationMessage,
     Ssh3ChannelOpenFailureMessage, Ssh3ChannelRequestMessage, Ssh3DataOrExtendedDataMessage,
     Ssh3DataType, Ssh3Message,
 };
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 
 use crate::conversation::{Ssh3ConversationDatagramSender, Ssh3ConversationId};
 use crate::queue::Ssh3DatagramQueue;
 use crate::transport::{Ssh3ReceiveStream, Ssh3SendStream};
+
+/// Smallest maximum packet size a channel may negotiate, in bytes.
+///
+/// Below this value the outbound chunk size (the maximum packet size minus
+/// the length of the data frame header) underflows and the write loop stops
+/// making progress, and a read buffer of that size would starve the channel
+/// anyway.
+pub const MIN_MAX_PACKET_SIZE: u64 = 4096;
+
+/// Largest maximum packet size a peer may announce, in bytes.
+///
+/// The value is bounded by the maximum length of an SSH string, the largest
+/// payload a channel may carry.
+pub const MAX_MAX_PACKET_SIZE: u64 = ssh3_proto::MAX_SSH_STRING_LEN;
+
+/// Capacity of the queue of messages the reader task fills.
+const MESSAGE_QUEUE_CAPACITY: usize = 32;
+
+/// Error code sent to the peer when a read is cancelled.
+const CANCEL_READ_ERROR_CODE: u64 = 42;
+
+/// Floors the maximum packet size a local endpoint announces.
+///
+/// The floor is applied where the channel is built, so the invariant that
+/// the maximum packet size exceeds the length of the data frame header holds
+/// for every caller instead of depending on the call sites.
+pub fn clamp_local_max_packet_size(local: u64) -> u64 {
+    local.max(MIN_MAX_PACKET_SIZE)
+}
+
+/// Bounds the maximum packet size a peer announces.
+///
+/// The value of the peer is floored at [`MIN_MAX_PACKET_SIZE`] and capped by
+/// the value the local endpoint announces: the peer must not pick the size
+/// of the buffers of the local endpoint, and the channel would starve with a
+/// packet size below the floor.
+pub fn clamp_peer_max_packet_size(peer: u64, local: u64) -> u64 {
+    peer.max(MIN_MAX_PACKET_SIZE).min(local)
+}
 
 /// Static description of a channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,11 +271,86 @@ pub struct Ssh3Channel {
     info: Ssh3ChannelInfo,
     confirm_sent: AtomicBool,
     confirm_received: AtomicBool,
+    /// Maximum packet size the peer announced, once it is known.
+    peer_max_packet_size: AtomicU64,
     header: Mutex<Option<Vec<u8>>>,
     datagram_sender: RwLock<Option<Arc<Ssh3ConversationDatagramSender>>>,
-    recv: AsyncMutex<Box<dyn Ssh3ReceiveStream>>,
+    recv: Ssh3Recv,
     send: AsyncMutex<Box<dyn Ssh3SendStream>>,
     datagrams_queue: RwLock<Arc<Ssh3DatagramQueue>>,
+}
+
+/// The receive side of a channel.
+///
+/// The stream is read by a dedicated task that owns it and hands the parsed
+/// messages over a queue. The task never holds a lock of the channel while it
+/// waits for the peer, so a pending read can always be cancelled and the
+/// writers of the channel are never blocked by a silent peer.
+struct Ssh3Recv {
+    /// State shared with the reader task.
+    shared: Arc<Ssh3RecvShared>,
+    /// Queue of the messages the reader task parsed.
+    queue: AsyncMutex<mpsc::Receiver<Result<Ssh3Message, Ssh3ChannelError>>>,
+    /// The stream, moved into the reader task when it starts.
+    stream: Mutex<Option<Box<dyn Ssh3ReceiveStream>>>,
+    /// Whether the reader task was already started.
+    started: AtomicBool,
+}
+
+/// The state the reader task shares with the channel.
+struct Ssh3RecvShared {
+    /// Sender of the queue of parsed messages.
+    sender: mpsc::Sender<Result<Ssh3Message, Ssh3ChannelError>>,
+    /// Set when the caller cancelled the read.
+    cancelled: AtomicBool,
+    /// Set when the channel is being dropped.
+    closing: AtomicBool,
+    /// Set when the reader task ended.
+    finished: AtomicBool,
+    /// Wakes the reader task when the read is cancelled.
+    notify: Notify,
+}
+
+impl Ssh3RecvShared {
+    /// Returns `true` when the reader task must stop.
+    fn stop_requested(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst)
+    }
+}
+
+impl Ssh3Recv {
+    /// Creates the receive side of a channel.
+    fn new(recv: Box<dyn Ssh3ReceiveStream>) -> Self {
+        let (sender, queue) = mpsc::channel(MESSAGE_QUEUE_CAPACITY);
+        Self {
+            shared: Arc::new(Ssh3RecvShared {
+                sender,
+                cancelled: AtomicBool::new(false),
+                closing: AtomicBool::new(false),
+                finished: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+            queue: AsyncMutex::new(queue),
+            stream: Mutex::new(Some(recv)),
+            started: AtomicBool::new(false),
+        }
+    }
+
+    /// Cancels the pending read.
+    ///
+    /// The reader task is woken up so it can abort the read of the transport,
+    /// and the waiters are woken up with an error.
+    fn cancel(&self) {
+        self.shared.cancelled.store(true, Ordering::SeqCst);
+        self.shared.notify.notify_waiters();
+        let _ = self.shared.sender.try_send(Err(cancelled_error()));
+    }
+
+    /// Stops the reader task without reporting an error to the waiters.
+    fn close(&self) {
+        self.shared.closing.store(true, Ordering::SeqCst);
+        self.shared.notify.notify_waiters();
+    }
 }
 
 impl Ssh3Channel {
@@ -267,6 +381,9 @@ impl Ssh3Channel {
         W: Ssh3SendStream + 'static,
     {
         let channel_type = channel_type.into();
+        // The floor is applied where the channel is built, so the value that
+        // reaches the header and the channel info is always usable.
+        let max_packet_size = clamp_local_max_packet_size(max_packet_size);
         let header = send_header.then(|| {
             Ssh3ChannelHeader {
                 conversation_stream_id,
@@ -286,9 +403,10 @@ impl Ssh3Channel {
             },
             confirm_sent: AtomicBool::new(confirm_sent),
             confirm_received: AtomicBool::new(confirm_received),
+            peer_max_packet_size: AtomicU64::new(MAX_MAX_PACKET_SIZE),
             header: Mutex::new(header),
             datagram_sender: RwLock::new(datagram_sender),
-            recv: AsyncMutex::new(Box::new(recv)),
+            recv: Ssh3Recv::new(Box::new(recv)),
             send: AsyncMutex::new(Box::new(send)),
             datagrams_queue: RwLock::new(Arc::new(Ssh3DatagramQueue::new(datagrams_queue_size))),
         }
@@ -338,15 +456,14 @@ impl Ssh3Channel {
         if self.confirm_received() {
             return Ok(());
         }
+        self.start_reader()?;
 
-        let message = {
-            let mut recv = self.recv.lock().await;
-            parse_message(recv.as_mut()).await?
-        };
+        let message = self.next_queued_message().await?;
 
         match message {
-            Ssh3Message::ChannelOpenConfirmation(_) => {
+            Ssh3Message::ChannelOpenConfirmation(confirmation) => {
                 self.confirm_received.store(true, Ordering::SeqCst);
+                self.apply_peer_max_packet_size(confirmation.max_packet_size);
                 Ok(())
             }
             Ssh3Message::ChannelOpenFailure(message) => {
@@ -366,15 +483,15 @@ impl Ssh3Channel {
     /// A confirmation message is consumed silently: it only updates the
     /// confirmation state. Any other message is returned to the caller.
     pub async fn next_message(&self) -> Result<Ssh3Message, Ssh3ChannelError> {
+        self.start_reader()?;
+
         loop {
-            let message = {
-                let mut recv = self.recv.lock().await;
-                parse_message(recv.as_mut()).await?
-            };
+            let message = self.next_queued_message().await?;
 
             match message {
-                Ssh3Message::ChannelOpenConfirmation(_) => {
+                Ssh3Message::ChannelOpenConfirmation(confirmation) => {
                     self.confirm_received.store(true, Ordering::SeqCst);
+                    self.apply_peer_max_packet_size(confirmation.max_packet_size);
                     continue;
                 }
                 Ssh3Message::ChannelOpenFailure(message) => {
@@ -395,6 +512,105 @@ impl Ssh3Channel {
         }
     }
 
+    /// Starts the task that reads the stream of the channel.
+    ///
+    /// The task owns the stream, so it can be cancelled while it waits for
+    /// the peer. It is started once, when the first message is requested.
+    fn start_reader(&self) -> Result<(), Ssh3ChannelError> {
+        // The lock of the stream serializes the start: the task that owns
+        // the stream is started exactly once.
+        let mut stream = self.recv.stream.lock().unwrap();
+        if self.recv.started.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let Some(taken) = stream.take() else {
+            return Err(Ssh3ChannelError::Io(io::Error::other(
+                "the stream of the channel is already gone",
+            )));
+        };
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle,
+            Err(_) => {
+                // The stream is given back: the reader can be started later.
+                *stream = Some(taken);
+                return Err(Ssh3ChannelError::Io(io::Error::other(
+                    "a tokio runtime is needed to read the channel",
+                )));
+            }
+        };
+
+        self.recv.started.store(true, Ordering::SeqCst);
+        let shared = Arc::downgrade(&self.recv.shared);
+        let sender = self.recv.shared.sender.clone();
+        handle.spawn(read_messages(shared, taken, sender));
+        Ok(())
+    }
+
+    /// Returns the next message the reader task parsed.
+    async fn next_queued_message(&self) -> Result<Ssh3Message, Ssh3ChannelError> {
+        let mut queue = self.recv.queue.lock().await;
+        loop {
+            if self.recv.shared.cancelled.load(Ordering::SeqCst) {
+                return Err(cancelled_error());
+            }
+            match queue.try_recv() {
+                Ok(message) => return message,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => return Err(finished_error()),
+            }
+            if self.recv.shared.finished.load(Ordering::SeqCst) {
+                return Err(finished_error());
+            }
+
+            // The notification is registered before the state is checked
+            // again, so an end of the stream that happens in between is not
+            // missed.
+            let notified = self.recv.shared.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match queue.try_recv() {
+                Ok(message) => return message,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => return Err(finished_error()),
+            }
+            if self.recv.shared.cancelled.load(Ordering::SeqCst) {
+                return Err(cancelled_error());
+            }
+            if self.recv.shared.finished.load(Ordering::SeqCst) {
+                return Err(finished_error());
+            }
+
+            tokio::select! {
+                biased;
+                _ = &mut notified => continue,
+                message = queue.recv() => {
+                    return match message {
+                        Some(message) => message,
+                        None => Err(finished_error()),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Records the maximum packet size the peer announced.
+    fn apply_peer_max_packet_size(&self, peer: u64) {
+        let clamped = clamp_peer_max_packet_size(peer, self.info.max_packet_size);
+        self.peer_max_packet_size.store(clamped, Ordering::SeqCst);
+    }
+
+    /// Returns the maximum packet size the channel may use for its frames.
+    ///
+    /// It is the smallest of the value the local endpoint announced and the
+    /// value the peer announced, so a frame never exceeds what the peer
+    /// accepts.
+    fn negotiated_max_packet_size(&self) -> u64 {
+        self.peer_max_packet_size
+            .load(Ordering::SeqCst)
+            .min(self.info.max_packet_size)
+    }
+
     /// Writes the channel header, unless it was already written.
     ///
     /// The header is sent at most once per channel, before the first message.
@@ -410,8 +626,9 @@ impl Ssh3Channel {
     /// Writes payload data to the channel.
     ///
     /// The payload is split into chunks that fit into the negotiated maximum
-    /// packet size. Returns the number of bytes written, including the
-    /// framing of the data messages.
+    /// packet size, so a frame never exceeds what the peer accepts. Returns
+    /// the number of bytes written, including the framing of the data
+    /// messages.
     pub async fn write_data(
         &self,
         data_buf: &[u8],
@@ -424,14 +641,13 @@ impl Ssh3Channel {
             data: Vec::new(),
         };
         let overhead = empty.encoded_len();
-        let max_payload = self
-            .info
-            .max_packet_size
-            .checked_sub(overhead as u64)
-            .ok_or(Ssh3ChannelError::MaxPacketSizeTooSmall {
-                max_packet_size: self.info.max_packet_size,
+        let max_packet_size = self.negotiated_max_packet_size();
+        let max_payload = max_packet_size.checked_sub(overhead as u64).ok_or(
+            Ssh3ChannelError::MaxPacketSizeTooSmall {
+                max_packet_size,
                 message_overhead: overhead,
-            })? as usize;
+            },
+        )? as usize;
 
         let mut written = 0;
         let mut send = self.send.lock().await;
@@ -509,8 +725,12 @@ impl Ssh3Channel {
     }
 
     /// Aborts a pending read on the channel.
+    ///
+    /// The call returns as soon as the cancellation is signalled: the read of
+    /// the transport is aborted by the task that owns the stream, and the
+    /// pending call that waits for a message returns an error.
     pub async fn cancel_read(&self) {
-        self.recv.lock().await.cancel_read(42);
+        self.recv.cancel();
     }
 
     /// Closes the write side of the channel.
@@ -531,6 +751,106 @@ impl Ssh3Channel {
     pub fn set_datagram_queue(&self, queue: Arc<Ssh3DatagramQueue>) {
         *self.datagrams_queue.write().unwrap() = queue;
     }
+}
+
+impl Drop for Ssh3Channel {
+    fn drop(&mut self) {
+        // Stop the task that reads the stream: it holds the stream of the
+        // channel and would otherwise wait for a peer that is gone.
+        self.recv.close();
+    }
+}
+
+/// Reads the messages of a channel and hands them over to the waiters.
+///
+/// The task owns the stream of the channel, so it can abort the read of the
+/// transport when the read is cancelled. It never holds a lock of the channel
+/// while it waits for the peer.
+async fn read_messages(
+    shared: Weak<Ssh3RecvShared>,
+    mut stream: Box<dyn Ssh3ReceiveStream>,
+    sender: mpsc::Sender<Result<Ssh3Message, Ssh3ChannelError>>,
+) {
+    let mut cancelled = false;
+
+    loop {
+        let Some(state) = shared.upgrade() else {
+            break;
+        };
+        if state.stop_requested() {
+            break;
+        }
+
+        // The notification is registered before the state is checked again,
+        // so a cancellation that happens in between is not missed.
+        let notified = state.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if state.stop_requested() {
+            break;
+        }
+
+        let message = tokio::select! {
+            biased;
+            _ = &mut notified => {
+                cancelled = true;
+                break;
+            }
+            result = parse_message(stream.as_mut()) => result,
+        };
+
+        match message {
+            Ok(message) => {
+                let notified = state.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let sent = tokio::select! {
+                    biased;
+                    _ = &mut notified => {
+                        cancelled = true;
+                        break;
+                    }
+                    result = sender.send(Ok(message)) => result.is_ok(),
+                };
+                if !sent {
+                    break;
+                }
+            }
+            Err(err) => {
+                let _ = sender.try_send(Err(err));
+                break;
+            }
+        }
+    }
+
+    if cancelled {
+        // The peer is told that the read was aborted instead of waiting for
+        // a message that will never arrive.
+        stream.cancel_read(CANCEL_READ_ERROR_CODE);
+    }
+
+    if let Some(state) = shared.upgrade() {
+        state.finished.store(true, Ordering::SeqCst);
+        // The waiters that are still waiting for a message are woken up: the
+        // stream of the channel is over.
+        state.notify.notify_waiters();
+    }
+}
+
+/// Returns the error reported when a read was cancelled.
+fn cancelled_error() -> Ssh3ChannelError {
+    Ssh3ChannelError::Io(io::Error::new(
+        io::ErrorKind::Interrupted,
+        "the read of the channel was cancelled",
+    ))
+}
+
+/// Returns the error reported when the stream of the channel ended.
+fn finished_error() -> Ssh3ChannelError {
+    Ssh3ChannelError::Io(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "the stream of the channel ended",
+    ))
 }
 
 async fn parse_message(recv: &mut dyn Ssh3ReceiveStream) -> Result<Ssh3Message, Ssh3ChannelError> {
@@ -699,6 +1019,16 @@ async fn read_var_int(recv: &mut dyn Ssh3ReceiveStream) -> Result<u64, Ssh3Chann
 
 async fn read_ssh_bytes(recv: &mut dyn Ssh3ReceiveStream) -> Result<Vec<u8>, Ssh3ChannelError> {
     let len = read_var_int(recv).await?;
+    // The length is chosen by the peer: refuse it before allocating, so a
+    // hostile peer cannot make the process allocate an arbitrary buffer.
+    if len > ssh3_proto::MAX_SSH_STRING_LEN {
+        return Err(Ssh3ChannelError::Proto(
+            ssh3_proto::Ssh3Error::StringTooLong {
+                length: len,
+                limit: ssh3_proto::MAX_SSH_STRING_LEN,
+            },
+        ));
+    }
     let len = usize::try_from(len)
         .map_err(|_| Ssh3ChannelError::Proto(ssh3_proto::Ssh3Error::InvalidLength(len)))?;
     let mut out = vec![0; len];
@@ -724,15 +1054,23 @@ async fn read_byte(recv: &mut dyn Ssh3ReceiveStream) -> Result<u8, Ssh3ChannelEr
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
+    use async_trait::async_trait;
     use ssh3_proto::{
-        Ssh3ChannelHeader, Ssh3ChannelRequest, Ssh3ChannelRequestMessage, Ssh3Message,
-        Ssh3SignalRequest, append_var_int,
+        SSH_MSG_CHANNEL_DATA, Ssh3ChannelHeader, Ssh3ChannelRequest, Ssh3ChannelRequestMessage,
+        Ssh3Message, Ssh3SignalRequest, append_var_int,
     };
 
-    use super::{Ssh3Channel, Ssh3ChannelError};
+    use super::{
+        MIN_MAX_PACKET_SIZE, Ssh3Channel, Ssh3ChannelError, clamp_local_max_packet_size,
+        clamp_peer_max_packet_size,
+    };
     use crate::conversation::Ssh3ConversationDatagramSender;
+    use crate::transport::Ssh3ReceiveStream;
     use crate::transport::testutil::{
         BytesReceiveStream, RecordingDatagramSender, RecordingSendStream,
     };
@@ -741,8 +1079,97 @@ mod tests {
         [7; 32]
     }
 
+    /// A receive stream that never delivers a byte until it is cancelled.
+    struct BlockingReceiveStream {
+        cancelled: Arc<AtomicBool>,
+        codes: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl BlockingReceiveStream {
+        fn new() -> (Self, Arc<Mutex<Vec<u64>>>) {
+            let codes = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    codes: codes.clone(),
+                },
+                codes,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Ssh3ReceiveStream for BlockingReceiveStream {
+        async fn read_exact(&mut self, _buf: &mut [u8]) -> io::Result<()> {
+            while !self.cancelled.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(io::Error::new(io::ErrorKind::Interrupted, "read cancelled"))
+        }
+
+        fn cancel_read(&mut self, error_code: u64) {
+            self.codes.lock().unwrap().push(error_code);
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
     #[tokio::test]
     async fn write_data_sends_header_once_and_chunks_payload() {
+        let (recv, _) = BytesReceiveStream::new(Vec::new());
+        let (send, handle) = RecordingSendStream::new();
+        let channel = Ssh3Channel::new(
+            11,
+            conversation_id(),
+            22,
+            b"session".to_vec(),
+            MIN_MAX_PACKET_SIZE,
+            recv,
+            send,
+            None,
+            true,
+            true,
+            true,
+            4,
+            None,
+        );
+
+        // The payload is split into chunks that fit into the negotiated
+        // maximum packet size.
+        let overhead = ssh3_proto::Ssh3DataOrExtendedDataMessage {
+            data_type: ssh3_proto::SSH_EXTENDED_DATA_NONE,
+            data: Vec::new(),
+        }
+        .encoded_len() as u64;
+        let chunk_size = (MIN_MAX_PACKET_SIZE - overhead) as usize;
+        let payload: Vec<u8> = (0..chunk_size * 2 + 5).map(|i| i as u8).collect();
+
+        let written = channel
+            .write_data(&payload, ssh3_proto::SSH_EXTENDED_DATA_NONE)
+            .await
+            .unwrap();
+        let mut expected = Ssh3ChannelHeader {
+            conversation_stream_id: 11,
+            channel_type: b"session".to_vec(),
+            max_packet_size: MIN_MAX_PACKET_SIZE,
+        }
+        .encode(None);
+        let header_len = expected.len();
+        for chunk in payload.chunks(chunk_size) {
+            expected.extend_from_slice(
+                &Ssh3Message::Data(ssh3_proto::Ssh3DataOrExtendedDataMessage {
+                    data_type: ssh3_proto::SSH_EXTENDED_DATA_NONE,
+                    data: chunk.to_vec(),
+                })
+                .to_vec(),
+            );
+        }
+
+        assert_eq!(written, expected.len() - header_len);
+        assert_eq!(handle.bytes(), expected);
+    }
+
+    #[tokio::test]
+    async fn local_max_packet_size_is_floored_at_construction() {
         let (recv, _) = BytesReceiveStream::new(Vec::new());
         let (send, handle) = RecordingSendStream::new();
         let channel = Ssh3Channel::new(
@@ -761,34 +1188,111 @@ mod tests {
             None,
         );
 
-        let written = channel
-            .write_data(b"abcdefg", ssh3_proto::SSH_EXTENDED_DATA_NONE)
-            .await
-            .unwrap();
-        let mut expected = Ssh3ChannelHeader {
+        assert_eq!(channel.max_packet_size(), MIN_MAX_PACKET_SIZE);
+        let header = Ssh3ChannelHeader {
             conversation_stream_id: 11,
             channel_type: b"session".to_vec(),
-            max_packet_size: 5,
+            max_packet_size: MIN_MAX_PACKET_SIZE,
         }
         .encode(None);
-        let header_len = expected.len();
-        for chunk in [
-            b"ab".as_slice(),
-            b"cd".as_slice(),
-            b"ef".as_slice(),
-            b"g".as_slice(),
-        ] {
-            expected.extend_from_slice(
-                &Ssh3Message::Data(ssh3_proto::Ssh3DataOrExtendedDataMessage {
-                    data_type: ssh3_proto::SSH_EXTENDED_DATA_NONE,
-                    data: chunk.to_vec(),
-                })
-                .to_vec(),
+        channel.maybe_send_header().await.unwrap();
+        assert_eq!(handle.bytes(), header);
+    }
+
+    #[test]
+    fn peer_max_packet_size_is_bounded_by_the_local_value() {
+        let local = 30_000;
+        let cases = [
+            (0, MIN_MAX_PACKET_SIZE),
+            (1, MIN_MAX_PACKET_SIZE),
+            (MIN_MAX_PACKET_SIZE - 1, MIN_MAX_PACKET_SIZE),
+            (MIN_MAX_PACKET_SIZE, MIN_MAX_PACKET_SIZE),
+            (29_999, 29_999),
+            (30_000, 30_000),
+            (30_001, 30_000),
+            (1 << 24, 30_000),
+            (1 << 62, 30_000),
+        ];
+        for (peer, expected) in cases {
+            assert_eq!(
+                clamp_peer_max_packet_size(peer, local),
+                expected,
+                "peer {peer} must be clamped to {expected}"
             );
         }
 
-        assert_eq!(written, expected.len() - header_len);
-        assert_eq!(handle.bytes(), expected);
+        // A local value under the floor is not raised by the clamp: the clamp
+        // bounds the peer by what the local endpoint announces.
+        assert_eq!(clamp_peer_max_packet_size(0, 2048), 2048);
+        // The floor of the local value is applied where the channel is built.
+        assert_eq!(clamp_local_max_packet_size(0), MIN_MAX_PACKET_SIZE);
+        assert_eq!(clamp_local_max_packet_size(2048), MIN_MAX_PACKET_SIZE);
+        assert_eq!(clamp_local_max_packet_size(30_000), 30_000);
+    }
+
+    #[tokio::test]
+    async fn write_data_never_exceeds_the_size_agreed_with_the_peer() {
+        // The peer confirms the channel with a smaller packet size.
+        let mut confirmation = Vec::new();
+        append_var_int(
+            &mut confirmation,
+            ssh3_proto::SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
+        );
+        append_var_int(&mut confirmation, 4096);
+        let (recv, _) = BytesReceiveStream::new(confirmation);
+        let (send, handle) = RecordingSendStream::new();
+        let channel = Ssh3Channel::new(
+            11,
+            conversation_id(),
+            22,
+            b"session".to_vec(),
+            30_000,
+            recv,
+            send,
+            None,
+            true,
+            true,
+            false,
+            4,
+            None,
+        );
+        channel.wait_for_confirmation().await.unwrap();
+
+        let payload = vec![7; 20_000];
+        channel
+            .write_data(&payload, ssh3_proto::SSH_EXTENDED_DATA_NONE)
+            .await
+            .unwrap();
+
+        // Every data frame carries at most the payload that fits into the
+        // size the peer accepted.
+        let overhead = ssh3_proto::Ssh3DataOrExtendedDataMessage {
+            data_type: ssh3_proto::SSH_EXTENDED_DATA_NONE,
+            data: Vec::new(),
+        }
+        .encoded_len() as u64;
+        let bytes = handle.bytes();
+        let header = Ssh3ChannelHeader {
+            conversation_stream_id: 11,
+            channel_type: b"session".to_vec(),
+            max_packet_size: 30_000,
+        }
+        .encode(None);
+        assert_eq!(&bytes[..header.len()], &header[..]);
+        let mut cursor = std::io::Cursor::new(&bytes[header.len()..]);
+        let mut frames = 0;
+        while (cursor.position() as usize) < cursor.get_ref().len() {
+            let message_type = ssh3_proto::read_var_int(&mut cursor).unwrap();
+            assert_eq!(message_type, SSH_MSG_CHANNEL_DATA);
+            let length = ssh3_proto::read_var_int(&mut cursor).unwrap();
+            assert!(
+                length + overhead <= 4096,
+                "frame of {length} bytes exceeds the size the peer accepted"
+            );
+            cursor.set_position(cursor.position() + length);
+            frames += 1;
+        }
+        assert!(frames > 1, "the payload must be split into several frames");
     }
 
     #[tokio::test]
@@ -902,5 +1406,90 @@ mod tests {
         append_var_int(&mut expected, 22);
         expected.extend_from_slice(&[9, 8, 7]);
         assert_eq!(sender.datagrams(), vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn oversized_strings_in_a_message_are_refused() {
+        let mut recv_bytes = Vec::new();
+        append_var_int(&mut recv_bytes, SSH_MSG_CHANNEL_DATA);
+        append_var_int(&mut recv_bytes, ssh3_proto::MAX_SSH_STRING_LEN + 1);
+        let (recv, _) = BytesReceiveStream::new(recv_bytes);
+        let (send, _) = RecordingSendStream::new();
+        let channel = Ssh3Channel::new(
+            1,
+            conversation_id(),
+            2,
+            b"session".to_vec(),
+            MIN_MAX_PACKET_SIZE,
+            recv,
+            send,
+            None,
+            false,
+            true,
+            true,
+            4,
+            None,
+        );
+
+        match channel.next_message().await {
+            Err(Ssh3ChannelError::Proto(ssh3_proto::Ssh3Error::StringTooLong {
+                length,
+                limit,
+            })) => {
+                assert_eq!(length, ssh3_proto::MAX_SSH_STRING_LEN + 1);
+                assert_eq!(limit, ssh3_proto::MAX_SSH_STRING_LEN);
+            }
+            other => panic!("expected a length error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_read_interrupts_a_blocked_read() {
+        let (recv, codes) = BlockingReceiveStream::new();
+        let (send, _) = RecordingSendStream::new();
+        let channel = Arc::new(Ssh3Channel::new(
+            1,
+            conversation_id(),
+            2,
+            b"session".to_vec(),
+            MIN_MAX_PACKET_SIZE,
+            recv,
+            send,
+            None,
+            false,
+            true,
+            true,
+            4,
+            None,
+        ));
+
+        // The reader blocks on the stream of the channel.
+        let reader = channel.clone();
+        let pending = tokio::spawn(async move { reader.next_message().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The cancellation returns at once, even though the read is pending.
+        tokio::time::timeout(Duration::from_secs(2), channel.cancel_read())
+            .await
+            .expect("cancel_read must not wait for the pending read");
+
+        // The pending read gives up instead of waiting for the peer.
+        let result = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("the pending read must return")
+            .expect("the reader task must not panic");
+        assert!(result.is_err(), "the pending read must report an error");
+
+        // The read of the transport was aborted, so the peer is not left
+        // waiting for a message that will never arrive.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while codes.lock().unwrap().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the read of the transport was not aborted"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*codes.lock().unwrap(), vec![super::CANCEL_READ_ERROR_CODE]);
     }
 }

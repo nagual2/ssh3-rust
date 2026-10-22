@@ -17,10 +17,10 @@
 //! | Module | Responsibility |
 //! |---|---|
 //! | `config` | [`Ssh3ServerConfig`] and the defaults it is built from |
-//! | `auth` | request authorization: bearer tokens, OIDC identities, passwords |
+//! | `auth` | request authorization: bearer tokens, OIDC identities, passwords, DoS guards |
 //! | `session` | session channels, process spawning, agent forwarding |
 //! | `pty` | pseudo-terminal allocation, sizing and signal delivery |
-//! | `forwarding` | direct TCP/UDP port forwarding |
+//! | `forwarding` | direct TCP/UDP port forwarding and the `PermitOpen` policy |
 //! | `tls` | self-signed TLS entry point |
 //! | `runtime` | endpoint/connection acceptance and channel routing |
 //! | `error` | [`Ssh3ServerError`] and benign-error classification |
@@ -37,7 +37,9 @@ mod tls;
 #[cfg(test)]
 mod tests;
 
-pub use config::{Ssh3PasswordVerifier, Ssh3ServerConfig};
+pub use auth::Ssh3AuthGuard;
+pub use config::{Ssh3PasswordVerifier, Ssh3ServerConfig, parse_duration};
 pub use error::Ssh3ServerError;
+pub use forwarding::{ForwardPolicy, check_listen_target};
 pub use runtime::{serve_connection, serve_endpoint};
-pub use tls::run_with_self_signed;
+pub use tls::{apply_transport_timeouts, run_with_self_signed};

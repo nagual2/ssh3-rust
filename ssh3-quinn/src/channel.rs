@@ -6,8 +6,9 @@ use std::sync::Mutex;
 
 use quinn::{Connection, ConnectionError, RecvStream};
 use ssh3_core::{
-    Ssh3AcceptedChannel, Ssh3Channel, Ssh3Conversation, Ssh3ConversationDatagramSender,
-    Ssh3ConversationError, Ssh3ConversationId,
+    MAX_MAX_PACKET_SIZE, Ssh3AcceptedChannel, Ssh3Channel, Ssh3Conversation,
+    Ssh3ConversationDatagramSender, Ssh3ConversationError, Ssh3ConversationId,
+    clamp_peer_max_packet_size,
 };
 use ssh3_proto::{SSH_FRAME_TYPE, Ssh3ChannelHeader, Ssh3ForwardingAddressFamily};
 
@@ -29,6 +30,55 @@ impl Ssh3IncomingChannel {
         datagram_sender: Option<Arc<Ssh3ConversationDatagramSender>>,
         datagrams_queue_size: usize,
     ) -> Ssh3AcceptedChannel {
+        // Without a conversation the value this endpoint announces is
+        // unknown: the value of the peer is only bounded by the protocol
+        // limit.
+        let max_packet_size =
+            clamp_peer_max_packet_size(self.header.max_packet_size, MAX_MAX_PACKET_SIZE);
+        self.build(
+            max_packet_size,
+            conversation_id,
+            recv,
+            send,
+            datagram_sender,
+            datagrams_queue_size,
+        )
+    }
+
+    pub fn into_accepted_channel_for_conversation(
+        self,
+        conversation: &Ssh3Conversation,
+        recv: quinn::RecvStream,
+        send: quinn::SendStream,
+    ) -> Ssh3AcceptedChannel {
+        let datagram_sender = (self.header.channel_type.as_slice() == b"direct-udp")
+            .then(|| conversation.datagram_sender_for_channel(self.stream_id));
+        // The peer must not pick the size of the buffers of this endpoint:
+        // its value is bounded by the value this endpoint announces.
+        let max_packet_size =
+            clamp_peer_max_packet_size(self.header.max_packet_size, conversation.max_packet_size());
+        self.build(
+            max_packet_size,
+            conversation.conversation_id(),
+            recv,
+            send,
+            datagram_sender,
+            conversation.default_datagrams_queue_size(),
+        )
+    }
+
+    /// Builds the channel of an incoming channel with the maximum packet
+    /// size this endpoint uses on it.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        &self,
+        max_packet_size: u64,
+        conversation_id: Ssh3ConversationId,
+        recv: quinn::RecvStream,
+        send: quinn::SendStream,
+        datagram_sender: Option<Arc<Ssh3ConversationDatagramSender>>,
+        datagrams_queue_size: usize,
+    ) -> Ssh3AcceptedChannel {
         let stream_id = self.stream_id;
         let forwarding_target = self.forwarding_target;
         let channel_type = self.header.channel_type.clone();
@@ -41,8 +91,8 @@ impl Ssh3IncomingChannel {
             self.header.conversation_stream_id,
             conversation_id,
             stream_id,
-            self.header.channel_type,
-            self.header.max_packet_size,
+            self.header.channel_type.clone(),
+            max_packet_size,
             Ssh3QuinnReceiveStream::new(recv),
             Ssh3QuinnSendStream::new(send),
             datagram_sender,
@@ -64,23 +114,6 @@ impl Ssh3IncomingChannel {
             },
             _ => Ssh3AcceptedChannel::Channel(channel),
         }
-    }
-
-    pub fn into_accepted_channel_for_conversation(
-        self,
-        conversation: &Ssh3Conversation,
-        recv: quinn::RecvStream,
-        send: quinn::SendStream,
-    ) -> Ssh3AcceptedChannel {
-        let datagram_sender = (self.header.channel_type.as_slice() == b"direct-udp")
-            .then(|| conversation.datagram_sender_for_channel(self.stream_id));
-        self.into_accepted_channel(
-            conversation.conversation_id(),
-            recv,
-            send,
-            datagram_sender,
-            conversation.default_datagrams_queue_size(),
-        )
     }
 
     pub fn into_channel(
@@ -364,6 +397,19 @@ pub async fn read_incoming_channel(
         max_packet_size: read_var_int(recv).await?,
     };
 
+    // The value the peer announces bounds the data messages it may send on
+    // the channel: left unbounded it is a second unvalidated allocation
+    // knob, because the data messages are parsed as SSH strings.
+    if header.max_packet_size > MAX_MAX_PACKET_SIZE {
+        return Err(Ssh3ChannelSetupError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "peer max packet size {} exceeds the limit of {MAX_MAX_PACKET_SIZE}",
+                header.max_packet_size
+            ),
+        )));
+    }
+
     let forwarding_target = match header.channel_type.as_slice() {
         b"direct-udp" | b"direct-tcp" => Some(read_forwarding_target(recv).await?),
         _ => None,
@@ -500,6 +546,16 @@ async fn read_var_int(recv: &mut RecvStream) -> Result<u64, Ssh3ChannelSetupErro
 
 async fn read_ssh_bytes(recv: &mut RecvStream) -> Result<Vec<u8>, Ssh3ChannelSetupError> {
     let len = read_var_int(recv).await?;
+    // The length is chosen by the peer: refuse it before allocating, so a
+    // hostile peer cannot make the process allocate an arbitrary buffer.
+    if len > ssh3_proto::MAX_SSH_STRING_LEN {
+        return Err(Ssh3ChannelSetupError::Proto(
+            ssh3_proto::Ssh3Error::StringTooLong {
+                length: len,
+                limit: ssh3_proto::MAX_SSH_STRING_LEN,
+            },
+        ));
+    }
     let len = usize::try_from(len)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SSH string too large"))?;
     let mut out = vec![0; len];
@@ -526,8 +582,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use ssh3_core::{Ssh3AcceptedChannel, Ssh3Conversation};
-    use ssh3_proto::{Ssh3ChannelRequest, Ssh3ChannelRequestMessage, Ssh3Message, append_var_int};
+    use ssh3_core::{MAX_MAX_PACKET_SIZE, Ssh3AcceptedChannel, Ssh3Conversation};
+    use ssh3_proto::{
+        Ssh3ChannelHeader, Ssh3ChannelRequest, Ssh3ChannelRequestMessage, Ssh3Message,
+        append_var_int,
+    };
 
     use super::{
         Ssh3IncomingChannelRouter, Ssh3RouteAcceptedChannelError, accept_bi_channel, open_channel,
@@ -937,5 +996,70 @@ mod tests {
             }
             _ => panic!("expected routing error"),
         }
+    }
+
+    /// Opens a stream and writes a channel header with the given maximum
+    /// packet size, the way a peer that announces a value of its own would.
+    async fn open_raw_channel(
+        connection: &quinn::Connection,
+        conversation_stream_id: u64,
+        max_packet_size: u64,
+    ) -> (quinn::SendStream, quinn::RecvStream) {
+        let (mut send, recv) = connection.open_bi().await.unwrap();
+        let header = Ssh3ChannelHeader {
+            conversation_stream_id,
+            channel_type: b"session".to_vec(),
+            max_packet_size,
+        };
+        send.write_all(&header.encode(None)).await.unwrap();
+        (send, recv)
+    }
+
+    #[tokio::test]
+    async fn incoming_channels_reject_an_oversized_max_packet_size() {
+        let (_client_endpoint, _server_endpoint, client_connection, server_connection) =
+            loopback().await;
+        let _raw = open_raw_channel(&client_connection, 5, MAX_MAX_PACKET_SIZE + 1).await;
+
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            accept_bi_channel(&server_connection),
+        )
+        .await
+        .unwrap()
+        {
+            Err(super::Ssh3AcceptChannelError::Setup(super::Ssh3ChannelSetupError::Io(err))) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected the channel to be refused, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn incoming_channels_bound_the_max_packet_size_of_the_peer() {
+        let (_client_endpoint, _server_endpoint, client_connection, server_connection) =
+            loopback().await;
+
+        let local_max_packet_size = 4096;
+        let conversation = Ssh3Conversation::new(
+            5,
+            conversation_id(),
+            local_max_packet_size,
+            8,
+            Arc::new(Ssh3QuinnDatagramSender::new(client_connection.clone())),
+        );
+        let router = Ssh3IncomingChannelRouter::new();
+        router.register_conversation(Arc::new(conversation));
+
+        // The peer announces a value above the one this endpoint announces.
+        let _raw = open_raw_channel(&client_connection, 5, 1 << 20).await;
+
+        let conversation = router
+            .accept_and_route_channel(&server_connection)
+            .await
+            .unwrap();
+        let accepted = conversation.accept_channel_with_metadata().await.unwrap();
+        let channel = accepted.channel();
+        assert_eq!(channel.max_packet_size(), local_max_packet_size);
     }
 }

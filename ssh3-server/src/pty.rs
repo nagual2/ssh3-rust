@@ -225,6 +225,10 @@ mod unix {
                     request: Ssh3ChannelRequest::ExitStatus(Ssh3ExitStatusRequest { exit_status }),
                 })
                 .await;
+            // The exit status ends the session. The Go server does not close
+            // the channel here either: closing it right away races the
+            // delivery of the status, and a client that reads an EOF before
+            // the status reports a failure.
         });
 
         Ok(RunningSession {

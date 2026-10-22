@@ -223,6 +223,47 @@ impl Drop for AgentForwarding {
     }
 }
 
+/// The owner of the forwarded agent socket of a conversation.
+///
+/// The socket must outlive the session channel that requested it: a client
+/// may close the session channel right away and connect to the agent socket
+/// afterwards, and a socket that disappears with the session channel makes
+/// the agent unusable (`ENOENT`). The slot is owned by the conversation, so
+/// the socket is removed when the conversation ends and the forwarding is
+/// really over.
+#[derive(Clone, Default)]
+pub(crate) struct AgentForwardingSlot {
+    #[cfg(unix)]
+    inner: Arc<std::sync::Mutex<Option<AgentForwarding>>>,
+}
+
+impl AgentForwardingSlot {
+    /// Creates an empty slot.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the path of the forwarded agent socket, if it was opened.
+    #[cfg(unix)]
+    pub(crate) fn socket_path(&self) -> Option<PathBuf> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|forwarding| forwarding.socket_path().to_path_buf())
+    }
+
+    /// Takes ownership of the forwarded agent socket.
+    ///
+    /// A slot that already holds a socket keeps the old one; the new socket
+    /// is dropped, which removes it from the file system.
+    #[cfg(unix)]
+    pub(crate) fn store(&self, forwarding: AgentForwarding) {
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        *inner = Some(forwarding);
+    }
+}
+
 /// The input side of a running session: either a pipe or a pseudo-terminal.
 pub(crate) enum SessionInput {
     /// Standard input of a process without a pseudo-terminal.
@@ -329,9 +370,18 @@ pub(crate) async fn handle_plain_channel(
     connection: Connection,
     config: Ssh3ServerConfig,
     session_user: SessionUser,
+    agent_forwarding: AgentForwardingSlot,
 ) -> Result<(), Ssh3ServerError> {
     if channel.channel_type() == b"session" {
-        handle_session_channel(channel, conversation, connection, config, session_user).await
+        handle_session_channel(
+            channel,
+            conversation,
+            connection,
+            config,
+            session_user,
+            agent_forwarding,
+        )
+        .await
     } else {
         write_stderr(
             channel.as_ref(),
@@ -359,10 +409,9 @@ pub(crate) async fn handle_session_channel(
     connection: Connection,
     config: Ssh3ServerConfig,
     session_user: SessionUser,
+    agent_forwarding: AgentForwardingSlot,
 ) -> Result<(), Ssh3ServerError> {
     let mut pending_pty: Option<PendingPty> = None;
-    #[cfg(unix)]
-    let mut agent_forwarding: Option<AgentForwarding> = None;
     let mut session: Option<RunningSession> = None;
 
     loop {
@@ -385,6 +434,7 @@ pub(crate) async fn handle_session_channel(
                 }
                 Ssh3ChannelRequest::Shell => {
                     if session.is_none() {
+                        let agent_socket_path = agent_forwarding.socket_path();
                         session = Some(
                             spawn_session_process(
                                 channel.clone(),
@@ -394,7 +444,7 @@ pub(crate) async fn handle_session_channel(
                                 {
                                     #[cfg(unix)]
                                     {
-                                        agent_forwarding.as_ref().map(AgentForwarding::socket_path)
+                                        agent_socket_path.as_deref()
                                     }
                                     #[cfg(not(unix))]
                                     {
@@ -411,6 +461,7 @@ pub(crate) async fn handle_session_channel(
                 }
                 Ssh3ChannelRequest::Exec(exec) => {
                     if session.is_none() {
+                        let agent_socket_path = agent_forwarding.socket_path();
                         session = Some(
                             spawn_session_process(
                                 channel.clone(),
@@ -420,7 +471,7 @@ pub(crate) async fn handle_session_channel(
                                 {
                                     #[cfg(unix)]
                                     {
-                                        agent_forwarding.as_ref().map(AgentForwarding::socket_path)
+                                        agent_socket_path.as_deref()
                                     }
                                     #[cfg(not(unix))]
                                     {
@@ -484,16 +535,15 @@ pub(crate) async fn handle_session_channel(
                 } else if message.data == b"forward-agent" {
                     #[cfg(unix)]
                     {
-                        if agent_forwarding.is_none() {
-                            agent_forwarding = Some(
-                                open_agent_socket_and_forward_agent(
-                                    conversation.clone(),
-                                    connection.clone(),
-                                    &config,
-                                    &session_user,
-                                )
-                                .await?,
-                            );
+                        if agent_forwarding.socket_path().is_none() {
+                            let forwarding = open_agent_socket_and_forward_agent(
+                                conversation.clone(),
+                                connection.clone(),
+                                &config,
+                                &session_user,
+                            )
+                            .await?;
+                            agent_forwarding.store(forwarding);
                         }
                     }
 
@@ -612,6 +662,10 @@ async fn spawn_pipe_session_process(
                 request: Ssh3ChannelRequest::ExitStatus(Ssh3ExitStatusRequest { exit_status }),
             })
             .await;
+        // The exit status ends the session. The Go server does not close the
+        // channel here either ("both channels are closed, nothing else to
+        // do"): closing it right away races the delivery of the status, and a
+        // client that reads an EOF before the status reports a failure.
     });
 
     Ok(RunningSession {

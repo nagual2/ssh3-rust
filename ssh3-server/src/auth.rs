@@ -14,9 +14,18 @@
 //! (`require_authentication`, `enable_password_login` and
 //! `authorized_identity_paths` are all empty/disabled), every request is
 //! accepted.
+//!
+//! The authentication phase is guarded against denial of service by
+//! [`Ssh3AuthGuard`]: the number of conversations that wait for their
+//! authentication is capped (the `MaxStartups` analog) and repeated failed
+//! password attempts lock an account out for a while.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -38,6 +47,162 @@ pub(crate) enum RequestAuthorization {
     Basic { username: String, password: String },
     /// HTTP bearer authentication carrying a raw token.
     Bearer(String),
+}
+
+/// The verdict of the authorization of a CONNECT request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuthOutcome {
+    /// The request may proceed.
+    Authorized,
+    /// The credentials were missing or wrong (`401 Unauthorized`).
+    Unauthorized,
+    /// The account is locked out after too many failed attempts
+    /// (`429 Too Many Requests`).
+    TooManyRequests,
+}
+
+/// The bookkeeping of the failed password attempts of one account.
+#[derive(Clone, Copy, Debug)]
+struct PasswordFailureRecord {
+    /// Consecutive failed attempts that were booked.
+    failures: u32,
+    /// Instant the lockout expires; `None` while the account is not locked.
+    locked_until: Option<Instant>,
+}
+
+/// The DoS guards of the authentication phase.
+///
+/// The guard holds the two counters of the `MaxStartups` analog: the number
+/// of conversations that sit unauthenticated and the failed password attempts
+/// per account. It is shared by all connections of a server, so a client that
+/// opens many conversations or guesses many passwords exhausts its own budget
+/// only.
+#[derive(Debug, Default)]
+pub struct Ssh3AuthGuard {
+    unauthenticated: AtomicUsize,
+    password_failures: Mutex<HashMap<String, PasswordFailureRecord>>,
+}
+
+impl Ssh3AuthGuard {
+    /// Creates an empty guard.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Admits one more conversation into the unauthenticated phase.
+    ///
+    /// Returns `false` when the cap is reached; the caller has to refuse the
+    /// conversation then.
+    pub fn try_acquire_unauthenticated(&self, max: usize) -> bool {
+        let mut current = self.unauthenticated.load(Ordering::SeqCst);
+        loop {
+            if current >= max {
+                return false;
+            }
+            match self.unauthenticated.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Gives one unauthenticated slot back.
+    pub fn release_unauthenticated(&self) {
+        let mut current = self.unauthenticated.load(Ordering::SeqCst);
+        loop {
+            if current == 0 {
+                return;
+            }
+            match self.unauthenticated.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Reports whether the account is currently locked out of the password
+    /// backend.
+    ///
+    /// An expired lockout clears the record lazily.
+    pub fn password_locked(&self, user: &str) -> bool {
+        let mut failures = self
+            .password_failures
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(record) = failures.get(user) else {
+            return false;
+        };
+
+        if let Some(locked_until) = record.locked_until
+            && Instant::now() < locked_until
+        {
+            return true;
+        }
+
+        if record.locked_until.is_some() {
+            failures.remove(user);
+        }
+
+        false
+    }
+
+    /// Books one failed password attempt.
+    ///
+    /// Hitting the failure limit locks the account out for the given
+    /// duration. An account that is already locked out is not extended by
+    /// attempts that never reached the password backend.
+    pub fn password_failure(&self, user: &str, max_failures: u32, lockout: Duration) {
+        let mut failures = self
+            .password_failures
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let now = Instant::now();
+        let record = failures
+            .entry(user.to_string())
+            .or_insert(PasswordFailureRecord {
+                failures: 0,
+                locked_until: None,
+            });
+
+        if record
+            .locked_until
+            .is_some_and(|locked_until| now < locked_until)
+        {
+            return;
+        }
+
+        record.failures = record.failures.saturating_add(1);
+        if record.failures >= max_failures {
+            record.locked_until = Some(now + lockout);
+        }
+    }
+
+    /// Clears the failure bookkeeping of the account.
+    pub fn password_success(&self, user: &str) {
+        let mut failures = self
+            .password_failures
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        failures.remove(user);
+    }
+}
+
+/// Reports whether password authentication must be refused for the account.
+///
+/// The root account authenticates by key only — the `PermitRootLogin
+/// prohibit-password` analog of the sshd canon.
+pub(crate) fn password_login_refused(username: &str) -> bool {
+    username == "root"
 }
 
 /// Extracts the value of a query parameter from a request URI.
@@ -274,32 +439,72 @@ fn verify_password(config: &Ssh3ServerConfig, username: &str, password: &str) ->
 
 /// Authorizes a request against the credentials it carries.
 ///
-/// Returns `Ok(true)` when the request may proceed. `Ok(false)` means the
-/// credentials were missing or wrong; an `Err` is reserved for infrastructure
-/// failures (an unreadable identity file, a failing OIDC provider).
+/// Returns [`AuthOutcome::Authorized`] when the request may proceed. A wrong
+/// or missing credential yields [`AuthOutcome::Unauthorized`], a locked-out
+/// account [`AuthOutcome::TooManyRequests`]; an `Err` is reserved for
+/// infrastructure failures (an unreadable identity file, a failing OIDC
+/// provider).
 pub(crate) async fn authorize_request(
     authorization: &RequestAuthorization,
     session_user: &SessionUser,
     conversation_id: &[u8; 32],
     config: &Ssh3ServerConfig,
-) -> Result<bool, Ssh3AuthError> {
+) -> Result<AuthOutcome, Ssh3AuthError> {
     if !should_authenticate(config) {
-        return Ok(true);
+        return Ok(AuthOutcome::Authorized);
     }
 
     match authorization {
         RequestAuthorization::Basic { username, password } => {
             if !config.enable_password_login || username != &session_user.username {
-                return Ok(false);
+                return Ok(AuthOutcome::Unauthorized);
             }
-            verify_password(config, username, password).map_err(Ssh3AuthError::from)
+
+            // the sshd PermitRootLogin prohibit-password analog: the root
+            // account never authenticates by password, whatever its shadow
+            // entry says
+            if password_login_refused(username) {
+                eprintln!(
+                    "ssh3-rust-server password auth for {username} refused: the root account authenticates by key only"
+                );
+                return Ok(AuthOutcome::Unauthorized);
+            }
+
+            if config.auth_guard.password_locked(username) {
+                eprintln!(
+                    "ssh3-rust-server password auth for {username} refused: the account is locked out"
+                );
+                return Ok(AuthOutcome::TooManyRequests);
+            }
+
+            let verified = match verify_password(config, username, password) {
+                Ok(verified) => verified,
+                Err(err) => {
+                    // a failing password backend is booked as a failed
+                    // attempt as well, so a broken backend cannot be used to
+                    // brute-force the account
+                    eprintln!("ssh3-rust-server password auth for {username} failed: {err}");
+                    false
+                }
+            };
+            if !verified {
+                config.auth_guard.password_failure(
+                    username,
+                    config.max_password_failures,
+                    config.password_lockout,
+                );
+                return Ok(AuthOutcome::Unauthorized);
+            }
+
+            config.auth_guard.password_success(username);
+            Ok(AuthOutcome::Authorized)
         }
         RequestAuthorization::Bearer(token) => {
             let identities = load_authorized_identities_from_paths(
                 &configured_authorized_identity_paths(config, session_user),
             )?;
             if identities.is_empty() {
-                return Ok(false);
+                return Ok(AuthOutcome::Unauthorized);
             }
 
             for identity in &identities {
@@ -313,7 +518,7 @@ pub(crate) async fn authorize_request(
                         )
                         .is_ok()
                         {
-                            return Ok(true);
+                            return Ok(AuthOutcome::Authorized);
                         }
                     }
                     Ssh3AuthorizedIdentity::Oidc(oidc_identity) => {
@@ -326,14 +531,14 @@ pub(crate) async fn authorize_request(
                         .await
                         .is_ok()
                         {
-                            return Ok(true);
+                            return Ok(AuthOutcome::Authorized);
                         }
                     }
                 }
             }
 
-            Ok(false)
+            Ok(AuthOutcome::Unauthorized)
         }
-        RequestAuthorization::None => Ok(false),
+        RequestAuthorization::None => Ok(AuthOutcome::Unauthorized),
     }
 }

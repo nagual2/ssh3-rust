@@ -8,6 +8,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
@@ -24,7 +25,7 @@ use ssh3_auth::{
     Ssh3AuthError, bearer_authorization_value, build_bearer_token, conversation_id_base64,
     load_private_key,
 };
-use ssh3_core::{Ssh3Channel, Ssh3ChannelError, Ssh3Conversation};
+use ssh3_core::{Ssh3Channel, Ssh3ChannelError, Ssh3Conversation, Ssh3ConversationError};
 use ssh3_h3::{
     SSH3_USER_HEADER, SSH3_VERSION_STRING, Ssh3BuildConnectRequestError, Ssh3ClientControlStream,
     Ssh3ClientConversationError, Ssh3ConversationIdError, Ssh3EstablishedClientConversation,
@@ -48,13 +49,50 @@ use tokio::signal::unix::{SignalKind, signal};
 use url::Url;
 
 mod agent;
+mod duration;
+mod escape;
+mod forward;
 
 pub use agent::Ssh3AgentSelection;
 use agent::{build_agent_bearer_token, resolve_agent_socket_path};
+pub use duration::{Ssh3DurationError, parse_duration};
+pub use escape::{Ssh3EscapeAction, Ssh3EscapeCharError, Ssh3EscapeFilter, parse_escape_char};
+pub use forward::{
+    Ssh3ForwardParseError, Ssh3ForwardProtocol, Ssh3LocalForwardSpec, parse_local_forward_spec,
+};
 
 const DEFAULT_USER_AGENT: &str = SSH3_VERSION_STRING;
 const DEFAULT_OIDC_SCOPE: &str = "openid email";
 const OIDC_CALLBACK_PATH: &str = "/ssh";
+
+/// The default QUIC handshake timeout of the client.
+///
+/// The value follows the ssh2 canon of the LoginGraceTime scale, like the Go
+/// implementation does.
+pub const DEFAULT_HANDSHAKE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The default QUIC idle timeout of the client.
+///
+/// The value follows the ssh2 canon of an idle session that is never killed
+/// (ClientAliveInterval=0), like the Go implementation does.
+pub const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The default keep-alive period of the client.
+///
+/// The keep-alive packets keep an idle session alive, so the idle timeout
+/// above only closes a connection the peer really went away.
+pub const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The default escape character of an interactive session.
+pub const DEFAULT_ESCAPE_CHAR: u8 = b'~';
+
+/// The geometry of a pty when the local console cannot be queried.
+const DEFAULT_PTY_COLUMNS: u16 = 80;
+const DEFAULT_PTY_ROWS: u16 = 24;
+
+/// The terminal type reported to the server when neither the caller nor the
+/// local environment provides one.
+const DEFAULT_TERM_TYPE: &str = "xterm-256color";
 
 #[derive(Clone, Debug)]
 pub enum Ssh3TrustStrategy {
@@ -87,6 +125,22 @@ pub struct Ssh3ClientConfig {
     pub max_packet_size: u64,
     pub default_datagrams_queue_size: usize,
     pub trust: Ssh3TrustStrategy,
+    /// The policy that decides whether the session requests a pseudo-terminal.
+    pub pty_policy: Ssh3PtyPolicy,
+    /// The terminal type reported to the server; `None` takes the local `TERM`
+    /// environment variable and falls back to a 256-color terminal.
+    pub term_type: Option<String>,
+    /// The escape character of the interactive escape sequences; zero disables
+    /// them.
+    pub escape_char: u8,
+    /// The timeout of the QUIC handshake.
+    pub handshake_idle_timeout: Duration,
+    /// The timeout of an idle QUIC connection.
+    pub max_idle_timeout: Duration,
+    /// The period of the keep-alive packets; `None` disables them.
+    pub keep_alive_interval: Option<Duration>,
+    /// The local forwards (`-L`) the session opens.
+    pub local_forwards: Vec<Ssh3LocalForwardSpec>,
 }
 
 impl Ssh3ClientConfig {
@@ -106,6 +160,43 @@ impl Ssh3ClientConfig {
             max_packet_size: 30_000,
             default_datagrams_queue_size: 10,
             trust: Ssh3TrustStrategy::WebPkiRoots,
+            pty_policy: Ssh3PtyPolicy::Auto,
+            term_type: None,
+            escape_char: DEFAULT_ESCAPE_CHAR,
+            handshake_idle_timeout: DEFAULT_HANDSHAKE_IDLE_TIMEOUT,
+            max_idle_timeout: DEFAULT_MAX_IDLE_TIMEOUT,
+            keep_alive_interval: Some(DEFAULT_KEEP_ALIVE_INTERVAL),
+            local_forwards: Vec::new(),
+        }
+    }
+}
+
+/// The policy that decides whether the client requests a pseudo-terminal.
+///
+/// The values are the ones of the `RequestTTY` keyword of ssh_config: `auto`
+/// (the default) requests a pty for an interactive session driven by a local
+/// terminal, `no` never requests one, `yes` always requests one and `force`
+/// requests one even when the local side has no terminal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Ssh3PtyPolicy {
+    #[default]
+    Auto,
+    No,
+    Yes,
+    Force,
+}
+
+impl Ssh3PtyPolicy {
+    /// Parses the value of the `RequestTTY` option.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "no" => Ok(Self::No),
+            "yes" => Ok(Self::Yes),
+            "force" => Ok(Self::Force),
+            _ => Err(format!(
+                "invalid RequestTTY policy {value:?}: want auto, no, yes or force"
+            )),
         }
     }
 }
@@ -143,19 +234,44 @@ struct RawModeGuard {
 }
 
 #[cfg(unix)]
+impl RawModeGuard {
+    /// Restores the terminal state the guard captured.
+    fn restore(&self) -> io::Result<()> {
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        termios::tcsetattr(fd, SetArg::TCSANOW, &self.original).map_err(io::Error::from)
+    }
+
+    /// Enters the raw mode again, after a suspend resumed the process.
+    fn reenter(&self) -> io::Result<()> {
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        let mut state = termios::tcgetattr(fd).map_err(io::Error::from)?;
+        termios::cfmakeraw(&mut state);
+        termios::tcsetattr(fd, SetArg::TCSANOW, &state).map_err(io::Error::from)
+    }
+}
+
+#[cfg(unix)]
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        let _ = termios::tcsetattr(fd, SetArg::TCSANOW, &self.original);
+        let _ = self.restore();
     }
 }
 
 #[derive(Default)]
 struct SessionRuntime {
     background_tasks: Vec<tokio::task::JoinHandle<()>>,
-    #[cfg(unix)]
-    raw_mode_guard: Option<RawModeGuard>,
+    raw_mode_guard: RawModeGuardHandle,
 }
+
+/// The handle of the raw mode guard of the local console.
+///
+/// The guard only exists on unix, where the console can be put in the raw
+/// mode; elsewhere the handle stays empty. The mutex keeps the guard
+/// shareable between the session and the stdin pump.
+#[cfg(unix)]
+type RawModeGuardHandle = Option<Arc<std::sync::Mutex<RawModeGuard>>>;
+#[cfg(not(unix))]
+type RawModeGuardHandle = Option<Arc<()>>;
 
 impl Drop for SessionRuntime {
     fn drop(&mut self) {
@@ -171,6 +287,76 @@ pub struct Ssh3CapturedSession {
     pub exit_status: i32,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+/// The parameters of the pseudo-terminal the client requests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PtySpec {
+    term: Vec<u8>,
+    char_width: u16,
+    char_height: u16,
+    pixel_width: u16,
+    pixel_height: u16,
+}
+
+impl PtySpec {
+    /// Builds the pty request of a session.
+    ///
+    /// The geometry of the local console wins; a console that cannot be
+    /// queried falls back to 80x24, because a pty with a default geometry
+    /// still beats a raw pipe session: the remote ncurses programs refuse to
+    /// start without one.
+    fn new(terminal: Option<&LocalTerminal>, term_type: Option<&str>) -> Self {
+        let size = terminal.map(|terminal| terminal.info.size);
+        let term = term_type
+            .map(|term| term.to_string())
+            .or_else(|| {
+                terminal
+                    .and_then(|terminal| terminal.info.term.clone())
+                    .or_else(|| env::var("TERM").ok().filter(|term| !term.is_empty()))
+            })
+            .unwrap_or_else(|| DEFAULT_TERM_TYPE.to_string());
+        let width = size.map(|size| size.char_width).unwrap_or(0);
+        let height = size.map(|size| size.char_height).unwrap_or(0);
+        Self {
+            term: term.into_bytes(),
+            char_width: if width == 0 {
+                DEFAULT_PTY_COLUMNS
+            } else {
+                width
+            },
+            char_height: if height == 0 {
+                DEFAULT_PTY_ROWS
+            } else {
+                height
+            },
+            pixel_width: size.map(|size| size.pixel_width).unwrap_or(0),
+            pixel_height: size.map(|size| size.pixel_height).unwrap_or(0),
+        }
+    }
+}
+
+/// Decides whether the session requests a pseudo-terminal.
+///
+/// The policy follows the `RequestTTY` canon: `auto` requests one for an
+/// interactive session driven by a local terminal, `yes` and `force` always
+/// request one (the `force` policy does not need a local terminal) and `no`
+/// never requests one.
+fn resolve_pty(
+    policy: Ssh3PtyPolicy,
+    request: &Ssh3SessionRequest,
+    terminal: Option<&LocalTerminal>,
+    term_type: Option<&str>,
+) -> Option<PtySpec> {
+    let wanted = match policy {
+        Ssh3PtyPolicy::No => false,
+        Ssh3PtyPolicy::Yes | Ssh3PtyPolicy::Force => true,
+        Ssh3PtyPolicy::Auto => matches!(request, Ssh3SessionRequest::Shell) && terminal.is_some(),
+    };
+    if !wanted {
+        return None;
+    }
+    Some(PtySpec::new(terminal, term_type))
 }
 
 #[derive(Debug)]
@@ -252,6 +438,8 @@ pub enum Ssh3ClientError {
     UnsupportedAgentKey(String),
     ConflictingAuthenticationMethods,
     ExitSignal(Ssh3ExitSignalRequest),
+    /// The QUIC handshake did not finish within the handshake timeout.
+    HandshakeTimeout(Duration),
 }
 
 impl fmt::Display for Ssh3ClientError {
@@ -302,6 +490,9 @@ impl fmt::Display for Ssh3ClientError {
                 String::from_utf8_lossy(&signal.signal_name_without_sig),
                 String::from_utf8_lossy(&signal.error_message_utf8)
             ),
+            Self::HandshakeTimeout(timeout) => {
+                write!(f, "the QUIC handshake timed out after {timeout:?}")
+            }
         }
     }
 }
@@ -335,6 +526,7 @@ impl std::error::Error for Ssh3ClientError {
             Self::UnsupportedAgentKey(_) => None,
             Self::ConflictingAuthenticationMethods => None,
             Self::ExitSignal(_) => None,
+            Self::HandshakeTimeout(_) => None,
         }
     }
 }
@@ -416,6 +608,45 @@ struct ResolvedTarget {
     server_name: String,
 }
 
+/// The exit code of a session whose remote process died by a signal.
+///
+/// The convention of OpenSSH is 128 plus the number of the signal (SIGTERM is
+/// 143, SIGSEGV is 139); an unknown signal falls back to 255, like the Go
+/// implementation does.
+pub fn exit_code_for_exit_signal(signal_name: &str) -> i32 {
+    match signal_name {
+        "HUP" => 129,
+        "INT" => 130,
+        "QUIT" => 131,
+        "ILL" => 132,
+        "ABRT" => 134,
+        "FPE" => 136,
+        "KILL" => 137,
+        "SEGV" => 139,
+        "PIPE" => 141,
+        "ALRM" => 142,
+        "TERM" => 143,
+        "USR1" => 138,
+        "USR2" => 140,
+        "STOP" => 149,
+        "TSTP" => 150,
+        "CONT" => 151,
+        "CHLD" => 152,
+        "TTIN" => 153,
+        "TTOU" => 154,
+        "XCPU" => 155,
+        "XFSZ" => 156,
+        "VTALRM" => 157,
+        "PROF" => 158,
+        "WINCH" => 159,
+        "IO" => 160,
+        "POLL" => 161,
+        "PWR" => 162,
+        "SYS" => 163,
+        _ => 255,
+    }
+}
+
 struct ActiveClient {
     endpoint: Endpoint,
     connection: Connection,
@@ -473,12 +704,10 @@ pub fn load_certificates(
 async fn send_initial_session_requests(
     channel: &Ssh3Channel,
     request: &Ssh3SessionRequest,
-    terminal: Option<&LocalTerminalInfo>,
+    pty: Option<&PtySpec>,
 ) -> Result<(), Ssh3ClientError> {
-    if matches!(request, Ssh3SessionRequest::Shell)
-        && let Some(terminal) = terminal
-    {
-        send_pty_request(channel, terminal).await?;
+    if let Some(pty) = pty {
+        send_pty_request(channel, pty).await?;
     }
 
     let request = match request {
@@ -499,19 +728,16 @@ async fn send_initial_session_requests(
         .map_err(Ssh3ClientError::from)
 }
 
-async fn send_pty_request(
-    channel: &Ssh3Channel,
-    terminal: &LocalTerminalInfo,
-) -> Result<(), Ssh3ClientError> {
+async fn send_pty_request(channel: &Ssh3Channel, pty: &PtySpec) -> Result<(), Ssh3ClientError> {
     channel
         .send_request(Ssh3ChannelRequestMessage {
             want_reply: true,
             request: Ssh3ChannelRequest::Pty(Ssh3PtyRequest {
-                term: terminal.term.clone().unwrap_or_default().into_bytes(),
-                char_width: terminal.size.char_width.into(),
-                char_height: terminal.size.char_height.into(),
-                pixel_width: terminal.size.pixel_width.into(),
-                pixel_height: terminal.size.pixel_height.into(),
+                term: pty.term.clone(),
+                char_width: pty.char_width.into(),
+                char_height: pty.char_height.into(),
+                pixel_width: pty.pixel_width.into(),
+                pixel_height: pty.pixel_height.into(),
                 encoded_terminal_modes: Vec::new(),
             }),
         })
@@ -671,20 +897,23 @@ fn build_session_runtime(
     client: &ActiveClient,
     config: &Ssh3ClientConfig,
     channel: Arc<Ssh3Channel>,
-    request: &Ssh3SessionRequest,
+    pty: Option<&PtySpec>,
     terminal: Option<&LocalTerminal>,
 ) -> Result<SessionRuntime, Ssh3ClientError> {
     let mut runtime = SessionRuntime {
         background_tasks: spawn_signal_forwarders(channel.clone()),
-        #[cfg(unix)]
         raw_mode_guard: None,
     };
 
+    // The console only enters the raw mode for a session that owns a pty:
+    // the remote program drives the terminal side of it.
     #[cfg(unix)]
-    if matches!(request, Ssh3SessionRequest::Shell)
+    if pty.is_some()
         && let Some(terminal) = terminal
     {
-        runtime.raw_mode_guard = Some(enable_raw_mode(terminal.fd)?);
+        runtime.raw_mode_guard = Some(Arc::new(std::sync::Mutex::new(enable_raw_mode(
+            terminal.fd,
+        )?)));
         runtime
             .background_tasks
             .push(spawn_resize_forwarder(channel, terminal.fd));
@@ -702,6 +931,29 @@ fn build_session_runtime(
     }
 
     Ok(runtime)
+}
+
+/// Opens the local listeners of the `-L` forwards of the configuration.
+///
+/// The listeners ride the connection of the session: they only need the
+/// conversation, so they stay usable for the whole lifetime of the session.
+async fn start_local_forwards(
+    client: &ActiveClient,
+    config: &Ssh3ClientConfig,
+) -> Result<Vec<tokio::task::JoinHandle<()>>, Ssh3ClientError> {
+    let mut tasks = Vec::new();
+    for spec in &config.local_forwards {
+        let task = forward::start_local_forward(
+            client.conversation.clone(),
+            client.connection.clone(),
+            config.max_packet_size,
+            config.default_datagrams_queue_size,
+            spec,
+        )
+        .await?;
+        tasks.push(task);
+    }
+    Ok(tasks)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1009,10 +1261,23 @@ fn activate_client(
         let connection = connection.clone();
         let conversation = established.conversation.clone();
         async move {
-            if let Err(err) = ssh3_h3::dispatch_datagrams_forever(conversation, connection).await
-                && !is_benign_datagram_dispatch_error(&err)
-            {
-                eprintln!("ssh3-rust-client incoming datagram error: {err}");
+            // F-19: a malformed datagram is per-datagram garbage; it must not
+            // end the reception of the datagrams, so the loop drops it and
+            // carries on.
+            loop {
+                match ssh3_h3::dispatch_one_datagram(conversation.as_ref(), &connection).await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        if is_benign_datagram_dispatch_error(&err) {
+                            eprintln!("ssh3-rust-client dropping malformed datagram: {err}");
+                            continue;
+                        }
+                        if !is_benign_connection_dispatch_error(&err) {
+                            eprintln!("ssh3-rust-client incoming datagram error: {err}");
+                        }
+                        return;
+                    }
+                }
             }
         }
     });
@@ -1087,13 +1352,17 @@ async fn connect_client_with_browser_opener(
     let resolved = resolve_target(&config.target_url, config.server_name.as_deref()).await?;
     let bind_addr = client_bind_addr(resolved.remote_addr);
     let mut endpoint = Endpoint::client(bind_addr).map_err(Ssh3ClientError::Endpoint)?;
-    endpoint.set_default_client_config(client_quinn_config(&config.trust)?);
+    endpoint.set_default_client_config(client_quinn_config(config)?);
 
-    let connection = endpoint
-        .connect(resolved.remote_addr, &resolved.server_name)
-        .map_err(Ssh3ClientError::Connect)?
-        .await
-        .map_err(Ssh3ClientError::Connection)?;
+    let connection = tokio::time::timeout(
+        config.handshake_idle_timeout,
+        endpoint
+            .connect(resolved.remote_addr, &resolved.server_name)
+            .map_err(Ssh3ClientError::Connect)?,
+    )
+    .await
+    .map_err(|_| Ssh3ClientError::HandshakeTimeout(config.handshake_idle_timeout))?
+    .map_err(Ssh3ClientError::Connection)?;
 
     let (mut driver, mut send_request) = new_client(connection.clone()).await?;
     let driver_task = tokio::spawn(async move {
@@ -1172,10 +1441,10 @@ async fn connect_client_with_browser_opener(
     ))
 }
 
-fn client_quinn_config(trust: &Ssh3TrustStrategy) -> Result<quinn::ClientConfig, Ssh3ClientError> {
-    match trust {
+fn client_quinn_config(config: &Ssh3ClientConfig) -> Result<quinn::ClientConfig, Ssh3ClientError> {
+    let mut client_config = match &config.trust {
         Ssh3TrustStrategy::WebPkiRoots => {
-            client_config_with_webpki_roots().map_err(Ssh3ClientError::from)
+            client_config_with_webpki_roots().map_err(Ssh3ClientError::from)?
         }
         Ssh3TrustStrategy::Certificates(certificates) => {
             let mut roots = RootCertStore::empty();
@@ -1183,10 +1452,27 @@ fn client_quinn_config(trust: &Ssh3TrustStrategy) -> Result<quinn::ClientConfig,
             if added == 0 {
                 return Err(Ssh3ClientError::InvalidCertificateBundle);
             }
-            client_config_with_roots(roots).map_err(Ssh3ClientError::from)
+            client_config_with_roots(roots).map_err(Ssh3ClientError::from)?
         }
-        Ssh3TrustStrategy::Insecure => client_config_insecure().map_err(Ssh3ClientError::from),
-    }
+        Ssh3TrustStrategy::Insecure => client_config_insecure().map_err(Ssh3ClientError::from)?,
+    };
+
+    // The idle timeout of the ssh2 canon is an idle session that is never
+    // killed, so the client raises its side too (QUIC negotiates the smaller
+    // of the two values) and keeps the connection alive with keep-alive
+    // packets.
+    let mut transport = quinn::TransportConfig::default();
+    let idle_timeout = quinn::IdleTimeout::try_from(config.max_idle_timeout).map_err(|err| {
+        Ssh3ClientError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid max idle timeout: {err}"),
+        ))
+    })?;
+    transport.max_idle_timeout(Some(idle_timeout));
+    transport.keep_alive_interval(config.keep_alive_interval);
+    client_config.transport_config(Arc::new(transport));
+
+    Ok(client_config)
 }
 
 async fn resolve_target(
@@ -1224,11 +1510,21 @@ async fn run_capture_on_client(
     request: Ssh3SessionRequest,
 ) -> Result<Ssh3CapturedSession, Ssh3ClientError> {
     let channel = client.open_session_channel().await?;
+    let pty = resolve_pty(
+        config.pty_policy,
+        &request,
+        None,
+        config.term_type.as_deref(),
+    );
     if config.forward_agent {
         send_forward_agent_request(channel.as_ref()).await?;
     }
-    let session_runtime = build_session_runtime(client, config, channel.clone(), &request, None)?;
-    send_initial_session_requests(channel.as_ref(), &request, None).await?;
+    let mut session_runtime =
+        build_session_runtime(client, config, channel.clone(), pty.as_ref(), None)?;
+    session_runtime
+        .background_tasks
+        .extend(start_local_forwards(client, config).await?);
+    send_initial_session_requests(channel.as_ref(), &request, pty.as_ref()).await?;
     if !config.forward_agent {
         channel.close().await?;
     }
@@ -1271,20 +1567,42 @@ async fn run_stdio_on_client(
 ) -> Result<i32, Ssh3ClientError> {
     let channel = client.open_session_channel().await?;
     let terminal = detect_local_terminal()?;
+    let pty = resolve_pty(
+        config.pty_policy,
+        &request,
+        terminal.as_ref(),
+        config.term_type.as_deref(),
+    );
     if config.forward_agent {
         send_forward_agent_request(channel.as_ref()).await?;
     }
-    send_initial_session_requests(
-        channel.as_ref(),
-        &request,
-        terminal.as_ref().map(|terminal| &terminal.info),
-    )
-    .await?;
-    let session_runtime =
-        build_session_runtime(client, config, channel.clone(), &request, terminal.as_ref())?;
+    send_initial_session_requests(channel.as_ref(), &request, pty.as_ref()).await?;
+    let mut session_runtime = build_session_runtime(
+        client,
+        config,
+        channel.clone(),
+        pty.as_ref(),
+        terminal.as_ref(),
+    )?;
+    session_runtime
+        .background_tasks
+        .extend(start_local_forwards(client, config).await?);
+
+    // The escape sequences only arm for an interactive pty session: the
+    // traffic of an exec session stays byte-exact.
+    let escape_filter = pty.as_ref().and_then(|_| {
+        (config.escape_char != 0)
+            .then(|| Ssh3EscapeFilter::new(config.escape_char, suspend_supported()))
+    });
+    // The sender of the actions stays alive for the whole session: the
+    // receiver must not report the end of the stream while the session of the
+    // remote side is still running.
+    let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel::<Ssh3EscapeAction>();
 
     let stdin_task = tokio::spawn({
         let channel = channel.clone();
+        let action_tx = action_tx.clone();
+        let raw_mode_guard = session_runtime.raw_mode_guard.clone();
         async move {
             let mut stdin = tokio::io::stdin();
             let mut buf = vec![
@@ -1293,6 +1611,8 @@ async fn run_stdio_on_client(
                     .unwrap_or(30_000)
                     .max(1)
             ];
+            let mut filter = escape_filter;
+            let mut payload: Vec<u8> = Vec::new();
             loop {
                 let n = match stdin.read(&mut buf).await {
                     Ok(n) => n,
@@ -1302,8 +1622,43 @@ async fn run_stdio_on_client(
                     let _ = channel.close().await;
                     return;
                 }
+
+                match filter.as_mut() {
+                    Some(filter) => {
+                        let (forwarded, action) = filter.feed(&buf[..n]);
+                        match action {
+                            Ssh3EscapeAction::Disconnect => {
+                                if !forwarded.is_empty()
+                                    && channel
+                                        .write_data(&forwarded, SSH_EXTENDED_DATA_NONE)
+                                        .await
+                                        .is_err()
+                                {
+                                    return;
+                                }
+                                let _ = action_tx.send(Ssh3EscapeAction::Disconnect);
+                                return;
+                            }
+                            Ssh3EscapeAction::Suspend => {
+                                if let Err(err) = suspend_local_process(&raw_mode_guard) {
+                                    eprintln!("ssh3-rust-client escape suspend failed: {err}");
+                                }
+                            }
+                            Ssh3EscapeAction::None => {}
+                        }
+                        payload = forwarded;
+                    }
+                    None => {
+                        payload.clear();
+                        payload.extend_from_slice(&buf[..n]);
+                    }
+                }
+
+                if payload.is_empty() {
+                    continue;
+                }
                 if channel
-                    .write_data(&buf[..n], SSH_EXTENDED_DATA_NONE)
+                    .write_data(&payload, SSH_EXTENDED_DATA_NONE)
                     .await
                     .is_err()
                 {
@@ -1317,7 +1672,21 @@ async fn run_stdio_on_client(
     let mut stderr = tokio::io::stderr();
 
     let result = loop {
-        match channel.next_message().await? {
+        let message = tokio::select! {
+            biased;
+            action = action_rx.recv() => {
+                match action {
+                    Some(Ssh3EscapeAction::Disconnect) => {
+                        // the user tore the session down with the ~. escape
+                        // sequence: the exit code of a closed connection
+                        break Ok(255);
+                    }
+                    _ => continue,
+                }
+            }
+            message = channel.next_message() => message?,
+        };
+        match message {
             Ssh3Message::Data(data) => match data.data_type {
                 SSH_EXTENDED_DATA_NONE => {
                     stdout.write_all(&data.data).await?;
@@ -1345,6 +1714,37 @@ async fn run_stdio_on_client(
     stdin_task.abort();
     drop(session_runtime);
     result
+}
+
+/// Tells whether the local console can suspend the process.
+fn suspend_supported() -> bool {
+    cfg!(unix)
+}
+
+/// Suspends the client locally: the terminal is restored, the process stops
+/// itself with SIGTSTP and the raw mode is entered again on resume.
+#[cfg(unix)]
+fn suspend_local_process(guard: &RawModeGuardHandle) -> io::Result<()> {
+    let Some(guard) = guard.as_ref() else {
+        return Ok(());
+    };
+    let guard = guard
+        .lock()
+        .map_err(|_| io::Error::other("the raw mode guard is poisoned"))?;
+    guard.restore()?;
+    let result = unsafe { nix::libc::kill(nix::libc::getpid(), nix::libc::SIGTSTP) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    guard.reenter()
+}
+
+#[cfg(not(unix))]
+fn suspend_local_process(_guard: &RawModeGuardHandle) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the local console cannot suspend the process",
+    ))
 }
 
 fn is_benign_connection_error(error: &ConnectionError) -> bool {
@@ -1409,11 +1809,36 @@ fn is_benign_route_error(error: &Ssh3RouteAcceptedChannelError) -> bool {
     )
 }
 
+/// Tells whether the error of a datagram dispatch is a per-datagram failure.
+///
+/// A malformed datagram is garbage of a single datagram: dropping it must not
+/// end the reception of the datagrams, like the Go implementation does.
 fn is_benign_datagram_dispatch_error(error: &ssh3_h3::Ssh3DatagramDispatchError) -> bool {
+    match error {
+        ssh3_h3::Ssh3DatagramDispatchError::Proto(_) => true,
+        ssh3_h3::Ssh3DatagramDispatchError::Conversation(error) => {
+            is_benign_conversation_error(error)
+        }
+        ssh3_h3::Ssh3DatagramDispatchError::Connection(_) => false,
+    }
+}
+
+/// Tells whether the error of a datagram dispatch is the end of the
+/// connection: the peer went away, so the reception of the datagrams is over.
+fn is_benign_connection_dispatch_error(error: &ssh3_h3::Ssh3DatagramDispatchError) -> bool {
     matches!(
         error,
         ssh3_h3::Ssh3DatagramDispatchError::Connection(error) if is_benign_connection_error(error)
     )
+}
+
+/// Tells whether the error of a conversation is a per-datagram failure.
+fn is_benign_conversation_error(error: &Ssh3ConversationError) -> bool {
+    match error {
+        Ssh3ConversationError::Proto(_) => true,
+        Ssh3ConversationError::ChannelNotFound { .. } => true,
+        Ssh3ConversationError::Channel(error) => is_benign_channel_error(error),
+    }
 }
 
 #[cfg(unix)]
@@ -1525,7 +1950,8 @@ mod tests {
     #[cfg(unix)]
     use std::io::{Read, Write};
     #[cfg(unix)]
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+    use std::net::UdpSocket;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     #[cfg(unix)]
     use std::os::fd::AsRawFd;
     use std::path::{Path, PathBuf};
@@ -1553,7 +1979,7 @@ mod tests {
     use ssh_key::private::{EcdsaKeypair, Ed25519Keypair, KeypairData, RsaKeypair};
     use ssh_key::{Algorithm, HashAlg, Signature};
     use ssh3_auth::bearer_authorization_value;
-    use ssh3_core::Ssh3Channel;
+    use ssh3_core::{Ssh3Channel, Ssh3ConversationError};
     use ssh3_h3::{
         SSH3_USER_HEADER, SSH3_VERSION_STRING, accept_server_conversation, build_connect_request,
         establish_client_conversation, generate_conversation_id, is_ssh3_connect, new_client,
@@ -1578,13 +2004,38 @@ mod tests {
     use url::Url;
 
     use super::{
-        LocalTerminalInfo, Ssh3CapturedSession, Ssh3ClientConfig, Ssh3ClientError, Ssh3OidcConfig,
-        Ssh3OidcError, Ssh3SessionRequest, Ssh3TrustStrategy, TerminalSize, activate_client,
+        LocalTerminalInfo, PtySpec, Ssh3CapturedSession, Ssh3ClientConfig, Ssh3ClientError,
+        Ssh3ForwardProtocol, Ssh3LocalForwardSpec, Ssh3OidcConfig, Ssh3OidcError, Ssh3PtyPolicy,
+        Ssh3SessionRequest, Ssh3TrustStrategy, TerminalSize, activate_client,
         build_session_runtime, client_bind_addr, client_quinn_config, connect_client,
-        conversation_id_base64, resolve_target, run_capture_on_client, run_exec_capture,
-        run_exec_capture_with_browser_opener, send_forward_agent_request,
-        send_initial_session_requests, send_signal_request, send_window_change_request,
+        conversation_id_base64, exit_code_for_exit_signal, resolve_pty, resolve_target,
+        run_capture_on_client, run_exec_capture, run_exec_capture_with_browser_opener,
+        send_forward_agent_request, send_initial_session_requests, send_signal_request,
+        send_window_change_request,
     };
+
+    /// Builds the pty request of a session out of the metadata of a console.
+    fn pty_spec_from_info(info: &LocalTerminalInfo) -> PtySpec {
+        PtySpec {
+            term: info.term.clone().unwrap_or_default().into_bytes(),
+            char_width: info.size.char_width,
+            char_height: info.size.char_height,
+            pixel_width: info.size.pixel_width,
+            pixel_height: info.size.pixel_height,
+        }
+    }
+
+    /// Reserves a local TCP port for a listener of a test.
+    fn reserve_local_tcp_port() -> u16 {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// Reserves a local UDP port for a listener of a test.
+    fn reserve_local_udp_port() -> u16 {
+        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket.local_addr().unwrap().port()
+    }
 
     async fn setup_request_capture_harness(
         expected_messages: usize,
@@ -1668,7 +2119,7 @@ mod tests {
         let resolved = resolve_target(&config.target_url, config.server_name.as_deref()).await?;
         let bind_addr = client_bind_addr(resolved.remote_addr);
         let mut endpoint = Endpoint::client(bind_addr).map_err(Ssh3ClientError::Endpoint)?;
-        endpoint.set_default_client_config(client_quinn_config(&config.trust)?);
+        endpoint.set_default_client_config(client_quinn_config(config)?);
 
         let connection = endpoint
             .connect(resolved.remote_addr, &resolved.server_name)
@@ -2745,12 +3196,9 @@ mod tests {
         shell_input_suffix: &str,
     ) -> Result<Ssh3CapturedSession, Ssh3ClientError> {
         let channel = client.open_session_channel().await?;
-        send_initial_session_requests(
-            channel.as_ref(),
-            &Ssh3SessionRequest::Shell,
-            Some(&initial_terminal),
-        )
-        .await?;
+        let pty = pty_spec_from_info(&initial_terminal);
+        send_initial_session_requests(channel.as_ref(), &Ssh3SessionRequest::Shell, Some(&pty))
+            .await?;
         channel
             .write_data(shell_input_prefix.as_bytes(), SSH_EXTENDED_DATA_NONE)
             .await
@@ -5378,7 +5826,7 @@ mod tests {
             Ssh3SessionRequest::Exec("printf '%s\\n' \"$SSH_AUTH_SOCK\"; sleep 2".to_string());
         send_forward_agent_request(channel.as_ref()).await.unwrap();
         let session_runtime =
-            build_session_runtime(&client, &config, channel.clone(), &request, None).unwrap();
+            build_session_runtime(&client, &config, channel.clone(), None, None).unwrap();
         send_initial_session_requests(channel.as_ref(), &request, None)
             .await
             .unwrap();
@@ -5464,7 +5912,7 @@ mod tests {
             Ssh3SessionRequest::Exec("printf '%s\\n' \"$SSH_AUTH_SOCK\"; sleep 3".to_string());
         send_forward_agent_request(channel.as_ref()).await.unwrap();
         let session_runtime =
-            build_session_runtime(&client, &config, channel.clone(), &request, None).unwrap();
+            build_session_runtime(&client, &config, channel.clone(), None, None).unwrap();
         send_initial_session_requests(channel.as_ref(), &request, None)
             .await
             .unwrap();
@@ -5564,7 +6012,7 @@ mod tests {
             Ssh3SessionRequest::Exec("printf '%s\\n' \"$SSH_AUTH_SOCK\"; sleep 2".to_string());
         send_forward_agent_request(channel.as_ref()).await.unwrap();
         let session_runtime =
-            build_session_runtime(&client, &config, channel.clone(), &request, None).unwrap();
+            build_session_runtime(&client, &config, channel.clone(), None, None).unwrap();
         send_initial_session_requests(channel.as_ref(), &request, None)
             .await
             .unwrap();
@@ -5961,21 +6409,18 @@ mod tests {
     async fn shell_requests_send_pty_before_shell_when_terminal_metadata_is_available() {
         let (client, server_task) = setup_request_capture_harness(2).await;
         let channel = client.open_session_channel().await.unwrap();
-        send_initial_session_requests(
-            channel.as_ref(),
-            &Ssh3SessionRequest::Shell,
-            Some(&LocalTerminalInfo {
-                term: Some("xterm-256color".to_string()),
-                size: TerminalSize {
-                    char_width: 80,
-                    char_height: 24,
-                    pixel_width: 640,
-                    pixel_height: 480,
-                },
-            }),
-        )
-        .await
-        .unwrap();
+        let pty = pty_spec_from_info(&LocalTerminalInfo {
+            term: Some("xterm-256color".to_string()),
+            size: TerminalSize {
+                char_width: 80,
+                char_height: 24,
+                pixel_width: 640,
+                pixel_height: 480,
+            },
+        });
+        send_initial_session_requests(channel.as_ref(), &Ssh3SessionRequest::Shell, Some(&pty))
+            .await
+            .unwrap();
 
         let messages = server_task.await.unwrap();
         match &messages[0] {
@@ -5999,6 +6444,262 @@ mod tests {
         }
 
         client.shutdown().await;
+    }
+
+    #[test]
+    fn the_pty_policy_decides_the_pty_request() {
+        // auto: a pty only for an interactive session driven by a terminal
+        assert!(resolve_pty(Ssh3PtyPolicy::Auto, &Ssh3SessionRequest::Shell, None, None).is_none());
+        assert!(
+            resolve_pty(
+                Ssh3PtyPolicy::Auto,
+                &Ssh3SessionRequest::Exec("ls".to_string()),
+                None,
+                None
+            )
+            .is_none()
+        );
+
+        // no: never a pty
+        assert!(resolve_pty(Ssh3PtyPolicy::No, &Ssh3SessionRequest::Shell, None, None).is_none());
+
+        // yes and force: a pty even without a local terminal
+        let forced = resolve_pty(
+            Ssh3PtyPolicy::Force,
+            &Ssh3SessionRequest::Exec("ls".to_string()),
+            None,
+            Some("xterm-256color"),
+        )
+        .expect("the force policy requests a pty");
+        assert_eq!(forced.term, b"xterm-256color".to_vec());
+        assert_eq!(forced.char_width, 80);
+        assert_eq!(forced.char_height, 24);
+
+        let yes = resolve_pty(Ssh3PtyPolicy::Yes, &Ssh3SessionRequest::Shell, None, None)
+            .expect("the yes policy requests a pty");
+        assert_eq!(yes.char_width, 80);
+        assert_eq!(yes.char_height, 24);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_auto_pty_policy_follows_the_local_terminal() {
+        let terminal = super::LocalTerminal {
+            info: LocalTerminalInfo {
+                term: Some("xterm-256color".to_string()),
+                size: TerminalSize {
+                    char_width: 120,
+                    char_height: 40,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            },
+            fd: 0,
+        };
+        let pty = resolve_pty(
+            Ssh3PtyPolicy::Auto,
+            &Ssh3SessionRequest::Shell,
+            Some(&terminal),
+            None,
+        )
+        .expect("an interactive session on a terminal requests a pty");
+        assert_eq!(pty.term, b"xterm-256color".to_vec());
+        assert_eq!(pty.char_width, 120);
+        assert_eq!(pty.char_height, 40);
+    }
+
+    #[test]
+    fn the_exit_codes_of_the_signals_follow_the_open_ssh_convention() {
+        assert_eq!(exit_code_for_exit_signal("TERM"), 143);
+        assert_eq!(exit_code_for_exit_signal("SEGV"), 139);
+        assert_eq!(exit_code_for_exit_signal("KILL"), 137);
+        assert_eq!(exit_code_for_exit_signal("INT"), 130);
+        assert_eq!(exit_code_for_exit_signal("HUP"), 129);
+        assert_eq!(exit_code_for_exit_signal("WHATEVER"), 255);
+    }
+
+    #[tokio::test]
+    async fn a_local_tcp_forward_bridges_a_connection_to_the_target() {
+        // the target the forward dials on the client behalf
+        let echo = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let (mut stream, _) = echo.accept().await.unwrap();
+            let mut buffer = [0u8; 64];
+            loop {
+                let read = match stream.read(&mut buffer).await {
+                    Ok(read) => read,
+                    Err(_) => return,
+                };
+                if read == 0 {
+                    return;
+                }
+                if stream.write_all(&buffer[..read]).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let (server_config, server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let incoming = server_endpoint.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            serve_connection(connection, Ssh3ServerConfig::default())
+                .await
+                .unwrap();
+        });
+
+        let forward_port = reserve_local_tcp_port();
+        let mut config = Ssh3ClientConfig::new(
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
+                .parse()
+                .unwrap(),
+        );
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
+        config.local_forwards = vec![Ssh3LocalForwardSpec {
+            bind_address: Some("127.0.0.1".to_string()),
+            bind_port: forward_port,
+            target_host: "127.0.0.1".to_string(),
+            target_port: echo_addr.port(),
+            protocol: Ssh3ForwardProtocol::Tcp,
+        }];
+
+        let session = tokio::spawn({
+            let config = config.clone();
+            async move { run_exec_capture(&config, "sleep 10").await }
+        });
+
+        let mut stream = None;
+        for _ in 0..100 {
+            match TcpStream::connect((Ipv4Addr::LOCALHOST, forward_port)).await {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    break;
+                }
+                Err(_) => sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let mut stream = stream.expect("the local forward did not open its listener");
+        stream.write_all(b"ping").await.unwrap();
+        let mut buffer = [0u8; 4];
+        stream.read_exact(&mut buffer).await.unwrap();
+        assert_eq!(&buffer, b"ping");
+
+        drop(stream);
+        session.abort();
+        echo_task.abort();
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_local_udp_forward_bridges_a_datagram_to_the_target() {
+        // the target the forward dials on the client behalf
+        let echo = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buffer = vec![0u8; 64];
+            loop {
+                let (read, source) = match echo.recv_from(&mut buffer).await {
+                    Ok(received) => received,
+                    Err(_) => return,
+                };
+                if echo.send_to(&buffer[..read], source).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let (server_config, server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let incoming = server_endpoint.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            serve_connection(connection, Ssh3ServerConfig::default())
+                .await
+                .unwrap();
+        });
+
+        let forward_port = reserve_local_udp_port();
+        let mut config = Ssh3ClientConfig::new(
+            format!("https://127.0.0.1:{}/ssh3-term", server_addr.port())
+                .parse()
+                .unwrap(),
+        );
+        config.trust = Ssh3TrustStrategy::Certificates(vec![server_certificate]);
+        config.local_forwards = vec![Ssh3LocalForwardSpec {
+            bind_address: Some("127.0.0.1".to_string()),
+            bind_port: forward_port,
+            target_host: "127.0.0.1".to_string(),
+            target_port: echo_addr.port(),
+            protocol: Ssh3ForwardProtocol::Udp,
+        }];
+
+        let session = tokio::spawn({
+            let config = config.clone();
+            async move { run_exec_capture(&config, "sleep 10").await }
+        });
+
+        let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let mut buffer = vec![0u8; 64];
+        let mut echoed = None;
+        for _ in 0..100 {
+            let _ = socket
+                .send_to(b"ping", (Ipv4Addr::LOCALHOST, forward_port))
+                .await;
+            match tokio::time::timeout(Duration::from_millis(200), socket.recv_from(&mut buffer))
+                .await
+            {
+                Ok(Ok((read, _))) => {
+                    echoed = Some(buffer[..read].to_vec());
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert_eq!(echoed.as_deref(), Some(&b"ping"[..]));
+
+        session.abort();
+        echo_task.abort();
+        server_task.abort();
+    }
+
+    #[test]
+    fn a_malformed_datagram_does_not_end_the_datagram_reception() {
+        // a datagram that cannot be parsed is per-datagram garbage
+        assert!(super::is_benign_datagram_dispatch_error(
+            &ssh3_h3::Ssh3DatagramDispatchError::Proto(ssh3_proto::Ssh3Error::UnknownMessageType(
+                42
+            ))
+        ));
+        // a datagram for a channel that does not exist is dropped too
+        assert!(super::is_benign_datagram_dispatch_error(
+            &ssh3_h3::Ssh3DatagramDispatchError::Conversation(
+                Ssh3ConversationError::ChannelNotFound { channel_id: 7 }
+            )
+        ));
+        // the end of the connection is not a malformed datagram
+        assert!(!super::is_benign_datagram_dispatch_error(
+            &ssh3_h3::Ssh3DatagramDispatchError::Connection(quinn::ConnectionError::LocallyClosed)
+        ));
     }
 
     #[tokio::test]

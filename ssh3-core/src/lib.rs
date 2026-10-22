@@ -26,8 +26,9 @@ pub mod queue;
 pub mod transport;
 
 pub use channel::{
-    Ssh3AcceptedChannel, Ssh3Channel, Ssh3ChannelError, Ssh3ChannelInfo, Ssh3ChannelOpenFailure,
-    Ssh3MessageOnNonConfirmedChannel, Ssh3SentDatagramOnNonDatagramChannel,
+    MAX_MAX_PACKET_SIZE, MIN_MAX_PACKET_SIZE, Ssh3AcceptedChannel, Ssh3Channel, Ssh3ChannelError,
+    Ssh3ChannelInfo, Ssh3ChannelOpenFailure, Ssh3MessageOnNonConfirmedChannel,
+    Ssh3SentDatagramOnNonDatagramChannel, clamp_local_max_packet_size, clamp_peer_max_packet_size,
 };
 pub use conversation::{
     Ssh3Conversation, Ssh3ConversationDatagramSender, Ssh3ConversationError, Ssh3ConversationId,

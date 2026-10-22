@@ -17,6 +17,21 @@ const MAX_VARINT_2: u64 = 16_383;
 const MAX_VARINT_4: u64 = 1_073_741_823;
 const MAX_VARINT_8: u64 = 4_611_686_018_427_387_903;
 
+/// Upper bound of the length of an SSH string, in bytes (16 MiB).
+///
+/// The length of an SSH string is a variable-length integer chosen by the
+/// peer, so it can carry any value up to 2^62 - 1. Allocating a buffer of
+/// that size from a handful of attacker-controlled bytes is a remote denial
+/// of service, so the length is checked before the allocation happens.
+///
+/// The bound is the one of the reference implementation
+/// (`nagual2/ssh3-go`, `util.MaxSSHStringLen`): it stays above any legitimate
+/// use — the largest data chunks are bounded by the negotiated maximum
+/// packet size, which is itself refused above this bound, and commands and
+/// paths are bounded by `PATH_MAX` — while keeping the worst-case allocation
+/// bounded.
+pub const MAX_SSH_STRING_LEN: u64 = 1 << 24;
+
 /// Result of a decoding operation on the wire format.
 pub type Ssh3Result<T> = std::result::Result<T, Ssh3Error>;
 
@@ -29,6 +44,13 @@ pub enum Ssh3Error {
     InvalidBool(u8),
     /// A string length did not fit into the address space of the process.
     InvalidLength(u64),
+    /// A string length exceeded [`MAX_SSH_STRING_LEN`].
+    StringTooLong {
+        /// The length the peer announced.
+        length: u64,
+        /// The largest length that is accepted.
+        limit: u64,
+    },
     /// The message type is not known to this implementation.
     UnknownMessageType(u64),
     /// The channel request type is not known to this implementation.
@@ -46,6 +68,12 @@ impl fmt::Display for Ssh3Error {
             Self::InvalidBool(value) => write!(f, "invalid SSH boolean byte: {value}"),
             Self::InvalidLength(length) => {
                 write!(f, "SSH string length does not fit in memory: {length}")
+            }
+            Self::StringTooLong { length, limit } => {
+                write!(
+                    f,
+                    "SSH string length {length} exceeds the limit of {limit} bytes"
+                )
             }
             Self::UnknownMessageType(kind) => write!(f, "unknown SSH message type: {kind}"),
             Self::UnknownRequestType(kind) => {
@@ -210,11 +238,19 @@ pub fn var_int_len(value: u64) -> usize {
 /// Reads a length-prefixed byte string ("SSH string") from `reader`.
 ///
 /// The length is a variable-length integer followed by exactly that many
-/// bytes. The length is bounded by the address space of the process; a length
-/// that does not fit is reported as [`Ssh3Error::InvalidLength`] instead of
-/// causing an allocation.
+/// bytes. The length is bounded by [`MAX_SSH_STRING_LEN`]: a length above
+/// that bound is reported as [`Ssh3Error::StringTooLong`] *before* any buffer
+/// is allocated, so a peer cannot make the process allocate an arbitrary
+/// amount of memory. A length that does not fit into the address space of the
+/// process is reported as [`Ssh3Error::InvalidLength`].
 pub fn read_ssh_bytes<R: Read>(reader: &mut R) -> Ssh3Result<Vec<u8>> {
     let length = read_var_int(reader)?;
+    if length > MAX_SSH_STRING_LEN {
+        return Err(Ssh3Error::StringTooLong {
+            length,
+            limit: MAX_SSH_STRING_LEN,
+        });
+    }
     let length = usize::try_from(length).map_err(|_| Ssh3Error::InvalidLength(length))?;
     let mut out = vec![0; length];
     reader.read_exact(&mut out)?;
@@ -262,11 +298,12 @@ fn read_byte<R: Read>(reader: &mut R) -> Ssh3Result<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{self, Cursor, Read};
 
     use super::{
-        MAX_VARINT, append_ssh_bytes, append_var_int, append_var_int_with_len, min_u64,
-        read_ssh_bytes, read_var_int, ssh_string_len, var_int_len,
+        MAX_SSH_STRING_LEN, MAX_VARINT, Ssh3Error, append_ssh_bytes, append_var_int,
+        append_var_int_with_len, min_u64, read_ssh_bytes, read_var_int, ssh_string_len,
+        var_int_len,
     };
 
     #[test]
@@ -323,5 +360,64 @@ mod tests {
     fn min_u64_returns_the_smaller_value() {
         assert_eq!(min_u64(4, 9), 4);
         assert_eq!(min_u64(9, 4), 4);
+    }
+
+    /// Reader that hands out the bytes of a buffer and counts them.
+    struct CountingReader<'a> {
+        data: &'a [u8],
+        consumed: usize,
+    }
+
+    impl Read for CountingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let available = self.data.len() - self.consumed;
+            let count = buf.len().min(available);
+            buf[..count].copy_from_slice(&self.data[self.consumed..self.consumed + count]);
+            self.consumed += count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn ssh_bytes_above_the_limit_are_refused_before_the_allocation() {
+        for length in [MAX_SSH_STRING_LEN + 1, MAX_VARINT] {
+            let mut encoded = Vec::new();
+            append_var_int(&mut encoded, length);
+            let mut reader = CountingReader {
+                data: &encoded,
+                consumed: 0,
+            };
+
+            match read_ssh_bytes(&mut reader) {
+                Err(Ssh3Error::StringTooLong {
+                    length: reported,
+                    limit,
+                }) => {
+                    assert_eq!(reported, length);
+                    assert_eq!(limit, MAX_SSH_STRING_LEN);
+                }
+                other => panic!("expected a length error, got {other:?}"),
+            }
+
+            // Only the length prefix was consumed: the payload was never
+            // requested, so no buffer of the announced size was allocated.
+            assert_eq!(reader.consumed, encoded.len());
+        }
+    }
+
+    #[test]
+    fn ssh_bytes_at_the_limit_are_accepted() {
+        let mut encoded = Vec::new();
+        append_var_int(&mut encoded, MAX_SSH_STRING_LEN);
+        let mut reader = CountingReader {
+            data: &encoded,
+            consumed: 0,
+        };
+
+        // The length itself is accepted: what fails is the missing payload.
+        match read_ssh_bytes(&mut reader) {
+            Err(Ssh3Error::Io(err)) => assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof),
+            other => panic!("expected the missing payload to be reported, got {other:?}"),
+        }
     }
 }

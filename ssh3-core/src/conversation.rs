@@ -338,6 +338,14 @@ impl Ssh3Conversation {
         self.default_datagrams_queue_size
     }
 
+    /// Returns the maximum packet size the conversation announces.
+    ///
+    /// It is the value sent in the confirmation of a channel and the upper
+    /// bound of the maximum packet size a peer may announce.
+    pub fn max_packet_size(&self) -> u64 {
+        self.max_packet_size
+    }
+
     async fn confirm_and_register_channel(
         &self,
         channel: Ssh3AcceptedChannel,
@@ -630,7 +638,9 @@ mod tests {
         let expected = ssh3_proto::Ssh3ChannelHeader {
             conversation_stream_id: 10,
             channel_type: b"direct-tcp".to_vec(),
-            max_packet_size: 1024,
+            // The announced packet size is floored at the construction of the
+            // channel, so it never drops below the minimum sane value.
+            max_packet_size: crate::channel::MIN_MAX_PACKET_SIZE,
         }
         .encode(Some(&ssh3_proto::build_forwarding_additional_bytes(
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),

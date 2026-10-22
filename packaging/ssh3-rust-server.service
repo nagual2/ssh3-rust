@@ -1,0 +1,44 @@
+# Copyright 2026 The nagual2 ssh3 Authors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# systemd unit of the Rust SSH3 server. It mirrors the unit of the Go
+# implementation (packaging/ssh3-server.service of nagual2/ssh3-go) and
+# adapts it to the binary and the options of the Rust server.
+
+[Unit]
+Description=SSH3 server (Rust, QUIC/HTTP-3, keys by default)
+Documentation=https://github.com/nagual2/ssh3-rust
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The environment file is optional: the leading "-" keeps the unit startable
+# on a host where the operator did not create it. Every option of the file
+# has a command line counterpart.
+EnvironmentFile=-/etc/ssh3/ssh3-rust-server.env
+# The Rust server generates its self-signed certificate on startup, so there
+# is no -cert/-key pair here; the subject alternative names of the
+# certificate are taken from --hostname (add the addresses the clients dial
+# as IP SANs).
+ExecStart=/usr/bin/ssh3-rust-server --bind [::]:443 --url-path /ssh3-term --hostname localhost
+Restart=on-failure
+RestartSec=3
+# sshd parity: daemon restart must not kill active user sessions
+KillMode=process
+# The security model of the Rust server: the sessions run as the
+# authenticated user (the server drops to the uid/gid of the account), the
+# secret URL path keeps the endpoint from being found by accident and the
+# authentication is key-based by default. Password login is off by default
+# and can be turned on with --enable-password-login (or
+# SSH3_ENABLE_PASSWORD_LOGIN=1 in /etc/ssh3/ssh3-rust-server.env); the root
+# account never authenticates by password. The forwarding targets of the
+# clients can be bounded with SSH3_PERMIT_OPEN and the reverse-forward
+# listeners with SSH3_PERMIT_LISTEN.
+#
+# No sandbox directives here on purpose: CapabilityBoundingSet /
+# NoNewPrivileges / Protect* / Restrict* apply to the whole cgroup, so they
+# would clip the capabilities that sudo regains inside a session. This
+# mirrors Debian's ssh.service, which ships no such directives either.
+[Install]
+WantedBy=multi-user.target

@@ -4,12 +4,34 @@
 //! certificate for the configured subject alternative names — or run on top
 //! of an endpoint the caller has already configured.
 
-use quinn::Endpoint;
+use std::sync::Arc;
+
+use quinn::{Endpoint, ServerConfig};
 use ssh3_quinn::self_signed_server_config;
 
 use crate::config::{Ssh3ServerConfig, validate_server_config};
 use crate::error::Ssh3ServerError;
 use crate::runtime::serve_endpoint;
+
+/// Applies the configured QUIC timeouts to a server configuration.
+///
+/// The idle timeout of the transport is the `max-idle-timeout` of the
+/// server; the handshake timeout is enforced by the runtime, which gives up
+/// on a connection that does not complete its handshake in time.
+pub fn apply_transport_timeouts(server_config: &mut ServerConfig, config: &Ssh3ServerConfig) {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(match quinn::IdleTimeout::try_from(config.max_idle_timeout) {
+        Ok(idle_timeout) => Some(idle_timeout),
+        Err(_) => {
+            eprintln!(
+                "ssh3-rust-server the idle timeout of {}s does not fit into the QUIC transport parameters, the idle timeout is disabled",
+                config.max_idle_timeout.as_secs()
+            );
+            None
+        }
+    });
+    server_config.transport = Arc::new(transport);
+}
 
 /// Serves SSH3 with a freshly generated self-signed certificate.
 ///
@@ -21,8 +43,9 @@ use crate::runtime::serve_endpoint;
 /// provides its own certificate or key.
 pub async fn run_with_self_signed(config: Ssh3ServerConfig) -> Result<(), Ssh3ServerError> {
     validate_server_config(&config)?;
-    let (server_config, _certificate) =
+    let (mut server_config, _certificate) =
         self_signed_server_config(config.cert_subject_alt_names.clone())?;
+    apply_transport_timeouts(&mut server_config, &config);
     let endpoint = Endpoint::server(server_config, config.bind_addr)?;
     serve_endpoint(endpoint, config).await
 }

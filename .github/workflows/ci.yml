@@ -75,12 +75,7 @@ jobs:
       - name: Run the interop matrix
         env:
           SSH3_GO_REPO: ${{ github.workspace }}/ssh3-go
-        # `real_go_client_forward_agent_round_trips_against_the_rust_server`
-        # is skipped: the Rust server drops the forwarded ssh-agent socket
-        # when the session closes, so the probe that connects a moment later
-        # gets ENOENT. The defect is known and tracked (ROADMAP.md, stage
-        # M2); it is not fixed here because the workspace is frozen.
-        run: cargo test -p ssh3-client --locked -- --skip real_go_client_forward_agent_round_trips_against_the_rust_server
+        run: cargo test -p ssh3-client --locked
 
   audit:
     name: audit

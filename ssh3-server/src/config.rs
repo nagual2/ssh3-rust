@@ -6,11 +6,13 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ssh3_h3::SSH3_VERSION_STRING;
 
-use crate::auth::password_auth_available;
+use crate::auth::{Ssh3AuthGuard, password_auth_available};
 use crate::error::Ssh3ServerError;
+use crate::forwarding::ForwardPolicy;
 
 /// Callback that decides whether a username/password pair is valid.
 ///
@@ -54,6 +56,37 @@ pub struct Ssh3ServerConfig {
     pub shell: Option<String>,
     /// Custom password verifier; `None` selects the platform default.
     pub password_verifier: Option<Ssh3PasswordVerifier>,
+    /// Secret URL path the server accepts its CONNECT requests on.
+    ///
+    /// Any other path is answered with `404 Not Found`, the sshd `PidFile`
+    /// style secret path of the SSH3 canon.
+    pub url_path: String,
+    /// Policy that bounds the server-side dials of forwarded channels.
+    ///
+    /// `None` keeps the historical unrestricted behavior.
+    pub permit_open: Option<ForwardPolicy>,
+    /// Policy that bounds the server-side binds of reverse-forward listeners.
+    ///
+    /// `None` keeps the historical unrestricted behavior.
+    pub permit_listen: Option<ForwardPolicy>,
+    /// Maximum number of conversations that may wait for their authentication.
+    ///
+    /// A conversation over the cap is refused with `503 Service Unavailable`
+    /// before any identity work happens; this is the `MaxStartups` analog.
+    pub max_unauthenticated_conversations: usize,
+    /// Number of failed password attempts that locks an account out.
+    pub max_password_failures: u32,
+    /// How long an account stays locked out after too many failed attempts.
+    pub password_lockout: Duration,
+    /// Idle timeout of an established QUIC connection.
+    pub max_idle_timeout: Duration,
+    /// How long the server waits for a connection to complete its handshake.
+    pub handshake_idle_timeout: Duration,
+    /// Shared state of the authentication-phase DoS guards.
+    ///
+    /// The guard is shared by all connections of a server; cloning the
+    /// configuration keeps sharing it.
+    pub auth_guard: Arc<Ssh3AuthGuard>,
 }
 
 impl fmt::Debug for Ssh3ServerConfig {
@@ -76,6 +109,18 @@ impl fmt::Debug for Ssh3ServerConfig {
                 "password_verifier",
                 &self.password_verifier.as_ref().map(|_| "<custom>"),
             )
+            .field("url_path", &self.url_path)
+            .field("permit_open", &self.permit_open)
+            .field("permit_listen", &self.permit_listen)
+            .field(
+                "max_unauthenticated_conversations",
+                &self.max_unauthenticated_conversations,
+            )
+            .field("max_password_failures", &self.max_password_failures)
+            .field("password_lockout", &self.password_lockout)
+            .field("max_idle_timeout", &self.max_idle_timeout)
+            .field("handshake_idle_timeout", &self.handshake_idle_timeout)
+            .field("auth_guard", &self.auth_guard)
             .finish()
     }
 }
@@ -94,9 +139,36 @@ impl Default for Ssh3ServerConfig {
             default_user: current_username(),
             shell: env::var("SHELL").ok().filter(|shell| !shell.is_empty()),
             password_verifier: None,
+            url_path: DEFAULT_URL_PATH.to_string(),
+            permit_open: None,
+            permit_listen: None,
+            max_unauthenticated_conversations: DEFAULT_MAX_UNAUTHENTICATED_CONVERSATIONS,
+            max_password_failures: DEFAULT_MAX_PASSWORD_FAILURES,
+            password_lockout: DEFAULT_PASSWORD_LOCKOUT,
+            max_idle_timeout: DEFAULT_MAX_IDLE_TIMEOUT,
+            handshake_idle_timeout: DEFAULT_HANDSHAKE_IDLE_TIMEOUT,
+            auth_guard: Arc::new(Ssh3AuthGuard::default()),
         }
     }
 }
+
+/// The secret URL path the server listens on by default.
+pub const DEFAULT_URL_PATH: &str = "/ssh3-term";
+
+/// The default cap of conversations that may wait for their authentication.
+pub const DEFAULT_MAX_UNAUTHENTICATED_CONVERSATIONS: usize = 100;
+
+/// The default number of failed password attempts that locks an account out.
+pub const DEFAULT_MAX_PASSWORD_FAILURES: u32 = 10;
+
+/// The default lockout duration of a brute-forced account.
+pub const DEFAULT_PASSWORD_LOCKOUT: Duration = Duration::from_secs(60);
+
+/// The default idle timeout of an established connection (the ssh2 canon).
+pub const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The default handshake timeout of a connection (the ssh2 `LoginGraceTime` scale).
+pub const DEFAULT_HANDSHAKE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Returns the name of the user the server process runs as.
 ///
@@ -130,4 +202,94 @@ pub(crate) fn validate_server_config(config: &Ssh3ServerConfig) -> Result<(), Ss
         .into());
     }
     Ok(())
+}
+
+/// Parses a duration in the Go `time.ParseDuration` syntax.
+///
+/// The syntax is a sequence of decimal numbers with an optional fraction,
+/// each followed by a unit suffix: `ns`, `us` (`µs`), `ms`, `s`, `m` or `h`,
+/// for example `2m`, `1h30m` or `250ms`. A bare number is read as seconds,
+/// which keeps the Go implementation's second-based environment variables
+/// (`SSH3_MAX_IDLE_TIMEOUT=86400`) working unchanged.
+pub fn parse_duration(spec: &str) -> Result<Duration, String> {
+    let text = spec.trim();
+    if text.is_empty() {
+        return Err("the duration is empty".to_string());
+    }
+    if text == "0" {
+        return Ok(Duration::ZERO);
+    }
+    if let Ok(seconds) = text.parse::<u64>() {
+        return Ok(Duration::from_secs(seconds));
+    }
+
+    let mut total = Duration::ZERO;
+    let mut rest = text;
+    while !rest.is_empty() {
+        let digits_end = rest
+            .find(|character: char| !character.is_ascii_digit() && character != '.')
+            .unwrap_or(rest.len());
+        if digits_end == 0 {
+            return Err(format!("invalid duration {spec:?}: expected a number"));
+        }
+        let (number, tail) = rest.split_at(digits_end);
+        let (integer_part, fraction_part) = match number.split_once('.') {
+            Some((integer_part, fraction_part)) => (integer_part, fraction_part),
+            None => (number, ""),
+        };
+        if integer_part.is_empty() && fraction_part.is_empty() {
+            return Err(format!("invalid duration {spec:?}: expected a number"));
+        }
+        if !fraction_part
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        {
+            return Err(format!("invalid duration {spec:?}: bad number {number:?}"));
+        }
+
+        let unit_end = tail
+            .find(|character: char| character.is_ascii_digit() || character == '.')
+            .unwrap_or(tail.len());
+        let (unit, tail) = tail.split_at(unit_end);
+        let unit_nanos: u64 = match unit {
+            "ns" => 1,
+            "us" | "µs" | "μs" => 1_000,
+            "ms" => 1_000_000,
+            "s" => 1_000_000_000,
+            "m" => 60 * 1_000_000_000,
+            "h" => 3_600 * 1_000_000_000,
+            "" => return Err(format!("invalid duration {spec:?}: missing unit")),
+            other => {
+                return Err(format!("invalid duration {spec:?}: unknown unit {other:?}"));
+            }
+        };
+
+        let integer: u128 = integer_part
+            .parse::<u128>()
+            .map_err(|_| format!("invalid duration {spec:?}: bad number {number:?}"))?;
+        let mut nanos = integer
+            .checked_mul(unit_nanos as u128)
+            .ok_or_else(|| format!("invalid duration {spec:?}: the value is too large"))?;
+
+        if !fraction_part.is_empty() {
+            let digits: u128 = fraction_part
+                .parse::<u128>()
+                .map_err(|_| format!("invalid duration {spec:?}: bad number {number:?}"))?;
+            let scale = 10u128.pow(fraction_part.len() as u32);
+            let fraction_nanos = digits
+                .checked_mul(unit_nanos as u128)
+                .ok_or_else(|| format!("invalid duration {spec:?}: the value is too large"))?
+                / scale;
+            nanos += fraction_nanos;
+        }
+
+        let nanos = u64::try_from(nanos)
+            .map_err(|_| format!("invalid duration {spec:?}: the value is too large"))?;
+        total = total
+            .checked_add(Duration::from_nanos(nanos))
+            .ok_or_else(|| format!("invalid duration {spec:?}: the value is too large"))?;
+        rest = tail;
+    }
+
+    Ok(total)
 }

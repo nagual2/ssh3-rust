@@ -31,13 +31,17 @@ use ssh3_proto::{
     Ssh3ChannelRequestMessage, Ssh3ExecRequest, Ssh3ExitStatusRequest, Ssh3Message, Ssh3PtyRequest,
     Ssh3SignalRequest, Ssh3WindowChangeRequest,
 };
-use ssh3_quinn::{client_config_for_certificate, open_channel, self_signed_server_config};
+use ssh3_quinn::{
+    client_config_for_certificate, open_channel, open_tcp_forwarding_channel,
+    self_signed_server_config,
+};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{sleep, timeout};
 
-use crate::config::{Ssh3ServerConfig, current_username};
+use crate::config::{Ssh3ServerConfig, current_username, parse_duration};
+use crate::forwarding::ForwardPolicy;
 use crate::runtime::serve_connection;
 use crate::session::{effective_shell, lookup_session_user};
 
@@ -1066,4 +1070,357 @@ async fn missing_requested_and_default_user_is_rejected() {
     let _ = timeout(Duration::from_secs(5), driver_task).await.unwrap();
     client_endpoint.wait_idle().await;
     server_task.await.unwrap();
+}
+
+/// Connects to the server and reports the HTTP status of the CONNECT request.
+///
+/// The helper is used by the tests that check how the server answers a
+/// request it refuses: a wrong URL path, a conversation over the
+/// unauthenticated cap or a locked-out account.
+async fn connect_status(
+    server_config: Ssh3ServerConfig,
+    path: &str,
+    authorization: Option<&str>,
+) -> http::StatusCode {
+    let (server_config_tls, server_certificate) =
+        self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+    let server_endpoint = quinn::Endpoint::server(
+        server_config_tls,
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+    )
+    .unwrap();
+    let server_addr = server_endpoint.local_addr().unwrap();
+
+    let mut client_endpoint =
+        quinn::Endpoint::client(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+    client_endpoint
+        .set_default_client_config(client_config_for_certificate(server_certificate).unwrap());
+
+    let client_connecting = client_endpoint.connect(server_addr, "localhost").unwrap();
+    let server_task = tokio::spawn(async move {
+        let incoming = timeout(Duration::from_secs(5), server_endpoint.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let connection = timeout(Duration::from_secs(5), incoming)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = timeout(
+            Duration::from_secs(10),
+            serve_connection(connection, server_config),
+        )
+        .await;
+    });
+    let client_connection = timeout(Duration::from_secs(5), client_connecting)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (mut driver, mut send_request) = new_client(client_connection.clone()).await.unwrap();
+    let driver_task = tokio::spawn(async move {
+        let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+
+    let mut request = build_connect_request(
+        format!("https://localhost{path}").parse().unwrap(),
+        SSH3_VERSION_STRING,
+    )
+    .unwrap();
+    if let Some(authorization) = authorization {
+        request.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_str(authorization).unwrap(),
+        );
+    }
+
+    let status = match timeout(
+        Duration::from_secs(5),
+        establish_client_conversation(
+            &mut send_request,
+            client_connection.clone(),
+            request,
+            30_000,
+            10,
+        ),
+    )
+    .await
+    .unwrap()
+    {
+        Ok(_) => http::StatusCode::OK,
+        Err(Ssh3ClientConversationError::UnexpectedStatus { status }) => status,
+        Err(err) => panic!("unexpected conversation error: {err}"),
+    };
+
+    client_connection.close(0u32.into(), b"done");
+    let _ = timeout(Duration::from_secs(5), driver_task).await.unwrap();
+    client_endpoint.wait_idle().await;
+    let _ = server_task.await;
+
+    status
+}
+
+#[test]
+fn the_permit_policy_follows_the_sshd_config_syntax() {
+    assert!(ForwardPolicy::parse("").unwrap().is_none());
+    assert!(ForwardPolicy::parse("   ").unwrap().is_none());
+
+    let policy = ForwardPolicy::parse("example.org:443, *.example.com:80 !10.0.0.1:*")
+        .unwrap()
+        .unwrap();
+    assert!(policy.allows("example.org", 443));
+    assert!(!policy.allows("example.org", 80));
+    assert!(policy.allows("www.example.com", 80));
+    assert!(!policy.allows("example.com", 80));
+    assert!(!policy.allows("10.0.0.1", 22));
+
+    // a policy that only holds negated entries allows everything else
+    let policy = ForwardPolicy::parse("!10.0.0.1:*").unwrap().unwrap();
+    assert!(policy.allows("example.org", 443));
+    assert!(!policy.allows("10.0.0.1", 22));
+
+    // the host is matched case-insensitively
+    let policy = ForwardPolicy::parse("Example.ORG:443").unwrap().unwrap();
+    assert!(policy.allows("example.org", 443));
+
+    // a broken entry is rejected
+    assert!(ForwardPolicy::parse("example.org").is_err());
+    assert!(ForwardPolicy::parse("example.org:").is_err());
+    assert!(ForwardPolicy::parse(":443").is_err());
+    assert!(ForwardPolicy::parse("example.org:http").is_err());
+}
+
+#[test]
+fn durations_are_parsed_in_the_go_syntax() {
+    assert_eq!(parse_duration("120s").unwrap(), Duration::from_secs(120));
+    assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+    assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86_400));
+    assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5_400));
+    assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
+    assert_eq!(parse_duration("1.5h").unwrap(), Duration::from_secs(5_400));
+    // a bare number is read as seconds, like the Go environment variables
+    assert_eq!(
+        parse_duration("86400").unwrap(),
+        Duration::from_secs(86_400)
+    );
+    assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
+
+    assert!(parse_duration("").is_err());
+    assert!(parse_duration("1x").is_err());
+    assert!(parse_duration("abc").is_err());
+    assert!(parse_duration("-5s").is_err());
+}
+
+#[tokio::test]
+async fn requests_on_another_url_path_are_refused() {
+    let config = Ssh3ServerConfig {
+        url_path: "/secret-path".to_string(),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        connect_status(config.clone(), "/ssh3-term", None).await,
+        http::StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        connect_status(config, "/secret-path", None).await,
+        http::StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn conversations_over_the_unauthenticated_cap_are_refused() {
+    let config = Ssh3ServerConfig {
+        max_unauthenticated_conversations: 0,
+        ..Default::default()
+    };
+    assert_eq!(
+        connect_status(config, "/ssh3-term", None).await,
+        http::StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    let config = Ssh3ServerConfig {
+        max_unauthenticated_conversations: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        connect_status(config, "/ssh3-term", None).await,
+        http::StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn failed_password_attempts_lock_the_account_out() {
+    let username = current_username().expect("the current user is known");
+    let config = Ssh3ServerConfig {
+        require_authentication: true,
+        enable_password_login: true,
+        max_password_failures: 2,
+        password_lockout: Duration::from_secs(60),
+        password_verifier: Some(Arc::new(|_user: &str, _password: &str| {
+            Ok::<bool, std::io::Error>(false)
+        })),
+        ..Default::default()
+    };
+
+    let authorization = basic_authorization(&username, "wrong");
+    assert_eq!(
+        connect_status(config.clone(), "/ssh3-term", Some(&authorization)).await,
+        http::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        connect_status(config.clone(), "/ssh3-term", Some(&authorization)).await,
+        http::StatusCode::UNAUTHORIZED
+    );
+    // the account is locked out now
+    assert_eq!(
+        connect_status(config, "/ssh3-term", Some(&authorization)).await,
+        http::StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn the_root_account_cannot_authenticate_with_a_password() {
+    let config = Ssh3ServerConfig {
+        require_authentication: true,
+        enable_password_login: true,
+        password_verifier: Some(Arc::new(|_user: &str, _password: &str| {
+            Ok::<bool, std::io::Error>(true)
+        })),
+        ..Default::default()
+    };
+
+    let authorization = basic_authorization("root", "secret");
+    assert_eq!(
+        connect_status(config.clone(), "/ssh3-term", Some(&authorization)).await,
+        http::StatusCode::UNAUTHORIZED
+    );
+
+    // the same credentials work for an ordinary account
+    let username = current_username().expect("the current user is known");
+    let authorization = basic_authorization(&username, "secret");
+    assert_eq!(
+        connect_status(config, "/ssh3-term", Some(&authorization)).await,
+        http::StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn forwarded_dials_are_denied_by_the_permit_open_policy() {
+    let listener = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let echo_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 64];
+                if let Ok(read) = stream.read(&mut buffer).await {
+                    let _ = stream.write_all(&buffer[..read]).await;
+                }
+            });
+        }
+    });
+
+    // a policy that allows the target lets the forward through
+    let config = Ssh3ServerConfig {
+        permit_open: ForwardPolicy::parse(&format!("127.0.0.1:{}", echo_addr.port())).unwrap(),
+        ..Default::default()
+    };
+    let harness = setup_harness(config).await;
+    let channel = open_tcp_forwarding_channel(
+        harness.conversation.as_ref(),
+        &harness.client_connection,
+        1024,
+        10,
+        echo_addr,
+    )
+    .await
+    .unwrap();
+    channel
+        .write_data(b"ping", SSH_EXTENDED_DATA_NONE)
+        .await
+        .unwrap();
+    let message = timeout(Duration::from_secs(5), channel.next_message())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&message, Ssh3Message::Data(data) if data.data == b"ping"),
+        "the allowed forward did not echo: {message:?}"
+    );
+    harness.shutdown().await;
+
+    // a policy that does not allow the target refuses the dial
+    let config = Ssh3ServerConfig {
+        permit_open: ForwardPolicy::parse("203.0.113.7:443").unwrap(),
+        ..Default::default()
+    };
+    let harness = setup_harness(config).await;
+    let channel = open_tcp_forwarding_channel(
+        harness.conversation.as_ref(),
+        &harness.client_connection,
+        1024,
+        10,
+        echo_addr,
+    )
+    .await
+    .unwrap();
+    let _ = channel.write_data(b"ping", SSH_EXTENDED_DATA_NONE).await;
+    let delivered = match timeout(Duration::from_secs(2), channel.next_message()).await {
+        Err(_) => false,
+        Ok(Err(_)) => false,
+        Ok(Ok(Ssh3Message::Data(data))) => data.data == b"ping",
+        Ok(Ok(_)) => false,
+    };
+    assert!(!delivered, "the denied forward still delivered the payload");
+    harness.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_forwarded_agent_socket_outlives_the_session_channel() {
+    let harness = setup_harness(Ssh3ServerConfig::default()).await;
+    let channel = harness.open_session_channel().await;
+    channel
+        .write_data(b"forward-agent", SSH_EXTENDED_DATA_NONE)
+        .await
+        .unwrap();
+    channel
+        .send_request(Ssh3ChannelRequestMessage {
+            want_reply: true,
+            request: Ssh3ChannelRequest::Exec(Ssh3ExecRequest {
+                command: b"printf '%s' \"$SSH_AUTH_SOCK\"".to_vec(),
+            }),
+        })
+        .await
+        .unwrap();
+
+    let output = collect_session_output(channel.clone()).await;
+    let socket_path = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        !socket_path.is_empty(),
+        "the agent socket was not exported to the session"
+    );
+    assert!(
+        std::path::Path::new(&socket_path).exists(),
+        "the agent socket {socket_path} does not exist"
+    );
+
+    // closing the session channel must not remove the socket: a client may
+    // connect to the agent socket after the session is gone
+    channel.close().await.unwrap();
+    sleep(Duration::from_millis(300)).await;
+    assert!(
+        std::path::Path::new(&socket_path).exists(),
+        "the agent socket {socket_path} was removed with the session channel"
+    );
+
+    // the socket is removed when the conversation ends
+    harness.shutdown().await;
+    sleep(Duration::from_millis(300)).await;
+    assert!(
+        !std::path::Path::new(&socket_path).exists(),
+        "the agent socket {socket_path} outlived the conversation"
+    );
 }
