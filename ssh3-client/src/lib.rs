@@ -44,6 +44,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use url::Url;
 
 mod agent;
+mod cm;
 mod console;
 mod duration;
 mod dynamic;
