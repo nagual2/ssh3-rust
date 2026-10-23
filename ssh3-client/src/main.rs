@@ -1476,6 +1476,11 @@ mod tests {
         assert_eq!(config.local_forwards[0].bind_port, 8080);
     }
 
+    // The keyword is parsed the same way on every platform, but the agent
+    // forwarding itself is a unix feature: the validation of the Windows
+    // command line rejects the resolved setting, so the check of the
+    // resolved value runs on unix only.
+    #[cfg(unix)]
     #[test]
     fn the_config_file_provides_the_forward_agent_keyword() {
         let directory = tempfile::TempDir::new().unwrap();
