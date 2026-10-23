@@ -14,6 +14,7 @@ use http::{Uri, header::HeaderValue};
 use quinn::{ConnectError, Connection, ConnectionError, Endpoint};
 use rand::{RngCore, rngs::OsRng};
 use reqwest::StatusCode as HttpStatusCode;
+use russh_sftp::client::SftpSession;
 use rustls::{RootCertStore, pki_types::CertificateDer};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -53,8 +54,12 @@ mod host_key;
 mod incoming;
 mod known_hosts;
 mod reverse;
+mod sftp_stream;
 mod ssh_config;
 mod strict_host_key;
+mod transfer;
+#[cfg(test)]
+mod transfer_tests;
 
 pub use agent::Ssh3AgentSelection;
 use agent::{build_agent_bearer_token, resolve_agent_socket_path};
@@ -84,6 +89,11 @@ pub use ssh_config::{SshConfig, default_ssh_config_path, load_ssh_config};
 pub use strict_host_key::{
     HostKeyContext, HostKeyDecision, HostKeyOutcome, Ssh3StrictHostKeyChecking,
     Ssh3StrictHostKeyCheckingError, decide_host_key, resolve_strict_host_key_checking,
+};
+pub use transfer::{
+    CHECKSUM_AUTO_THRESHOLD, DEFAULT_TRANSFER_PORT, DEFAULT_TRANSFER_URL_PATH, Ssh3TransferError,
+    Ssh3TransferFailure, Ssh3TransferOptions, Ssh3TransferPlan, Ssh3TransferTarget,
+    is_remote_transfer_spec, parse_remote_transfer_spec,
 };
 
 /// The version string of the client, in the format of the Go implementation.
@@ -744,6 +754,23 @@ impl ActiveClient {
             self.conversation.as_ref(),
             &self.connection,
             b"session".to_vec(),
+            self.max_packet_size,
+            self.default_datagrams_queue_size,
+        )
+        .await
+        .map_err(Ssh3ClientError::from)
+    }
+
+    /// Opens the channel of the SFTP subsystem.
+    ///
+    /// The channel carries the bytes of the SFTP protocol, the way the
+    /// reference implementation of the Go client does: the channel is of the
+    /// type `sftp` and the server serves the subsystem on it.
+    async fn open_sftp_channel(&self) -> Result<Arc<Ssh3Channel>, Ssh3ClientError> {
+        open_channel(
+            self.conversation.as_ref(),
+            &self.connection,
+            b"sftp".to_vec(),
             self.max_packet_size,
             self.default_datagrams_queue_size,
         )
@@ -1469,6 +1496,76 @@ pub async fn run_forwards_only(config: &Ssh3ClientConfig) -> Result<(), Ssh3Clie
     let result = hold_forwards(&client, config).await;
     client.shutdown().await;
     result
+}
+
+/// Moves a file or a tree between the local file system and the SFTP
+/// subsystem of the server.
+///
+/// The transfer opens a channel of the type `sftp` and speaks the SFTP
+/// protocol (version 3) over it, the way the reference implementation of the
+/// Go client does. The direction of the transfer is the one of the plan: the
+/// local path is the source of an upload and the destination of a download.
+pub async fn run_file_transfer(
+    config: &Ssh3ClientConfig,
+    plan: &Ssh3TransferPlan,
+) -> Result<(), Ssh3TransferError> {
+    let client = connect_client(config)
+        .await
+        .map_err(Ssh3TransferError::Connection)?;
+    let result = run_file_transfer_on_client(&client, plan).await;
+    client.shutdown().await;
+    result
+}
+
+/// Runs a transfer over the SFTP channel of an established connection.
+async fn run_file_transfer_on_client(
+    client: &ActiveClient,
+    plan: &Ssh3TransferPlan,
+) -> Result<(), Ssh3TransferError> {
+    let channel = client
+        .open_sftp_channel()
+        .await
+        .map_err(Ssh3TransferError::Connection)?;
+    let stream = sftp_stream::ChannelStream::new(channel);
+    let session = SftpSession::new(stream)
+        .await
+        .map_err(|error| Ssh3TransferError::Session { error })?;
+    let options = &plan.options;
+    if plan.upload {
+        if options.recursive {
+            transfer::upload_tree(
+                &session,
+                &plan.local_path,
+                &plan.target.remote_path,
+                options,
+            )
+            .await
+        } else {
+            transfer::upload_file(
+                &session,
+                &plan.local_path,
+                &plan.target.remote_path,
+                options,
+            )
+            .await
+        }
+    } else if options.recursive {
+        transfer::download_tree(
+            &session,
+            &plan.target.remote_path,
+            &plan.local_path,
+            options,
+        )
+        .await
+    } else {
+        transfer::download_file(
+            &session,
+            &plan.target.remote_path,
+            &plan.local_path,
+            options,
+        )
+        .await
+    }
 }
 
 /// Registers the forwards of the configuration and waits for the end of the
@@ -2346,15 +2443,15 @@ mod tests {
         server: PathBuf,
     }
 
-    struct AuthFixture {
-        _tempdir: TempDir,
-        private_key_path: std::path::PathBuf,
-        authorized_identities_path: std::path::PathBuf,
-        username: String,
+    pub(crate) struct AuthFixture {
+        pub(crate) _tempdir: TempDir,
+        pub(crate) private_key_path: std::path::PathBuf,
+        pub(crate) authorized_identities_path: std::path::PathBuf,
+        pub(crate) username: String,
     }
 
     #[derive(Clone, Copy)]
-    enum AuthKeyAlgorithm {
+    pub(crate) enum AuthKeyAlgorithm {
         Ed25519,
         NistP256,
         Rsa,
@@ -2448,7 +2545,7 @@ mod tests {
     /// so a scenario that did not run is always visible in the test log and
     /// can never be mistaken for a scenario that really passed.
     #[cfg(unix)]
-    fn skip_interop(scenario: &str) {
+    pub(crate) fn skip_interop(scenario: &str) {
         skip_interop_with_reason(scenario, &go_unavailable_reason());
     }
 
@@ -2612,7 +2709,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn reserve_udp_port() -> u16 {
+    pub(crate) fn reserve_udp_port() -> u16 {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         socket.local_addr().unwrap().port()
     }
@@ -2754,7 +2851,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn spawn_go_cli_server(
+    pub(crate) async fn spawn_go_cli_server(
         bind_addr: &str,
         username: &str,
         home_dir: &Path,
@@ -3495,7 +3592,7 @@ mod tests {
         Ok(echoed)
     }
 
-    fn create_auth_fixture(algorithm: AuthKeyAlgorithm) -> AuthFixture {
+    pub(crate) fn create_auth_fixture(algorithm: AuthKeyAlgorithm) -> AuthFixture {
         let tempdir = TempDir::new().unwrap();
         let private_key_path = tempdir.path().join("id_ed25519");
         let authorized_identities_path = tempdir.path().join("authorized_keys");
@@ -3533,7 +3630,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn lock_go_binary_tests() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn lock_go_binary_tests() -> std::sync::MutexGuard<'static, ()> {
         go_binary_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -2208,6 +2208,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rsa",
+ "russh-sftp",
  "rustls",
  "rustls-pemfile",
  "serde",

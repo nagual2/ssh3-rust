@@ -5,14 +5,16 @@ use std::time::Duration;
 use clap::{ArgGroup, CommandFactory, Parser, ValueHint, error::ErrorKind};
 use http::Uri;
 use ssh3_client::{
-    DEFAULT_HANDSHAKE_IDLE_TIMEOUT, DEFAULT_MAX_IDLE_TIMEOUT, SSH3_CLIENT_VERSION_STRING,
-    Ssh3AgentSelection, Ssh3ClientConfig, Ssh3ClientError, Ssh3DynamicForwardSpec,
-    Ssh3KnownHostsTrust, Ssh3LocalForwardSpec, Ssh3OidcConfig, Ssh3PtyPolicy,
-    Ssh3ReverseForwardSpec, Ssh3SessionRequest, Ssh3StrictHostKeyChecking, Ssh3TrustStrategy,
-    SshConfig, default_known_hosts_path, default_ssh_config_path, exit_code_for_exit_signal,
-    load_certificates, load_ssh_config, parse_duration, parse_dynamic_forward_spec,
-    parse_escape_char, parse_local_forward_spec, parse_reverse_forward_spec,
-    resolve_strict_host_key_checking, run_forwards_only, run_session_stdio,
+    DEFAULT_HANDSHAKE_IDLE_TIMEOUT, DEFAULT_MAX_IDLE_TIMEOUT, DEFAULT_TRANSFER_PORT,
+    DEFAULT_TRANSFER_URL_PATH, SSH3_CLIENT_VERSION_STRING, Ssh3AgentSelection, Ssh3ClientConfig,
+    Ssh3ClientError, Ssh3DynamicForwardSpec, Ssh3KnownHostsTrust, Ssh3LocalForwardSpec,
+    Ssh3OidcConfig, Ssh3PtyPolicy, Ssh3ReverseForwardSpec, Ssh3SessionRequest,
+    Ssh3StrictHostKeyChecking, Ssh3TransferOptions, Ssh3TransferPlan, Ssh3TrustStrategy, SshConfig,
+    default_known_hosts_path, default_ssh_config_path, exit_code_for_exit_signal,
+    is_remote_transfer_spec, load_certificates, load_ssh_config, parse_duration,
+    parse_dynamic_forward_spec, parse_escape_char, parse_local_forward_spec,
+    parse_remote_transfer_spec, parse_reverse_forward_spec, resolve_strict_host_key_checking,
+    run_file_transfer, run_forwards_only, run_session_stdio,
 };
 
 #[derive(Debug, Parser)]
@@ -139,8 +141,53 @@ struct Cli {
     #[arg(long, conflicts_with = "ca_cert")]
     insecure: bool,
 
+    /// The URL of the server, or the first operand of a transfer.
+    ///
+    /// In the transfer mode the operand is either the remote side of the
+    /// transfer (the `user@host:remote_path` form) or the local one.
     #[arg(value_name = "URL", required_unless_present = "print_version")]
-    url: Option<Uri>,
+    url: Option<String>,
+
+    /// Move files between the local machine and the server over SFTP.
+    ///
+    /// The mode takes exactly two operands: one in the `user@host:remote_path`
+    /// form and one local path. The remote operand is the source of a
+    /// download and the destination of an upload.
+    #[arg(long)]
+    transfer: bool,
+
+    /// Transfer the directories recursively (transfer mode).
+    #[arg(short = 'r', long)]
+    recursive: bool,
+
+    /// Resume an interrupted transfer instead of overwriting it (transfer
+    /// mode).
+    ///
+    /// The destination is compared with the source by size and modification
+    /// time; a file whose size matches but whose modification time does not
+    /// is transferred again.
+    #[arg(long = "continue")]
+    resume: bool,
+
+    /// Verify the transfer with a SHA-256 re-read of the remote file (transfer
+    /// mode).
+    ///
+    /// The verification happens on its own for the files over 32 MiB.
+    #[arg(long)]
+    checksum: bool,
+
+    /// The port of the server (transfer mode).
+    ///
+    /// The port wins over the port of the operand of the transfer.
+    #[arg(short = 'p', long, value_name = "PORT")]
+    port: Option<u16>,
+
+    /// The URL path of the server (transfer mode).
+    ///
+    /// The path wins over the default one; the operand of the transfer wins
+    /// over the flag.
+    #[arg(short = 'U', long = "url-path", value_name = "PATH")]
+    url_path: Option<String>,
 
     /// Force the allocation of a pseudo-terminal.
     #[arg(short = 't', conflicts_with = "no_pty")]
@@ -493,16 +540,166 @@ fn ssh_config_values(
     Ok(values)
 }
 
-fn build_config(cli: Cli) -> Result<(Ssh3ClientConfig, Ssh3SessionRequest, bool), clap::Error> {
+/// The plan the command line describes.
+#[derive(Debug)]
+struct ClientPlan {
+    /// The configuration of the connection.
+    config: Ssh3ClientConfig,
+    /// The request of the session.
+    request: Ssh3SessionRequest,
+    /// The connection is held open for the forwards only.
+    no_session: bool,
+    /// The transfer the mode asks for; `None` for the other modes.
+    transfer: Option<Ssh3TransferPlan>,
+}
+
+/// Builds the plan of the command line.
+///
+/// The transfer mode owns the two operands of the command line, so it is
+/// resolved before the configuration of the connection is built.
+fn build_config(cli: Cli) -> Result<ClientPlan, clap::Error> {
+    if cli.transfer {
+        return build_transfer_config(cli);
+    }
+    let command = cli.command.clone();
+    let no_session = cli.no_session;
     let url = cli.url.clone().ok_or_else(|| {
         cli_error(
             ErrorKind::MissingRequiredArgument,
             "the following required arguments were not provided: <URL>",
         )
     })?;
+    let url = url.parse::<Uri>().map_err(|err| {
+        cli_error(
+            ErrorKind::ValueValidation,
+            format!("invalid URL {url:?}: {err}"),
+        )
+    })?;
+    let config = build_connection_config(cli, url, None)?;
+    let request = if command.is_empty() {
+        Ssh3SessionRequest::Shell
+    } else {
+        Ssh3SessionRequest::Exec(command.join(" "))
+    };
+    Ok(ClientPlan {
+        config,
+        request,
+        no_session,
+        transfer: None,
+    })
+}
+
+/// Builds the plan of the transfer mode.
+///
+/// The mode takes exactly two operands: one in the `user@host:remote_path`
+/// form and one local path. The remote operand is the source of a download
+/// and the destination of an upload.
+fn build_transfer_config(cli: Cli) -> Result<ClientPlan, clap::Error> {
+    if cli.no_session {
+        return Err(cli_error(
+            ErrorKind::ArgumentConflict,
+            "-N cannot be combined with --transfer",
+        ));
+    }
+    let first = cli.url.clone().ok_or_else(|| {
+        cli_error(
+            ErrorKind::MissingRequiredArgument,
+            "file transfer mode expects exactly two operands: one user@host:remote_path and one local path",
+        )
+    })?;
+    if cli.command.len() != 1 {
+        return Err(cli_error(
+            ErrorKind::WrongNumberOfValues,
+            "file transfer mode expects exactly two operands: one user@host:remote_path and one local path",
+        ));
+    }
+    let second = cli.command[0].clone();
+
+    // the remote operand decides the direction of the transfer
+    let (remote_operand, local_operand, upload) = if is_remote_transfer_spec(&first)
+        && !is_remote_transfer_spec(&second)
+    {
+        (first, second, false)
+    } else if is_remote_transfer_spec(&second) && !is_remote_transfer_spec(&first) {
+        (second, first, true)
+    } else {
+        return Err(cli_error(
+            ErrorKind::ValueValidation,
+            "file transfer mode expects exactly one remote operand in the user@host:remote_path form",
+        ));
+    };
+
+    let default_url_path = cli
+        .url_path
+        .clone()
+        .unwrap_or_else(|| DEFAULT_TRANSFER_URL_PATH.to_string());
+    let default_port = cli.port.unwrap_or(DEFAULT_TRANSFER_PORT);
+    let mut target = parse_remote_transfer_spec(&remote_operand, default_port, &default_url_path)
+        .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))?;
+    // the port of the command line wins over the port of the operand
+    if let Some(port) = cli.port {
+        target.port = port;
+    }
+    if target.url_path.is_empty() {
+        target.url_path = "/".to_string();
+    }
+
+    let options = Ssh3TransferOptions {
+        recursive: cli.recursive,
+        resume: cli.resume,
+        checksum: cli.checksum,
+    };
+    let transfer = Ssh3TransferPlan {
+        target: target.clone(),
+        local_path: PathBuf::from(&local_operand),
+        upload,
+        options,
+    };
+
+    // The URL of the connection carries the user of the operand in its
+    // query, the way the Go client does: the server of the reference
+    // implementation resolves the user of the session from the query.
+    let mut url = url::Url::parse(&format!(
+        "https://{}:{}{}",
+        target.hostname, target.port, target.url_path
+    ))
+    .map_err(|err| {
+        cli_error(
+            ErrorKind::ValueValidation,
+            format!("invalid transfer target {:?}: {err}", target.hostname),
+        )
+    })?;
+    url.query_pairs_mut().append_pair("user", &target.username);
+    let url = url.as_str().parse::<Uri>().map_err(|err| {
+        cli_error(
+            ErrorKind::ValueValidation,
+            format!("invalid URL {url:?}: {err}"),
+        )
+    })?;
+    // the user of the operand wins over the user of the command line
+    let config = build_connection_config(cli, url, Some(target.username))?;
+
+    Ok(ClientPlan {
+        config,
+        request: Ssh3SessionRequest::Shell,
+        no_session: false,
+        transfer: Some(transfer),
+    })
+}
+
+/// Builds the configuration of the connection.
+///
+/// The username of the caller wins over the one of the configuration only
+/// when the caller did not name one: the transfer mode carries the user of
+/// its operand.
+fn build_connection_config(
+    cli: Cli,
+    url: Uri,
+    username: Option<String>,
+) -> Result<Ssh3ClientConfig, clap::Error> {
     let mut config = Ssh3ClientConfig::new(url);
     config.server_name = cli.server_name;
-    config.username = cli.user;
+    config.username = username.or(cli.user);
     config.identity_file = cli.identity;
     config.agent = if cli.agent {
         Some(Ssh3AgentSelection::First)
@@ -700,12 +897,7 @@ fn build_config(cli: Cli) -> Result<(Ssh3ClientConfig, Ssh3SessionRequest, bool)
             "-N does not accept a remote command",
         ));
     }
-    let request = if cli.command.is_empty() {
-        Ssh3SessionRequest::Shell
-    } else {
-        Ssh3SessionRequest::Exec(cli.command.join(" "))
-    };
-    Ok((config, request, cli.no_session))
+    Ok(config)
 }
 
 #[tokio::main]
@@ -728,7 +920,7 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let (config, request, no_session) = match build_config(cli) {
+    let plan = match build_config(cli) {
         Ok(parsed) => parsed,
         Err(err) => {
             let status = match err.kind() {
@@ -740,8 +932,21 @@ async fn main() -> ExitCode {
         }
     };
 
-    if no_session {
-        return match run_forwards_only(&config).await {
+    // The transfer mode moves the files and opens no session.
+    if let Some(transfer) = plan.transfer {
+        return match run_file_transfer(&plan.config, &transfer).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("ssh3-rust-client: {err}");
+                // the Go implementation leaves the process with the code -1,
+                // which the shell sees as 255
+                ExitCode::from(255)
+            }
+        };
+    }
+
+    if plan.no_session {
+        return match run_forwards_only(&plan.config).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("ssh3-rust-client failed: {err}");
@@ -750,7 +955,7 @@ async fn main() -> ExitCode {
         };
     }
 
-    match run_session_stdio(&config, request).await {
+    match run_session_stdio(&plan.config, plan.request).await {
         Ok(status) => ExitCode::from(status as u8),
         Err(Ssh3ClientError::ExitSignal(signal)) => {
             let name = String::from_utf8_lossy(&signal.signal_name_without_sig).to_string();
@@ -780,7 +985,7 @@ mod tests {
         argv.extend_from_slice(arguments);
         argv.push("https://localhost:4433/ssh3-term");
         let cli = Cli::try_parse_from(argv).unwrap();
-        build_config(cli).unwrap().0
+        build_config(cli).unwrap().config
     }
 
     /// The three values the command line parsing produces.
@@ -789,8 +994,8 @@ mod tests {
         argv.extend_from_slice(arguments);
         argv.push("https://localhost:4433/ssh3-term");
         let cli = Cli::try_parse_from(argv).unwrap();
-        let (config, _, no_session) = build_config(cli).unwrap();
-        (config, no_session)
+        let plan = build_config(cli).unwrap();
+        (plan.config, plan.no_session)
     }
 
     /// The policy of the known_hosts check of a configuration.
@@ -1014,7 +1219,7 @@ mod tests {
             "https://localhost:4433/ssh3-term",
         ])
         .unwrap();
-        let (config, _, _) = build_config(cli).unwrap();
+        let config = build_config(cli).unwrap().config;
 
         assert_eq!(config.password.as_deref(), Some("secret-password"));
     }
@@ -1036,7 +1241,7 @@ mod tests {
             "https://localhost:4433/ssh3-term",
         ])
         .unwrap();
-        let (config, _, _) = build_config(cli).unwrap();
+        let config = build_config(cli).unwrap().config;
 
         assert_eq!(
             config
