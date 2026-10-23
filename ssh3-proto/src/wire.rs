@@ -57,6 +57,9 @@ pub enum Ssh3Error {
     InvalidForwardingProtocol(u64),
     /// The address family was neither `4` (IPv4) nor `6` (IPv6).
     InvalidAddressFamily(u64),
+    /// A compressed data frame did not decode: the payload is not a frame of
+    /// the algorithm the frame names, or it crosses the bomb limit.
+    Compression(String),
 }
 
 impl fmt::Display for Ssh3Error {
@@ -80,6 +83,7 @@ impl fmt::Display for Ssh3Error {
                 write!(f, "invalid forwarding protocol: {protocol}")
             }
             Self::InvalidAddressFamily(family) => write!(f, "invalid address family: {family}"),
+            Self::Compression(reason) => write!(f, "compressed data frame: {reason}"),
         }
     }
 }

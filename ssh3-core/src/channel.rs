@@ -875,6 +875,20 @@ async fn parse_message(recv: &mut dyn Ssh3ReceiveStream) -> Result<Ssh3Message, 
             data_type: SSH_EXTENDED_DATA_NONE,
             data: read_ssh_bytes(recv).await?,
         }),
+        ssh3_proto::SSH_MSG_CHANNEL_DATA_COMPRESSED => {
+            // the frame carries its algorithm, so the decode needs no
+            // negotiation of its own, exactly like the reference
+            // implementation (message.ParseCompressedDataMessage)
+            let algorithm = read_var_int(recv).await?;
+            let packed = read_ssh_bytes(recv).await?;
+            let data = crate::compress::decompress(algorithm, &packed).map_err(|err| {
+                Ssh3ChannelError::Proto(ssh3_proto::Ssh3Error::Compression(err.to_string()))
+            })?;
+            Ssh3Message::Data(Ssh3DataOrExtendedDataMessage {
+                data_type: SSH_EXTENDED_DATA_NONE,
+                data,
+            })
+        }
         ssh3_proto::SSH_MSG_CHANNEL_EXTENDED_DATA => {
             Ssh3Message::Data(Ssh3DataOrExtendedDataMessage {
                 data_type: read_var_int(recv).await?,
@@ -1326,6 +1340,63 @@ mod tests {
                 assert_eq!(reported, b"no-such-request")
             }
             other => panic!("expected the request type to be refused, got {other:?}"),
+        }
+    }
+
+    /// Builds the bytes of a compressed data frame: the message type, the
+    /// algorithm and the compressed payload as an SSH string.
+    fn compressed_data_frame_bytes(algorithm: u64, packed: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        append_var_int(&mut out, ssh3_proto::SSH_MSG_CHANNEL_DATA_COMPRESSED);
+        append_var_int(&mut out, algorithm);
+        ssh3_proto::append_ssh_bytes(&mut out, packed);
+        out
+    }
+
+    /// A compressed data frame decodes into its plain payload: the frame
+    /// carries its algorithm, so the parser needs no state of its own, the
+    /// way `ParseCompressedDataMessage` of the reference works.
+    #[tokio::test]
+    async fn a_compressed_data_frame_decodes_into_its_plain_payload() {
+        let payload = b"a compressed channel body ".repeat(64);
+        let packed = crate::compress::compress(crate::compress::ALGORITHM_DEFLATE, &payload)
+            .expect("the deflate codec refused the payload");
+        let bytes = compressed_data_frame_bytes(crate::compress::ALGORITHM_DEFLATE, &packed);
+        let (mut recv, _) = BytesReceiveStream::new(bytes);
+        let message = parse_message(&mut recv).await.unwrap();
+        match message {
+            Ssh3Message::Data(data) => {
+                assert_eq!(data.data_type, ssh3_proto::SSH_EXTENDED_DATA_NONE);
+                assert_eq!(data.data, payload);
+            }
+            other => panic!("expected a data message, got {other:?}"),
+        }
+    }
+
+    /// A frame whose payload does not decode is a protocol error: the
+    /// channel dies, the way the reference implementation drops the channel
+    /// of a frame that does not parse.
+    #[tokio::test]
+    async fn a_compressed_data_frame_that_does_not_decode_is_a_protocol_error() {
+        let bytes = compressed_data_frame_bytes(
+            crate::compress::ALGORITHM_DEFLATE,
+            b"not a deflate stream",
+        );
+        let (mut recv, _) = BytesReceiveStream::new(bytes);
+        match parse_message(&mut recv).await {
+            Err(Ssh3ChannelError::Proto(ssh3_proto::Ssh3Error::Compression(_))) => {}
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    /// An algorithm no implementation knows is refused the same way.
+    #[tokio::test]
+    async fn a_compressed_data_frame_of_an_unknown_algorithm_is_refused() {
+        let bytes = compressed_data_frame_bytes(42, b"whatever");
+        let (mut recv, _) = BytesReceiveStream::new(bytes);
+        match parse_message(&mut recv).await {
+            Err(Ssh3ChannelError::Proto(ssh3_proto::Ssh3Error::Compression(_))) => {}
+            other => panic!("expected a protocol error, got {other:?}"),
         }
     }
 
