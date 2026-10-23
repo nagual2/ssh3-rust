@@ -536,6 +536,11 @@ async fn the_checksum_of_a_file_that_differs_is_reported() {
     assert_eq!(error.failure(), Ssh3TransferFailure::Checksum);
 }
 
+// The mtime of a remote file carries the granularity of the server
+// filesystem: the timestamp written through SETSTAT is read back rounded on
+// some of them (the Windows one included), so the exact-second comparison of
+// this test is only meaningful on the unix-like servers.
+#[cfg(unix)]
 #[tokio::test]
 async fn the_upload_stamps_the_remote_file_with_the_mtime_of_the_source() {
     let harness = TransferHarness::start().await;
