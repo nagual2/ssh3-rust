@@ -46,6 +46,8 @@ use url::Url;
 mod agent;
 mod cm;
 mod console;
+#[cfg(unix)]
+mod control;
 mod duration;
 mod dynamic;
 mod escape;
@@ -308,12 +310,12 @@ pub struct Ssh3CapturedSession {
 
 /// The parameters of the pseudo-terminal the client requests.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PtySpec {
-    term: Vec<u8>,
-    char_width: u16,
-    char_height: u16,
-    pixel_width: u16,
-    pixel_height: u16,
+pub(crate) struct PtySpec {
+    pub(crate) term: Vec<u8>,
+    pub(crate) char_width: u16,
+    pub(crate) char_height: u16,
+    pub(crate) pixel_width: u16,
+    pub(crate) pixel_height: u16,
 }
 
 impl PtySpec {
@@ -717,8 +719,8 @@ pub fn exit_code_for_exit_signal(signal_name: &str) -> i32 {
 
 struct ActiveClient {
     endpoint: Endpoint,
-    connection: Connection,
-    conversation: Arc<Ssh3Conversation>,
+    pub(crate) connection: Connection,
+    pub(crate) conversation: Arc<Ssh3Conversation>,
     _control_stream: Ssh3ClientControlStream,
     _send_request: Ssh3SendRequest,
     driver_task: tokio::task::JoinHandle<()>,
@@ -735,9 +737,9 @@ struct ActiveClient {
     /// They stay open for the whole session: the lifetime of a forward is the
     /// lifetime of its control channel.
     forward_control_channels: std::sync::Mutex<Vec<Arc<Ssh3Channel>>>,
-    server_header: Option<String>,
-    max_packet_size: u64,
-    default_datagrams_queue_size: usize,
+    pub(crate) server_header: Option<String>,
+    pub(crate) max_packet_size: u64,
+    pub(crate) default_datagrams_queue_size: usize,
 }
 
 impl ActiveClient {
@@ -750,7 +752,7 @@ impl ActiveClient {
         self.endpoint.wait_idle().await;
     }
 
-    async fn open_session_channel(&self) -> Result<Arc<Ssh3Channel>, Ssh3ClientError> {
+    pub(crate) async fn open_session_channel(&self) -> Result<Arc<Ssh3Channel>, Ssh3ClientError> {
         open_channel(
             self.conversation.as_ref(),
             &self.connection,
@@ -798,7 +800,7 @@ pub fn load_certificates(
     }
 }
 
-async fn send_initial_session_requests(
+pub(crate) async fn send_initial_session_requests(
     channel: &Ssh3Channel,
     request: &Ssh3SessionRequest,
     pty: Option<&PtySpec>,
@@ -1611,7 +1613,9 @@ async fn wait_for_termination(connection: &Connection) {
     }
 }
 
-async fn connect_client(config: &Ssh3ClientConfig) -> Result<ActiveClient, Ssh3ClientError> {
+pub(crate) async fn connect_client(
+    config: &Ssh3ClientConfig,
+) -> Result<ActiveClient, Ssh3ClientError> {
     connect_client_with_browser_opener(config, default_browser_opener).await
 }
 
