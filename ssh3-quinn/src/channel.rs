@@ -53,12 +53,14 @@ impl Ssh3IncomingChannel {
     ) -> Ssh3AcceptedChannel {
         // Without a conversation the value this endpoint announces is
         // unknown: the value of the peer is only bounded by the protocol
-        // limit.
+        // limit. The compression stays off for the same reason: the
+        // capability of the peer is not known without its conversation.
         let max_packet_size =
             clamp_peer_max_packet_size(self.header.max_packet_size, MAX_MAX_PACKET_SIZE);
         self.build(
             max_packet_size,
             conversation_id,
+            ssh3_core::ALGORITHM_NONE,
             recv,
             send,
             datagram_sender,
@@ -81,6 +83,7 @@ impl Ssh3IncomingChannel {
         self.build(
             max_packet_size,
             conversation.conversation_id(),
+            conversation.compression_algorithm(),
             recv,
             send,
             datagram_sender,
@@ -95,6 +98,7 @@ impl Ssh3IncomingChannel {
         &self,
         max_packet_size: u64,
         conversation_id: Ssh3ConversationId,
+        compression_algorithm: u64,
         recv: quinn::RecvStream,
         send: quinn::SendStream,
         datagram_sender: Option<Arc<Ssh3ConversationDatagramSender>>,
@@ -123,6 +127,7 @@ impl Ssh3IncomingChannel {
             datagrams_queue_size,
             None,
         ));
+        channel.set_compression_algorithm(compression_algorithm);
 
         match (channel_type.as_slice(), forwarding_target) {
             (b"direct-udp", Some(remote_addr)) | (b"forwarded-udp", Some(remote_addr)) => {

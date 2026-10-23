@@ -34,7 +34,7 @@ pub use channel::{
 };
 pub use compress::{
     ALGORITHM_DEFLATE, ALGORITHM_LZ4, ALGORITHM_NONE, ALGORITHM_ZSTD, CompressError,
-    parse_version_capability,
+    negotiate_with_version_string, parse_version_capability,
 };
 pub use conversation::{
     Ssh3Conversation, Ssh3ConversationDatagramSender, Ssh3ConversationError, Ssh3ConversationId,
