@@ -20,10 +20,19 @@ categories = ["network-programming", "command-line-utilities"]
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Exposes the payload generator behind `pseudo_random_bytes` to the other
+# crates: the same bytes feed the golden vectors of every implementation.
+test-util = []
+
 [dependencies]
 async-trait = "0.1.89"
+flate2 = "1.1.4"
+lz4_flex = "0.11.5"
 ssh3-proto = { path = "../ssh3-proto" }
 tokio = { version = "1.48.0", features = ["io-util", "macros", "rt", "sync"] }
+zstd = "0.13.3"
+zstd-safe = "7.2.4"
 
 [dev-dependencies]
 tokio = { version = "1.48.0", features = ["macros", "rt", "time"] }
