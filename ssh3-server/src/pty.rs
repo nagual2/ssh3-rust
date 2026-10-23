@@ -5,22 +5,77 @@
 //! gets the slave side as its controlling terminal (`setsid(2)` plus
 //! `TIOCSCTTY`), and the server keeps the master side to feed input into the
 //! process and to read its output.
+//!
+//! A pseudo-terminal is a unix concept: the other platforms have none. There
+//! the request is only remembered, so that the session that asks for one can
+//! be refused with a clear error.
 
 use ssh3_proto::{Ssh3PtyRequest, Ssh3WindowChangeRequest};
 
+/// The PTY request that was received before the session started.
+///
+/// Unix keeps the terminal type and the initial size of the pseudo-terminal.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub(crate) struct PendingPty {
+    /// Value of the `TERM` environment variable requested by the client.
+    term: Option<String>,
+    /// Initial terminal size.
+    size: SessionPtySize,
+}
+
+#[cfg(unix)]
+impl PendingPty {
+    /// Builds the pending state from a `pty-req` channel request.
+    pub(crate) fn new(request: &Ssh3PtyRequest) -> Self {
+        Self {
+            term: crate::session::ssh_bytes_to_string(&request.term),
+            size: SessionPtySize::from_pty_request(request),
+        }
+    }
+
+    /// Applies a new terminal size to the pending state.
+    pub(crate) fn resize(&mut self, request: &Ssh3WindowChangeRequest) {
+        self.size = SessionPtySize::from_window_change(request);
+    }
+}
+
+/// The PTY request that was received before the session started.
+///
+/// The other platforms have no pseudo-terminal: the request is only
+/// remembered, so that the session that asks for one can be refused.
+#[cfg(not(unix))]
+#[derive(Clone, Debug)]
+pub(crate) struct PendingPty;
+
+#[cfg(not(unix))]
+impl PendingPty {
+    /// Builds the pending state from a `pty-req` channel request.
+    pub(crate) fn new(_request: &Ssh3PtyRequest) -> Self {
+        Self
+    }
+
+    /// Applies a new terminal size to the pending state.
+    ///
+    /// There is no pseudo-terminal to resize.
+    pub(crate) fn resize(&mut self, _request: &Ssh3WindowChangeRequest) {}
+}
+
 /// The size of a pseudo-terminal, in characters and pixels.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SessionPtySize {
     /// Width in characters.
-    pub(crate) char_width: u16,
+    char_width: u16,
     /// Height in characters.
-    pub(crate) char_height: u16,
+    char_height: u16,
     /// Width in pixels.
-    pub(crate) pixel_width: u16,
+    pixel_width: u16,
     /// Height in pixels.
-    pub(crate) pixel_height: u16,
+    pixel_height: u16,
 }
 
+#[cfg(unix)]
 impl SessionPtySize {
     /// Builds a size from a `pty-req` channel request.
     pub(crate) fn from_pty_request(request: &Ssh3PtyRequest) -> Self {
@@ -43,8 +98,7 @@ impl SessionPtySize {
     }
 
     /// Converts the size into the `winsize` structure used by the kernel.
-    #[cfg(unix)]
-    pub(crate) fn to_winsize(self) -> nix::pty::Winsize {
+    fn to_winsize(self) -> nix::pty::Winsize {
         nix::pty::Winsize {
             ws_row: self.char_height,
             ws_col: self.char_width,
@@ -55,7 +109,8 @@ impl SessionPtySize {
 }
 
 /// Clamps a wire value to the 16 bit range used by terminal sizes.
-pub(crate) fn clamp_u64_to_u16(value: u64) -> u16 {
+#[cfg(unix)]
+fn clamp_u64_to_u16(value: u64) -> u16 {
     value.min(u16::MAX as u64) as u16
 }
 
@@ -82,11 +137,11 @@ mod unix {
     use crate::config::Ssh3ServerConfig;
     use crate::error::Ssh3ServerError;
     use crate::session::{
-        PendingPty, RunningSession, SessionCommand, SessionInput, SessionUser, configure_process,
+        RunningSession, SessionCommand, SessionInput, SessionUser, configure_process,
         effective_shell, pump_process_output,
     };
 
-    use super::SessionPtySize;
+    use super::{PendingPty, SessionPtySize};
 
     /// The master side of a pseudo-terminal, used to resize it while it runs.
     pub(crate) struct PtyController {
@@ -190,7 +245,11 @@ mod unix {
                 if nix::libc::setsid() == -1 {
                     return Err(io::Error::last_os_error());
                 }
-                if nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY, 0) == -1 {
+                // The type of the request of the ioctl differs between the
+                // platforms: the constant of the BSD platforms is a `c_uint`,
+                // while the ioctl of the kernel takes a `c_ulong`. The cast
+                // lets the compiler pick the type the platform expects.
+                if nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY as _, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
@@ -225,9 +284,9 @@ mod unix {
                     request: Ssh3ChannelRequest::ExitStatus(Ssh3ExitStatusRequest { exit_status }),
                 })
                 .await;
-            // The exit status must reach the peer before the channel is
-            // closed; see the same note in `session.rs`. The pause gives
-            // the QUIC stream the moment it needs to flush the status.
+            // The exit status must reach the peer before the channel is closed;
+            // see the same note in `session.rs`. The pause gives the QUIC
+            // stream the moment it needs to flush the status.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let _ = channel.close().await;
         });

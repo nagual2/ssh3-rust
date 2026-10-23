@@ -72,6 +72,14 @@ pub(crate) async fn spawn_chroot_child(
         // lexical jail, exactly like the Go implementation does
         return Ok(ChildOutcome::FallbackToInProcess);
     }
+    // The jail drops the privileges of the user it serves, and with them the
+    // supplementary groups. A platform that cannot narrow the groups cannot
+    // build the jail: the channel is refused here, with the error, instead of
+    // starting a child that would serve the files with the groups of the
+    // server. The check is unix-only: the other platforms have no chroot, so
+    // the jail is never built there.
+    #[cfg(unix)]
+    supplementary_groups::check().map_err(Ssh3ServerError::Io)?;
 
     let executable = std::env::current_exe()?;
     let mut command = Command::new(executable);
@@ -162,6 +170,61 @@ fn chroot_is_available() -> bool {
     false
 }
 
+/// The narrowing of the supplementary groups of the process.
+///
+/// The jail drops the privileges of the user it serves, and with them the
+/// supplementary groups: a child that kept the groups of the server would
+/// read the files of those groups.
+///
+/// The Apple platforms have no `setgroups(2)`: the groups of a process are
+/// managed there by the directory service, and no call of the process
+/// narrows them. The jail of the sshd model needs them narrowed, so it is
+/// refused there instead of running the child with the groups of the server.
+#[cfg(all(
+    unix,
+    any(target_vendor = "apple", target_os = "redox", target_os = "haiku")
+))]
+mod supplementary_groups {
+    /// The error of a platform that cannot narrow the supplementary groups.
+    fn unsupported() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "supplementary groups cannot be dropped on this platform",
+        )
+    }
+
+    /// Narrows the supplementary groups of the process to none.
+    pub(super) fn narrow() -> std::io::Result<()> {
+        Err(unsupported())
+    }
+
+    /// Checks that the jail can narrow the supplementary groups of the child.
+    pub(super) fn check() -> std::io::Result<()> {
+        Err(unsupported())
+    }
+}
+
+/// The narrowing of the supplementary groups of the process.
+///
+/// The jail drops the privileges of the user it serves, and with them the
+/// supplementary groups: a child that kept the groups of the server would
+/// read the files of those groups.
+#[cfg(all(
+    unix,
+    not(any(target_vendor = "apple", target_os = "redox", target_os = "haiku"))
+))]
+mod supplementary_groups {
+    /// Narrows the supplementary groups of the process to none.
+    pub(super) fn narrow() -> std::io::Result<()> {
+        nix::unistd::setgroups(&[]).map_err(std::io::Error::from)
+    }
+
+    /// Checks that the jail can narrow the supplementary groups of the child.
+    pub(super) fn check() -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Serves the SFTP protocol over the standard streams of the process.
 ///
 /// This is the entry point of the internal child: the chroot jail is applied
@@ -202,7 +265,7 @@ pub async fn run_internal_sftp_server(options: InternalSftpOptions) -> io::Resul
 fn apply_chroot_and_drop(directory: &Path, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    use nix::unistd::{Gid, Uid, chdir, chroot, setgid, setgroups, setuid};
+    use nix::unistd::{Gid, Uid, chdir, chroot, setgid, setuid};
 
     if !nix::unistd::Uid::effective().is_root() {
         // fail closed: the caller asked for the chroot jail, serving the
@@ -213,6 +276,9 @@ fn apply_chroot_and_drop(directory: &Path, uid: Option<u32>, gid: Option<u32>) -
             "the chroot jail of the sftp subsystem requires root",
         ));
     }
+    // fail closed: the child must not keep the groups of the server, and a
+    // platform that cannot narrow them cannot run the jail
+    supplementary_groups::check()?;
     let metadata = std::fs::metadata(directory)?;
     if !metadata.is_dir() {
         return Err(io::Error::new(
@@ -237,7 +303,7 @@ fn apply_chroot_and_drop(directory: &Path, uid: Option<u32>, gid: Option<u32>) -
     if let (Some(uid), Some(gid)) = (uid, gid)
         && (uid != 0 || gid != 0)
     {
-        setgroups(&[]).map_err(io::Error::from)?;
+        supplementary_groups::narrow()?;
         setgid(Gid::from_raw(gid)).map_err(io::Error::from)?;
         setuid(Uid::from_raw(uid)).map_err(io::Error::from)?;
     }

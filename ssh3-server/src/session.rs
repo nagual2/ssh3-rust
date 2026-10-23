@@ -16,6 +16,7 @@ use nix::sys::signal;
 use nix::unistd::{Gid, Pid, Uid, User};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
@@ -27,15 +28,19 @@ use ssh3_core::Ssh3Channel;
 use ssh3_proto::{
     SSH_EXTENDED_DATA_NONE, SSH_EXTENDED_DATA_STDERR, Ssh3ChannelRequest,
     Ssh3ChannelRequestMessage, Ssh3ExitStatusRequest, Ssh3Message, Ssh3SignalRequest,
+    Ssh3WindowChangeRequest,
 };
+#[cfg(unix)]
 use ssh3_quinn::open_channel;
 
 use crate::auth::{RequestAuthorization, requested_username};
 use crate::config::Ssh3ServerConfig;
-use crate::error::{Ssh3ServerError, is_benign_server_error};
-use crate::pty::SessionPtySize;
+use crate::error::Ssh3ServerError;
 #[cfg(unix)]
-use crate::pty::{PtyController, spawn_pty_session_process};
+use crate::error::is_benign_server_error;
+use crate::pty::PendingPty;
+#[cfg(unix)]
+use crate::pty::{PtyController, SessionPtySize, spawn_pty_session_process};
 
 /// The operating-system account a session is executed as.
 #[derive(Clone, Debug)]
@@ -176,27 +181,34 @@ pub(crate) fn configure_process(
         process.current_dir(&session_user.home_dir);
     }
 
-    #[cfg(unix)]
-    {
-        if session_user.uid != Uid::current().as_raw()
-            || session_user.gid != Gid::current().as_raw()
-        {
-            process.uid(session_user.uid);
-            process.gid(session_user.gid);
-        }
-        if matches!(command, SessionCommand::Shell) {
-            process.arg0(login_shell_arg0(&shell));
-        }
+    apply_session_identity(process, session_user, command, &shell);
+}
+
+/// Applies the user id and the login shell name of the session user.
+#[cfg(unix)]
+fn apply_session_identity(
+    process: &mut Command,
+    session_user: &SessionUser,
+    command: &SessionCommand,
+    shell: &Path,
+) {
+    if session_user.uid != Uid::current().as_raw() || session_user.gid != Gid::current().as_raw() {
+        process.uid(session_user.uid);
+        process.gid(session_user.gid);
+    }
+    if matches!(command, SessionCommand::Shell) {
+        process.arg0(login_shell_arg0(shell));
     }
 }
 
-/// The PTY request that was received before the session started.
-#[derive(Clone, Debug)]
-pub(crate) struct PendingPty {
-    /// Value of the `TERM` environment variable requested by the client.
-    pub(crate) term: Option<String>,
-    /// Initial terminal size.
-    pub(crate) size: SessionPtySize,
+/// The other platforms have neither a user id nor a login shell name.
+#[cfg(not(unix))]
+fn apply_session_identity(
+    _process: &mut Command,
+    _session_user: &SessionUser,
+    _command: &SessionCommand,
+    _shell: &Path,
+) {
 }
 
 /// State of a forwarded SSH agent socket (Unix only).
@@ -268,6 +280,7 @@ pub(crate) enum SessionInput {
     /// Standard input of a process without a pseudo-terminal.
     Pipe(ChildStdin),
     /// Master side of a pseudo-terminal.
+    #[cfg(unix)]
     Pty(TokioFile),
 }
 
@@ -278,6 +291,7 @@ impl SessionInput {
                 stdin.write_all(data).await?;
                 stdin.flush().await?;
             }
+            #[cfg(unix)]
             Self::Pty(pty) => {
                 pty.write_all(data).await?;
                 pty.flush().await?;
@@ -292,6 +306,7 @@ pub(crate) struct RunningSession {
     /// Where the input of the client is written to.
     pub(crate) input: SessionInput,
     /// Process id of the child, used to deliver signals.
+    #[cfg(unix)]
     pub(crate) child_id: Option<u32>,
     /// Pseudo-terminal of the session, if one was requested.
     #[cfg(unix)]
@@ -303,13 +318,15 @@ impl RunningSession {
         self.input.write_all(data).await
     }
 
-    fn apply_window_change(&self, size: SessionPtySize) -> Result<(), Ssh3ServerError> {
-        #[cfg(unix)]
-        {
-            if let Some(pty) = &self.pty {
-                pty.resize(size)?;
-                return Ok(());
-            }
+    /// Applies a new terminal size to the pseudo-terminal of the session.
+    #[cfg(unix)]
+    fn apply_window_change(
+        &self,
+        request: &Ssh3WindowChangeRequest,
+    ) -> Result<(), Ssh3ServerError> {
+        if let Some(pty) = &self.pty {
+            pty.resize(SessionPtySize::from_window_change(request))?;
+            return Ok(());
         }
         Err(Ssh3ServerError::Io(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -317,17 +334,23 @@ impl RunningSession {
         )))
     }
 
-    fn send_signal(&self, request: &Ssh3SignalRequest) -> Result<(), Ssh3ServerError> {
-        #[cfg(not(unix))]
-        {
-            let _ = request;
-            return Err(Ssh3ServerError::Io(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "signal forwarding is not supported on this platform",
-            )));
-        }
+    /// Applies a new terminal size to the pseudo-terminal of the session.
+    ///
+    /// The other platforms have no pseudo-terminal, so the request is refused.
+    #[cfg(not(unix))]
+    fn apply_window_change(
+        &self,
+        _request: &Ssh3WindowChangeRequest,
+    ) -> Result<(), Ssh3ServerError> {
+        Err(Ssh3ServerError::Io(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "window-change requires a PTY-backed session",
+        )))
+    }
 
-        #[cfg(unix)]
+    /// Delivers a signal to the process of the session.
+    #[cfg(unix)]
+    fn send_signal(&self, request: &Ssh3SignalRequest) -> Result<(), Ssh3ServerError> {
         let signal = crate::pty::parse_signal_request(request).ok_or_else(|| {
             Ssh3ServerError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -343,18 +366,20 @@ impl RunningSession {
             )));
         };
 
-        #[cfg(unix)]
-        {
-            let pid = child_id as i32;
-            if self.pty.is_some() {
-                signal::kill(Pid::from_raw(-pid), signal).map_err(io::Error::from)?;
-            } else {
-                signal::kill(Pid::from_raw(pid), signal).map_err(io::Error::from)?;
-            }
-            return Ok(());
+        let pid = child_id as i32;
+        if self.pty.is_some() {
+            signal::kill(Pid::from_raw(-pid), signal).map_err(io::Error::from)?;
+        } else {
+            signal::kill(Pid::from_raw(pid), signal).map_err(io::Error::from)?;
         }
+        Ok(())
+    }
 
-        #[allow(unreachable_code)]
+    /// Delivers a signal to the process of the session.
+    ///
+    /// The other platforms have no unix signals, so the request is refused.
+    #[cfg(not(unix))]
+    fn send_signal(&self, _request: &Ssh3SignalRequest) -> Result<(), Ssh3ServerError> {
         Err(Ssh3ServerError::Io(io::Error::new(
             io::ErrorKind::Unsupported,
             "signal forwarding is not supported on this platform",
@@ -425,10 +450,7 @@ pub(crate) async fn handle_session_channel(
                         )
                         .await?;
                     } else {
-                        pending_pty = Some(PendingPty {
-                            term: ssh_bytes_to_string(&pty.term),
-                            size: SessionPtySize::from_pty_request(&pty),
-                        });
+                        pending_pty = Some(PendingPty::new(&pty));
                     }
                 }
                 Ssh3ChannelRequest::Shell => {
@@ -440,16 +462,7 @@ pub(crate) async fn handle_session_channel(
                                 &config,
                                 &session_user,
                                 pending_pty.clone(),
-                                {
-                                    #[cfg(unix)]
-                                    {
-                                        agent_socket_path.as_deref()
-                                    }
-                                    #[cfg(not(unix))]
-                                    {
-                                        None
-                                    }
-                                },
+                                agent_socket_path.as_deref(),
                                 SessionCommand::Shell,
                             )
                             .await?,
@@ -467,16 +480,7 @@ pub(crate) async fn handle_session_channel(
                                 &config,
                                 &session_user,
                                 pending_pty.clone(),
-                                {
-                                    #[cfg(unix)]
-                                    {
-                                        agent_socket_path.as_deref()
-                                    }
-                                    #[cfg(not(unix))]
-                                    {
-                                        None
-                                    }
-                                },
+                                agent_socket_path.as_deref(),
                                 SessionCommand::Exec(
                                     ssh_bytes_to_string(&exec.command).unwrap_or_default(),
                                 ),
@@ -501,13 +505,12 @@ pub(crate) async fn handle_session_channel(
                     }
                 }
                 Ssh3ChannelRequest::WindowChange(window_change) => {
-                    let size = SessionPtySize::from_window_change(&window_change);
                     if let Some(session) = session.as_mut() {
-                        if let Err(err) = session.apply_window_change(size) {
+                        if let Err(err) = session.apply_window_change(&window_change) {
                             write_stderr(channel.as_ref(), format!("{err}\n").as_bytes()).await?;
                         }
                     } else if let Some(pending_pty) = pending_pty.as_mut() {
-                        pending_pty.size = size;
+                        pending_pty.resize(&window_change);
                     } else {
                         write_stderr(
                             channel.as_ref(),
@@ -532,28 +535,15 @@ pub(crate) async fn handle_session_channel(
                 if let Some(session) = session.as_mut() {
                     session.write_input(&message.data).await?;
                 } else if message.data == b"forward-agent" {
-                    #[cfg(unix)]
-                    {
-                        if agent_forwarding.socket_path().is_none() {
-                            let forwarding = open_agent_socket_and_forward_agent(
-                                conversation.clone(),
-                                connection.clone(),
-                                &config,
-                                &session_user,
-                            )
-                            .await?;
-                            agent_forwarding.store(forwarding);
-                        }
-                    }
-
-                    #[cfg(not(unix))]
-                    {
-                        write_stderr(
-                            channel.as_ref(),
-                            b"agent forwarding is not supported on this platform\n",
-                        )
-                        .await?;
-                    }
+                    forward_agent(
+                        channel.as_ref(),
+                        &conversation,
+                        &connection,
+                        &config,
+                        &session_user,
+                        &agent_forwarding,
+                    )
+                    .await?;
                 } else {
                     write_stderr(
                         channel.as_ref(),
@@ -627,6 +617,7 @@ async fn spawn_pipe_session_process(
         .kill_on_drop(true);
 
     let mut child = process.spawn()?;
+    #[cfg(unix)]
     let child_id = child.id();
     let stdin = child.stdin.take().ok_or_else(|| {
         Ssh3ServerError::Io(io::Error::other("spawned process did not expose stdin"))
@@ -674,6 +665,7 @@ async fn spawn_pipe_session_process(
 
     Ok(RunningSession {
         input: SessionInput::Pipe(stdin),
+        #[cfg(unix)]
         child_id,
         #[cfg(unix)]
         pty: None,
@@ -798,6 +790,49 @@ async fn handle_agent_socket_conn(
             result.map_err(|err| Ssh3ServerError::Io(io::Error::other(err.to_string())))?
         }
     }
+}
+
+/// Opens the forwarded agent socket of a session, if it is not open yet.
+#[cfg(unix)]
+async fn forward_agent(
+    _channel: &Ssh3Channel,
+    conversation: &Arc<ssh3_core::Ssh3Conversation>,
+    connection: &Connection,
+    config: &Ssh3ServerConfig,
+    session_user: &SessionUser,
+    agent_forwarding: &AgentForwardingSlot,
+) -> Result<(), Ssh3ServerError> {
+    if agent_forwarding.socket_path().is_none() {
+        let forwarding = open_agent_socket_and_forward_agent(
+            conversation.clone(),
+            connection.clone(),
+            config,
+            session_user,
+        )
+        .await?;
+        agent_forwarding.store(forwarding);
+    }
+    Ok(())
+}
+
+/// Opens the forwarded agent socket of a session, if it is not open yet.
+///
+/// The agent socket is a unix concept: the other platforms have none, so the
+/// request is refused with a clear error.
+#[cfg(not(unix))]
+async fn forward_agent(
+    channel: &Ssh3Channel,
+    _conversation: &Arc<ssh3_core::Ssh3Conversation>,
+    _connection: &Connection,
+    _config: &Ssh3ServerConfig,
+    _session_user: &SessionUser,
+    _agent_forwarding: &AgentForwardingSlot,
+) -> Result<(), Ssh3ServerError> {
+    write_stderr(
+        channel,
+        b"agent forwarding is not supported on this platform\n",
+    )
+    .await
 }
 
 /// Starts listening for local connections that shall be forwarded to the agent.
