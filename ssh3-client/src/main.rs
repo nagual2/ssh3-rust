@@ -209,6 +209,16 @@ struct Cli {
     #[arg(short = 'N')]
     no_session: bool,
 
+    /// Connect through the jump hosts of the chain, every destination in the
+    /// `[user@]host[:port]` form separated by commas (-J). Each hop must run
+    /// an SSH3 server.
+    #[arg(short = 'J', long = "jump", value_name = "DESTINATION")]
+    jump: Option<String>,
+
+    /// The deprecated alias of `-J`.
+    #[arg(long = "proxy-jump", value_name = "DESTINATION")]
+    proxy_jump: Option<String>,
+
     /// Print the version string of the client and exit.
     ///
     /// The string has the format of the Go implementation: the name of the
@@ -838,7 +848,20 @@ fn build_connection_config(
     }
     // The proxy jump chain comes from the `-o` option first and from the
     // keyword of the ssh_config file next.
-    config.proxy_jump = overrides.proxy_jump.or(ssh_config_values.proxy_jump);
+    // The proxy jump chain comes from the `-J` flag first, from its
+    // deprecated `-proxy-jump` alias next, from the `-o` option after that
+    // and from the keyword of the ssh_config file last.
+    let jump_flag = cli
+        .jump
+        .as_deref()
+        .or(cli.proxy_jump.as_deref())
+        .map(str::to_string);
+    if let Some(chain) = jump_flag {
+        validate_proxy_jump(&chain).map_err(|err| cli_error(ErrorKind::ValueValidation, err))?;
+        config.proxy_jump = Some(chain);
+    } else {
+        config.proxy_jump = overrides.proxy_jump.or(ssh_config_values.proxy_jump);
+    }
 
     // The forwards follow the same precedence as the other options: the
     // command line wins over the `-o` options.
