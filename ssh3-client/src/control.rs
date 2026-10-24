@@ -155,6 +155,37 @@ pub fn default_control_path(user: &str, host: &str, port: u16) -> PathBuf {
         .join(format!("cm-{user}@{host}:{port}"))
 }
 
+/// Opens the authenticated connection a master serves, the entry point of
+/// the daemon mode of the CLI.
+pub async fn connect_shared(
+    config: &crate::Ssh3ClientConfig,
+) -> Result<Arc<ActiveClient>, ControlMasterError> {
+    crate::connect_client(config)
+        .await
+        .map(Arc::new)
+        .map_err(|err| ControlMasterError::Protocol(err.to_string()))
+}
+
+/// Builds the pty request of a slave session from the local console: a
+/// console without a size falls back to 80x24, the way the reference slave
+/// fills its `PtySpec`. `None` when the standard input is not a terminal.
+pub fn local_console_pty(term_type: Option<&str>) -> Option<cm::PtySpec> {
+    let terminal = crate::detect_local_terminal().ok().flatten()?;
+    let size = terminal.info.size;
+    let term = term_type
+        .map(str::to_string)
+        .or_else(|| terminal.info.term.clone())
+        .or_else(|| std::env::var("TERM").ok().filter(|term| !term.is_empty()))
+        .unwrap_or_else(|| "xterm".to_string());
+    Some(cm::PtySpec {
+        term,
+        columns: u32::from(size.char_width).max(80),
+        rows: u32::from(size.char_height).max(24),
+        pixel_width: u32::from(size.pixel_width),
+        pixel_height: u32::from(size.pixel_height),
+    })
+}
+
 /// Reports whether anything listens on the control socket.
 ///
 /// A successful dial (even before the master accepts it) proves a live
@@ -842,7 +873,7 @@ async fn run_master_bridge(
 pub async fn run_slave_session<R, W1, W2>(
     control_path: &Path,
     command: Vec<String>,
-    pty: Option<OpenSessionPty>,
+    pty: Option<cm::PtySpec>,
     forward_agent: bool,
     mut stdin: R,
     mut stdout: W1,
@@ -860,13 +891,7 @@ where
     let request = OpenSession {
         command,
         env: Vec::new(),
-        pty: pty.map(|pty| cm::PtySpec {
-            term: pty.term,
-            columns: pty.columns,
-            rows: pty.rows,
-            pixel_width: pty.pixel_width,
-            pixel_height: pty.pixel_height,
-        }),
+        pty,
         forward_agent,
     };
     let reply = call(&mut control, MsgType::OPEN_SESSION, &request.encode()).await?;
@@ -967,24 +992,6 @@ where
         }
     }
     Ok(i32::try_from(code).unwrap_or(255))
-}
-
-/// The pty parameters a slave carries in its session request.
-///
-/// The local console of the slave fills it; the master translates it into
-/// the pty request of the session channel.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct OpenSessionPty {
-    /// The terminal type of the slave environment.
-    pub term: String,
-    /// The console geometry in character cells.
-    pub columns: u32,
-    /// The console geometry in character cells.
-    pub rows: u32,
-    /// The console geometry in pixels.
-    pub pixel_width: u32,
-    /// The console geometry in pixels.
-    pub pixel_height: u32,
 }
 
 /// Attaches one dedicated stream connection to a bridged session, the way

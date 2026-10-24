@@ -47,7 +47,7 @@ mod agent;
 mod cm;
 mod console;
 #[cfg(unix)]
-mod control;
+pub mod control;
 mod duration;
 mod dynamic;
 mod escape;
@@ -717,7 +717,7 @@ pub fn exit_code_for_exit_signal(signal_name: &str) -> i32 {
     }
 }
 
-struct ActiveClient {
+pub struct ActiveClient {
     endpoint: Endpoint,
     pub(crate) connection: Connection,
     pub(crate) conversation: Arc<Ssh3Conversation>,
