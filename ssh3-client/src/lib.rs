@@ -56,6 +56,7 @@ mod known_hosts;
 mod reverse;
 mod sftp_stream;
 mod ssh_config;
+pub mod sshfp;
 mod strict_host_key;
 mod transfer;
 #[cfg(test)]
@@ -208,6 +209,11 @@ pub struct Ssh3ClientConfig {
     /// Go implementation does, but the transport of the jump itself is not
     /// implemented yet.
     pub proxy_jump: Option<String>,
+    /// The `VerifyHostKeyDNS` policy: whether the SSHFP records of the host
+    /// are checked against the presented certificate.
+    ///
+    /// `None` and the `No` mode never run the check.
+    pub verify_host_key_dns: Option<sshfp::VerifyHostKeyDns>,
 }
 
 impl Ssh3ClientConfig {
@@ -237,6 +243,7 @@ impl Ssh3ClientConfig {
             reverse_forwards: Vec::new(),
             dynamic_forwards: Vec::new(),
             proxy_jump: None,
+            verify_host_key_dns: None,
         }
     }
 }
@@ -458,6 +465,11 @@ pub enum Ssh3ClientError {
     HandshakeTimeout(Duration),
     /// The certificate of the server was refused by the known_hosts check.
     HostKeyRejected(String),
+    /// The SSHFP records published for the host do not match the
+    /// certificate the server presented (`VerifyHostKeyDNS`).
+    SshfpMismatch {
+        host: String,
+    },
     /// The known_hosts file could not be read or written.
     KnownHosts(Ssh3KnownHostsError),
     /// The server refused a reverse forwarding request.
@@ -537,6 +549,10 @@ impl fmt::Display for Ssh3ClientError {
                 write!(f, "the QUIC handshake timed out after {timeout:?}")
             }
             Self::HostKeyRejected(message) => write!(f, "{message}"),
+            Self::SshfpMismatch { host } => write!(
+                f,
+                "the SSHFP records published for {host} do not match the presented host key"
+            ),
             Self::KnownHosts(err) => write!(f, "{err}"),
             Self::ReverseForwardRefused { spec, reason } => {
                 write!(
@@ -561,7 +577,7 @@ impl fmt::Display for Ssh3ClientError {
 impl std::error::Error for Ssh3ClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::MissingHost => None,
+            Self::MissingHost | Self::SshfpMismatch { .. } => None,
             Self::Resolve(err) => Some(err),
             Self::Endpoint(err) => Some(err),
             Self::Connect(err) => Some(err),
@@ -1610,6 +1626,107 @@ async fn wait_for_termination(connection: &Connection) {
     }
 }
 
+/// Runs the SSHFP (`VerifyHostKeyDNS`) verification of the presented host
+/// certificate.
+///
+/// Only a mismatch is ever fatal, and only when the policy asks for it: a
+/// host without records, an unreachable resolver or a timeout means the DNS
+/// signal is simply absent. A mismatch under `StrictHostKeyChecking=no` is
+/// the explicitly allowed insecure behaviour: it warns loudly and lets the
+/// connection through, the way the known_hosts check does for a changed
+/// certificate.
+async fn run_sshfp_verification(
+    connection: &quinn::Connection,
+    config: &Ssh3ClientConfig,
+) -> Result<(), Ssh3ClientError> {
+    let Some(setting) = config.verify_host_key_dns.as_ref() else {
+        return Ok(());
+    };
+    if setting.mode == sshfp::VerifyHostKeyDnsMode::No {
+        return Ok(());
+    }
+    let Some(host) = config.target_url.host().map(str::to_string) else {
+        return Ok(());
+    };
+    // The certificate the handshake verified: the digests are taken over
+    // the DER bytes, exactly the bytes the known_hosts check compares.
+    let certificates = connection
+        .peer_identity()
+        .and_then(|identity| identity.downcast::<Vec<CertificateDer<'static>>>().ok());
+    let Some(certificate) = certificates.as_ref().and_then(|list| list.first()) else {
+        return Ok(());
+    };
+    let algorithm = sshfp::host_key_algorithm(certificate.as_ref());
+    if !setting.allows_algorithm(algorithm) {
+        // The host key algorithm is not covered by the requested algorithm
+        // list: the check simply does not apply to this key.
+        return Ok(());
+    }
+    let servers: Vec<SocketAddr> = sshfp::system_dns_servers()
+        .iter()
+        .filter_map(|server| normalize_dns_server(server))
+        .collect();
+    if servers.is_empty() {
+        eprintln!("ssh3-rust-client: no DNS server found, the SSHFP lookup is skipped");
+        return Ok(());
+    }
+    let result = sshfp::check_sshfp(&host, certificate.as_ref(), algorithm, &servers).await;
+    match result.status {
+        sshfp::SshfpStatus::Verified => {
+            let matched = result
+                .matched
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "record".to_string());
+            eprintln!("ssh3-rust-client: SSHFP verification of {host} succeeded ({matched})");
+        }
+        sshfp::SshfpStatus::Mismatch => {
+            eprintln!(
+                "ssh3-rust-client: the SSHFP records published for {} do not match the presented host key",
+                result.query_name
+            );
+        }
+        sshfp::SshfpStatus::LookupFailed => {
+            eprintln!(
+                "ssh3-rust-client: could not look up the SSHFP records of {}: {}",
+                result.query_name,
+                result.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+        sshfp::SshfpStatus::NoRecords => {
+            eprintln!(
+                "ssh3-rust-client: no SSHFP record is published for {}",
+                result.query_name
+            );
+        }
+        sshfp::SshfpStatus::NotChecked => {}
+    }
+    if !setting.rejects(result.status) {
+        return Ok(());
+    }
+    if let Ssh3TrustStrategy::KnownHosts(trust) = &config.trust
+        && trust.policy == Ssh3StrictHostKeyChecking::No
+    {
+        eprintln!(
+            "ssh3-rust-client: continuing because StrictHostKeyChecking=no explicitly allows the mismatch"
+        );
+        return Ok(());
+    }
+    Err(Ssh3ClientError::SshfpMismatch { host })
+}
+
+/// Adds the default DNS port to a resolver address; IPv6 literals gain the
+/// brackets the port needs.
+fn normalize_dns_server(server: &str) -> Option<SocketAddr> {
+    if let Ok(address) = server.parse::<SocketAddr>() {
+        return Some(address);
+    }
+    if server.contains(':') {
+        return format!("[{server}]:53").parse().ok();
+    }
+    format!("{server}:53").parse().ok()
+}
+
 async fn connect_client(config: &Ssh3ClientConfig) -> Result<ActiveClient, Ssh3ClientError> {
     connect_client_with_browser_opener(config, default_browser_opener).await
 }
@@ -1725,6 +1842,12 @@ async fn connect_client_with_browser_opener(
         config.default_datagrams_queue_size,
     )
     .await?;
+    // SSHFP (VerifyHostKeyDNS) is checked on the very same certificate the
+    // handshake verified: the known_hosts check answers "is this the key we
+    // saw last time?", SSHFP answers "does the zone vouch for this key?".
+    // The bare hostname carries the DNS meaning; the port and the path do
+    // not.
+    run_sshfp_verification(&connection, config).await?;
     // The HTTP/3 driver stays alive for the whole session: its control
     // stream carries the SETTINGS frame, and a peer that sees it closed
     // treats the connection as broken (H3_CLOSED_CRITICAL_STREAM). The

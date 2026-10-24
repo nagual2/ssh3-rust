@@ -280,6 +280,7 @@ struct OptionOverrides {
     dynamic_forwards: Vec<Ssh3DynamicForwardSpec>,
     proxy_jump: Option<String>,
     server_alive_interval: Option<Duration>,
+    verify_host_key_dns: Option<ssh3_client::sshfp::VerifyHostKeyDns>,
 }
 
 /// Parses the `-o KEY=VALUE` options.
@@ -351,6 +352,12 @@ fn parse_options(options: &[String]) -> Result<OptionOverrides, clap::Error> {
             "serveraliveinterval" => {
                 overrides.server_alive_interval = Some(
                     parse_timeout(&value)
+                        .map_err(|err| cli_error(ErrorKind::ValueValidation, err))?,
+                );
+            }
+            "verifyhostkeydns" => {
+                overrides.verify_host_key_dns = Some(
+                    ssh3_client::sshfp::VerifyHostKeyDns::parse(&value)
                         .map_err(|err| cli_error(ErrorKind::ValueValidation, err))?,
                 );
             }
@@ -441,6 +448,7 @@ struct SshConfigValues {
     forward_agent: bool,
     server_alive_interval: Option<Duration>,
     proxy_jump: Option<String>,
+    verify_host_key_dns: Option<String>,
 }
 
 /// Loads the ssh_config file of the user.
@@ -485,6 +493,7 @@ fn ssh_config_values(
         forward_agent: false,
         server_alive_interval: None,
         proxy_jump: None,
+        verify_host_key_dns: None,
     };
     let Some(host) = host else {
         return Ok(values);
@@ -536,6 +545,13 @@ fn ssh_config_values(
     if let Some(value) = get("UDPProxyJump").or_else(|| get("ProxyJump")) {
         validate_proxy_jump(&value).map_err(|err| cli_error(ErrorKind::ValueValidation, err))?;
         values.proxy_jump = Some(value);
+    }
+    if let Some(value) = get("VerifyHostKeyDNS") {
+        // The value is checked right away: a typo must cost a process start
+        // and nothing else.
+        ssh3_client::sshfp::VerifyHostKeyDns::parse(&value)
+            .map_err(|err| cli_error(ErrorKind::ValueValidation, err))?;
+        values.verify_host_key_dns = Some(value);
     }
     Ok(values)
 }
@@ -839,6 +855,24 @@ fn build_connection_config(
     // The proxy jump chain comes from the `-o` option first and from the
     // keyword of the ssh_config file next.
     config.proxy_jump = overrides.proxy_jump.or(ssh_config_values.proxy_jump);
+    // The SSHFP policy comes from the `-o` option first and from the keyword
+    // of the ssh_config file next; the parsed form of the winner lands in
+    // the configuration (the values above were already validated).
+    if let Some(value) = overrides
+        .verify_host_key_dns
+        .is_some()
+        .then(|| overrides.verify_host_key_dns.clone())
+        .flatten()
+        .or_else(|| {
+            ssh_config_values
+                .verify_host_key_dns
+                .as_deref()
+                .map(ssh3_client::sshfp::VerifyHostKeyDns::parse)
+                .and_then(Result::ok)
+        })
+    {
+        config.verify_host_key_dns = Some(value);
+    }
 
     // The forwards follow the same precedence as the other options: the
     // command line wins over the `-o` options.
@@ -1576,5 +1610,51 @@ mod tests {
         assert_eq!(fields[2], "ssh3-rust");
         assert!(fields[3].starts_with("0."));
         assert_eq!(fields[4], "experimental_spec_version=alpha-00");
+    }
+}
+
+#[cfg(test)]
+mod sshfp_cli_tests {
+    use super::{Cli, build_config};
+    use clap::Parser;
+    use ssh3_client::sshfp::VerifyHostKeyDnsMode;
+
+    fn config_of(arguments: &[&str]) -> ssh3_client::Ssh3ClientConfig {
+        let mut argv = vec!["ssh3-rust-client"];
+        argv.extend_from_slice(arguments);
+        argv.push("https://localhost:4433/ssh3-term");
+        let cli = Cli::try_parse_from(argv).unwrap();
+        build_config(cli).unwrap().config
+    }
+
+    /// The `-o VerifyHostKeyDNS` option lands in the configuration; a value
+    /// the parser refuses costs a process start and nothing else.
+    #[test]
+    fn the_verify_host_key_dns_option_lands_in_the_config() {
+        let config = config_of(&["-o", "VerifyHostKeyDNS=yes"]);
+        let setting = config
+            .verify_host_key_dns
+            .expect("the option sets the policy");
+        assert_eq!(setting.mode, VerifyHostKeyDnsMode::Yes);
+        assert!(setting.algorithms.is_empty());
+
+        let config = config_of(&["-o", "VerifyHostKeyDNS=ask:ed25519,sha256"]);
+        let setting = config
+            .verify_host_key_dns
+            .expect("the option sets the policy");
+        assert_eq!(setting.mode, VerifyHostKeyDnsMode::Ask);
+        assert_eq!(setting.algorithms, vec![4, 2]);
+
+        // The default never runs the check.
+        let config = config_of(&[]);
+        assert!(config.verify_host_key_dns.is_none());
+
+        // A broken value is refused before a packet is sent.
+        let mut argv = vec!["ssh3-rust-client".to_string()];
+        argv.push("-o".to_string());
+        argv.push("VerifyHostKeyDNS=maybe".to_string());
+        argv.push("https://localhost:4433/ssh3-term".to_string());
+        let cli = Cli::try_parse_from(argv).unwrap();
+        assert!(build_config(cli).is_err());
     }
 }
