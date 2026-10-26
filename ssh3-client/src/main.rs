@@ -517,6 +517,7 @@ struct SshConfigValues {
     control_path: Option<String>,
     control_persist: Option<String>,
     verify_host_key_dns: Option<String>,
+    port: Option<u16>,
 }
 
 /// Loads the ssh_config file of the user.
@@ -565,6 +566,7 @@ fn ssh_config_values(
         control_path: None,
         control_persist: None,
         verify_host_key_dns: None,
+        port: None,
     };
     let Some(host) = host else {
         return Ok(values);
@@ -635,6 +637,16 @@ fn ssh_config_values(
         ssh3_client::sshfp::VerifyHostKeyDns::parse(&value)
             .map_err(|err| cli_error(ErrorKind::ValueValidation, err))?;
         values.verify_host_key_dns = Some(value);
+    }
+    if let Some(value) = get("Port") {
+        // The value is checked right away: a typo must cost a process start
+        // and nothing else.
+        values.port = Some(value.trim().parse::<u16>().map_err(|err| {
+            cli_error(
+                ErrorKind::ValueValidation,
+                format!("invalid ssh_config Port {value:?}: {err}"),
+            )
+        })?);
     }
     Ok(values)
 }
@@ -875,6 +887,7 @@ fn build_connection_config(
     // from the copies taken here.
     let url_host = url.host().map(str::to_string);
     let url_port = url.port_u16().unwrap_or(443);
+    let url_has_port = url.port_u16().is_some();
     let mut config = Ssh3ClientConfig::new(url);
     config.server_name = cli.server_name;
     config.username = username.or(cli.user);
@@ -944,6 +957,18 @@ fn build_connection_config(
         config.target_url.host(),
         config.username.as_deref(),
     )?;
+
+    // The `Port` keyword of the ssh_config file applies when the URL did
+    // not name a port, like the Go implementation does (`cmd/ssh3.go:868`):
+    // the keyword of the file is the last source of the connection port.
+    if !url_has_port && let Some(port) = ssh_config_values.port {
+        config.target_url = url_with_port(&config.target_url, port).map_err(|err| {
+            cli_error(
+                ErrorKind::ValueValidation,
+                format!("invalid ssh_config Port: {err}"),
+            )
+        })?;
+    }
 
     // The certificate authorities the server chain may be verified against.
     let authorities = match cli.ca_cert.as_ref() {
@@ -1144,6 +1169,26 @@ fn build_connection_config(
         url_port,
     ))?;
     Ok((config, control))
+}
+
+/// Rebuilds the URL of the connection with the given port.
+///
+/// The scheme, the host, the path and the query stay as they are; only the
+/// authority carries the port.
+fn url_with_port(uri: &Uri, port: u16) -> Result<Uri, String> {
+    let host = uri
+        .host()
+        .ok_or_else(|| "the URL of the connection carries no host".to_string())?;
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    Uri::builder()
+        .scheme("https")
+        .authority(format!("{host}:{port}").as_str())
+        .path_and_query(path_and_query)
+        .build()
+        .map_err(|err| format!("could not rebuild the URL of the connection: {err}"))
 }
 
 /// The raw control master inputs of the command line.
@@ -1886,6 +1931,33 @@ mod tests {
             policy_of(&config),
             Some(Ssh3StrictHostKeyChecking::AcceptNew)
         );
+    }
+
+    #[test]
+    fn the_ssh_config_port_applies_to_a_url_without_one() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config");
+        std::fs::write(&path, "Host localhost\n  Port 1248\n").unwrap();
+
+        let cli = Cli::try_parse_from([
+            "ssh3-rust-client",
+            "--ssh-config",
+            path.to_str().unwrap(),
+            "https://localhost/ssh3-term",
+        ])
+        .unwrap();
+        let plan = build_config(cli).unwrap();
+        assert_eq!(plan.config.target_url.port_u16(), Some(1248));
+    }
+
+    #[test]
+    fn the_url_port_wins_over_the_ssh_config_keyword() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config");
+        std::fs::write(&path, "Host localhost\n  Port 1248\n").unwrap();
+
+        let config = config_of(&["--ssh-config", path.to_str().unwrap()]);
+        assert_eq!(config.target_url.port_u16(), Some(4433));
     }
 
     #[test]

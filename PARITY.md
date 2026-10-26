@@ -44,8 +44,8 @@
 | 4 | Клиент: control master | 5 | 0 | 0 | 0 | 5 | 0 |
 | 5 | Клиент: proxy jump | 4 | 4 | 0 | 0 | 0 | 0 |
 | 6 | Клиент: передача файлов | 6 | 0 | 0 | 0 | 6 | 0 |
-| 7 | Клиент: конфигурация / `-o` / ssh_config | 12 | 9 | 0 | 1 | 2 | 0 |
-| 8 | Клиент: прочие флаги и сервисы | 9 | 2 | 0 | 1 | 6 | 0 |
+| 7 | Клиент: конфигурация / `-o` / ssh_config | 12 | 10 | 0 | 0 | 2 | 0 |
+| 8 | Клиент: прочие флаги и сервисы | 9 | 3 | 0 | 1 | 5 | 0 |
 | 9 | Сервер: аутентификация и политики | 9 | 5 | 1 | 0 | 3 | 0 |
 | 10 | Сервер: политики форвардинга | 4 | 4 | 0 | 0 | 0 | 0 |
 | 11 | Сервер: лимиты и таймауты | 6 | 3 | 0 | 0 | 3 | 0 |
@@ -151,7 +151,7 @@
 | G7 | Конфигурация | ssh_config: `ForwardAgent` | да | да | Go `cmd/ssh3.go:1351`; Rust `ssh3-client/src/main.rs:476` (`ssh_config_values`, `forward_agent`) | S | G3, A11 |
 | G8 | Конфигурация | ssh_config: `EscapeChar` | да | да | Go `cmd/ssh3.go:1370`; Rust `ssh3-client/src/main.rs:470` (`ssh_config_values`, `escape_char`) | S | G3, B12 |
 | G9 | Конфигурация | ssh_config: `StrictHostKeyChecking` | да | да | Go `strict_host_key.go:62` (`ResolveStrictHostKeyChecking`); Rust `ssh3-client/src/ssh_config.rs` (`SshConfig::get_for_user`), `ssh3-client/src/main.rs:452` (`ssh_config_values`) | — | G3, A9 |
-| G10 | Конфигурация | ssh_config: `User`, `Port` | да | частично | Go `cmd/ssh3.go:868` (`Port`), `cmd/ssh3.go:876` (`User`); Rust `ssh3-client/src/ssh_config.rs:295` (`User` читается) — ключа `Port` **не найдено** | S | G3 |
+| G10 | Конфигурация | ssh_config: `User`, `Port` | да | да | Go `cmd/ssh3.go:868` (`Port`), `cmd/ssh3.go:876` (`User`); Rust `ssh3-client/src/ssh_config.rs:295` (`User`), `ssh3-client/src/main.rs` (`Port` читается и применяется к URL без порта, приоритет URL > ключа) | S | G3 |
 | G11 | Конфигурация | ssh_config: `IdentityFile` | да | нет | Go `cmd/ssh3.go:943` (маршрутизация по ключу), `auth/plugins/pubkey_authentication/client/privkey_auth.go:57`; Rust — **не найдено** | S | G3, A1 |
 | G12 | Конфигурация | Переменные окружения `SSH3_*` (серверная политика) | да | нет | Go `cmd/ssh3-server.go:993-1083` (`SSH3_ENABLE_PASSWORD_LOGIN`, `SSH3_GATEWAY_PORTS`, `SSH3_MAX_*`, `SSH3_PERMIT_OPEN`, `SSH3_PERMIT_LISTEN`, `SSH3_SHUTDOWN_DRAIN`), `packaging/ssh3-server.env`; Rust — **не найдено** | M | — |
 
@@ -165,7 +165,7 @@
 | H4 | Прочее | `-p` — порт сервера | да | нет | Go `cmd/ssh3.go:702`; Rust — **не найдено** (порт только в URL) | S | — |
 | H5 | Прочее | `-insecure` — не проверять сертификат | да | да | Go `cmd/ssh3.go:678`; Rust `ssh3-client/src/main.rs:139` | — | — |
 | H6 | Прочее | `-version` / `-V` | да | да | Go `cmd/ssh3.go:688-689`; Rust `ssh3-client/src/main.rs:170` (`-V`/`--version`), `ssh3-client/src/lib.rs:95` (`SSH3_CLIENT_VERSION_STRING`) — печатается строка версии в формате Go (`SSH 3.0 ssh3-rust 0.1.0 experimental_spec_version=alpha-00`) | — | — |
-| H7 | Прочее | X11 forwarding | да (серверная заглушка) | нет | Go `cmd/ssh3-server.go:564` (`newX11Req`), `cmd/ssh3-server.go:1497`, `client/session_pump.go:156` («not implemented» на клиенте); Rust — протокольный тип есть (`ssh3-proto/src/message.rs:330-331`), обработчика нет | M | — |
+| H7 | Прочее | X11 forwarding | да (серверная заглушка) | да (заглушка как в Go) | Go `cmd/ssh3-server.go:564` (`newX11Req` — отказ «not implemented»), `client/session_pump.go:156` («not implemented» на клиенте); Rust — протокольный тип (`ssh3-proto/src/message.rs:330-331`), парсер (`ssh3-core/src/channel.rs:954`), сервер отклоняет запрос в stderr сессии | M | — |
 | H8 | Прочее | `-packet-size` / `-initial-packet-size` — начальный размер QUIC-пакета (дефолт 1200, минимум RFC 9000) | да | частично | Go `cmd/ssh3.go:703` (клиент), `cmd/ssh3-server.go:965` (сервер), `cmd/ssh3.go:210-212` (применение к `qconf.InitialPacketSize`); Rust — параметра **не найдено** (`ssh3-quinn/src/config.rs` не задаёт `TransportConfig`), но фактическое значение совпадает: дефолт `quinn` `initial_mtu` = 1200 | S | — |
 | H9 | Прочее | Отключённый path-MTU discovery (сервер и туннелированные соединения) | да | нет | Go `cmd/ssh3-server.go:1316` (`DisablePathMTUDiscovery: true`), `cmd/ssh3.go:216-220` (туннель); Rust — **не найдено**: `quinn` оставляет PMTUD включённым по умолчанию, `ssh3-server/src/tls.rs:22-33` меняет только таймауты | S | H8, E4 |
 
@@ -364,7 +364,7 @@
 | X3 | Proxy jump | UDP/датаграммный туннель через jump-хост, цепочка хопов, `-J`/`-proxy-jump`/ssh_config + бюджет датаграмм (E4) | `ssh3-client/src/lib.rs`, `ssh3-client/src/main.rs` | `ssh3-rust-client -J jump target` работает через реальный jump-сервер | 10 | Q5, T1, H8, H9 |
 | X4 | Изоляция путей SFTP (`-sftp-jail`) | chroot-модель (дочерний процесс + uid/gid) либо лексический jail | `ssh3-server/src/sftp.rs`, `ssh3-server/src/config.rs` | SFTP-клиент не может выйти за пределы jail; тест на `../../etc/passwd` | ~~5~~ закрыт † | T5 |
 | X5 | Debian-упаковка и man-страницы | `.deb` — сделано † (`packaging/build-deb.sh`); остались man-страницы | `ssh3-rust/packaging/` | `dpkg-deb --build` собирает пакет; `lintian` без ошибок; `man` открывается | 2 | Q9, Q7 |
-| X6 | X11 forwarding | Полная реализация X11-канала на клиенте и сервере | `ssh3-server/src/session.rs`, `ssh3-client/src/lib.rs`, `ssh3-proto/src/message.rs:330-331` | X11-приложение стартует через туннель | 6 | T4 |
+| X6 | X11 forwarding | Полная реализация X11-канала на клиенте и сервере — **осознанно не переносится** (ROADMAP §4): эталон X11 не реализует, паритет — заглушка (H7) | — | — | — | — | — |
 | X7 | Полный аудит и wire- golden-векторы | Прогон `FROZEN.md`-процедуры; golden-векторы wire-формата из `wire_vectors_test.go` (механизм `scripts/refresh-go-vectors.sh` уже есть); fuzz-таргеты парсера | новый `ssh3-rust/tests/`, новый `ssh3-rust/fuzz/` | Все interop-сценарии зелёные на закреплённом теге Go; fuzz без падений | 3 | — |
 | **X8** | **Сжатие тела канала (B8)** | Объявить `compress=` в строке версии (N1); принять кадр 192 в `ssh3-proto`/`ssh3-core` (N2); кодеки deflate/lz4/zstd с байт-в-байт совпадением с Go (N3); cutoff (N4), лимит бомбы 16 MiB (N5), сжатие на сервере (N6). **Порядок обязателен**: capability объявляется только вместе с готовым декодером | `ssh3-h3/src/lib.rs:19`, `ssh3-proto/src/message.rs`, `ssh3-core/src/channel.rs:856-890`, новый `ssh3-core/src/compress.rs` | Interop: Go-клиент ↔ Rust-сервер и Rust-клиент ↔ Go-сервер сжаты в обе стороны; golden-векторы кадра 192 совпадают с `message/compressed_data_test.go` Go; пир без `compress=` получает открытые кадры | 12 | X7, N3 |
 
