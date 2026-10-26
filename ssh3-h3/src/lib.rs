@@ -6,7 +6,9 @@ use http::{
     HeaderValue, Method, Request, Response, StatusCode, Uri,
     header::{SERVER, USER_AGENT},
 };
-use ssh3_core::{Ssh3Conversation, Ssh3ConversationError, Ssh3ConversationId};
+use ssh3_core::{
+    Ssh3Conversation, Ssh3ConversationError, Ssh3ConversationId, negotiate_with_version_string,
+};
 use ssh3_proto::read_var_int;
 use ssh3_quinn::{
     Ssh3IncomingChannelRouter, Ssh3QuinnDatagramSender, Ssh3RouteAcceptedChannelError,
@@ -16,7 +18,14 @@ pub const SSH3_PROTOCOL_NAME: &str = "ssh3";
 pub const SSH3_EXPORTER_LABEL: &[u8] = b"EXPORTER-SSH3";
 pub const SSH3_CONVERSATION_ID_LEN: usize = 32;
 pub const SSH3_USER_HEADER: &str = "x-ssh3-user";
-pub const SSH3_VERSION_STRING: &str = "SSH 3.0 ssh3-rust 0.1.0 experimental_spec_version=alpha-00";
+/// The version string of this build.
+///
+/// The `compress=` field announces the codecs this build can decode, in the
+/// same order the reference implementation announces them (the capability
+/// mask of the channel body compression). The field is optional on the wire:
+/// a peer without it simply never sends compressed frames.
+pub const SSH3_VERSION_STRING: &str =
+    "SSH 3.0 ssh3-rust 0.1.0 experimental_spec_version=alpha-00 compress=zstd,deflate,lz4";
 
 pub type Ssh3QuinnConnection = h3_quinn::Connection;
 pub type Ssh3ClientConnection = h3::client::Connection<Ssh3QuinnConnection, Bytes>;
@@ -414,6 +423,15 @@ pub async fn establish_client_conversation(
         default_datagrams_queue_size,
         Arc::new(Ssh3QuinnDatagramSender::new(connection.clone())),
     ));
+    // The compression of the channel body: the codec both sides derive from
+    // the capability the peer announced in its version string, the same way
+    // the reference implementation derives it from its peerVersion. A peer
+    // that announced nothing keeps the plain frames.
+    conversation.set_compression_algorithm(
+        response_server_header(&response)
+            .map(negotiate_with_version_string)
+            .unwrap_or(ssh3_core::ALGORITHM_NONE),
+    );
 
     Ok(Ssh3EstablishedClientConversation {
         conversation,
@@ -441,6 +459,13 @@ pub async fn accept_server_conversation(
         default_datagrams_queue_size,
         Arc::new(Ssh3QuinnDatagramSender::new(connection.clone())),
     ));
+    // The compression of the channel body: the codec both sides derive from
+    // the capability the client announced in its User-Agent, the same way the
+    // reference implementation derives it from its peerVersion. A client that
+    // announced nothing keeps the plain frames.
+    if let Some(user_agent) = request_user_agent(&request) {
+        conversation.set_compression_algorithm(negotiate_with_version_string(user_agent));
+    }
 
     Ok(Some(Ssh3AcceptedServerConversation {
         conversation,

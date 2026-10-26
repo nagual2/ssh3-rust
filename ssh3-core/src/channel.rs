@@ -273,6 +273,10 @@ pub struct Ssh3Channel {
     confirm_received: AtomicBool,
     /// Maximum packet size the peer announced, once it is known.
     peer_max_packet_size: AtomicU64,
+    /// The codec of the compressed data frames this channel sends: the
+    /// algorithm both sides derive from the capability the peer announced in
+    /// its version string. `ALGORITHM_NONE` sends plain frames.
+    compression: AtomicU64,
     header: Mutex<Option<Vec<u8>>>,
     datagram_sender: RwLock<Option<Arc<Ssh3ConversationDatagramSender>>>,
     recv: Ssh3Recv,
@@ -404,6 +408,7 @@ impl Ssh3Channel {
             confirm_sent: AtomicBool::new(confirm_sent),
             confirm_received: AtomicBool::new(confirm_received),
             peer_max_packet_size: AtomicU64::new(MAX_MAX_PACKET_SIZE),
+            compression: AtomicU64::new(crate::compress::ALGORITHM_NONE),
             header: Mutex::new(header),
             datagram_sender: RwLock::new(datagram_sender),
             recv: Ssh3Recv::new(Box::new(recv)),
@@ -600,6 +605,16 @@ impl Ssh3Channel {
         self.peer_max_packet_size.store(clamped, Ordering::SeqCst);
     }
 
+    /// Records the codec of the compressed data frames this channel sends.
+    pub fn set_compression_algorithm(&self, algorithm: u64) {
+        self.compression.store(algorithm, Ordering::SeqCst);
+    }
+
+    /// Returns the codec of the compressed data frames this channel sends.
+    pub fn compression_algorithm(&self) -> u64 {
+        self.compression.load(Ordering::SeqCst)
+    }
+
     /// Returns the maximum packet size the channel may use for its frames.
     ///
     /// It is the smallest of the value the local endpoint announced and the
@@ -651,7 +666,26 @@ impl Ssh3Channel {
 
         let mut written = 0;
         let mut send = self.send.lock().await;
+        let compression = self.compression.load(Ordering::SeqCst);
         for chunk in data_buf.chunks(max_payload.max(1)) {
+            // The compression of the channel body: the chunk is compressed
+            // when the peer announced the codec and the compressed form is
+            // smaller - the cutoff of the ZFS fast levels, so already
+            // compressed data is not compressed twice. The stderr stream
+            // keeps the plain frames, like in the reference implementation.
+            if compression != crate::compress::ALGORITHM_NONE && data_type == SSH_EXTENDED_DATA_NONE
+            {
+                if let Some(packed) = crate::compress::compress(compression, chunk) {
+                    if packed.len() < chunk.len() {
+                        let mut frame =
+                            ssh3_proto::compressed_data_header(compression, packed.len() as u64);
+                        frame.extend_from_slice(&packed);
+                        send.write_all(&frame).await?;
+                        written += frame.len();
+                        continue;
+                    }
+                }
+            }
             let message = Ssh3Message::Data(Ssh3DataOrExtendedDataMessage {
                 data_type,
                 data: chunk.to_vec(),
@@ -875,6 +909,20 @@ async fn parse_message(recv: &mut dyn Ssh3ReceiveStream) -> Result<Ssh3Message, 
             data_type: SSH_EXTENDED_DATA_NONE,
             data: read_ssh_bytes(recv).await?,
         }),
+        ssh3_proto::SSH_MSG_CHANNEL_DATA_COMPRESSED => {
+            // the frame carries its algorithm, so the decode needs no
+            // negotiation of its own, exactly like the reference
+            // implementation (message.ParseCompressedDataMessage)
+            let algorithm = read_var_int(recv).await?;
+            let packed = read_ssh_bytes(recv).await?;
+            let data = crate::compress::decompress(algorithm, &packed).map_err(|err| {
+                Ssh3ChannelError::Proto(ssh3_proto::Ssh3Error::Compression(err.to_string()))
+            })?;
+            Ssh3Message::Data(Ssh3DataOrExtendedDataMessage {
+                data_type: SSH_EXTENDED_DATA_NONE,
+                data,
+            })
+        }
         ssh3_proto::SSH_MSG_CHANNEL_EXTENDED_DATA => {
             Ssh3Message::Data(Ssh3DataOrExtendedDataMessage {
                 data_type: read_var_int(recv).await?,
@@ -1087,10 +1135,11 @@ mod tests {
         MIN_MAX_PACKET_SIZE, Ssh3Channel, Ssh3ChannelError, clamp_local_max_packet_size,
         clamp_peer_max_packet_size, parse_message,
     };
+    use crate::conversation::Ssh3Conversation;
     use crate::conversation::Ssh3ConversationDatagramSender;
     use crate::transport::Ssh3ReceiveStream;
     use crate::transport::testutil::{
-        BytesReceiveStream, RecordingDatagramSender, RecordingSendStream,
+        BytesReceiveStream, RecordingDatagramSender, RecordingSendHandle, RecordingSendStream,
     };
 
     fn conversation_id() -> [u8; 32] {
@@ -1327,6 +1376,220 @@ mod tests {
             }
             other => panic!("expected the request type to be refused, got {other:?}"),
         }
+    }
+
+    /// Builds the bytes of a compressed data frame: the message type, the
+    /// algorithm and the compressed payload as an SSH string.
+    fn compressed_data_frame_bytes(algorithm: u64, packed: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        append_var_int(&mut out, ssh3_proto::SSH_MSG_CHANNEL_DATA_COMPRESSED);
+        append_var_int(&mut out, algorithm);
+        ssh3_proto::append_ssh_bytes(&mut out, packed);
+        out
+    }
+
+    /// A compressed data frame decodes into its plain payload: the frame
+    /// carries its algorithm, so the parser needs no state of its own, the
+    /// way `ParseCompressedDataMessage` of the reference works.
+    #[tokio::test]
+    async fn a_compressed_data_frame_decodes_into_its_plain_payload() {
+        let payload = b"a compressed channel body ".repeat(64);
+        let packed = crate::compress::compress(crate::compress::ALGORITHM_DEFLATE, &payload)
+            .expect("the deflate codec refused the payload");
+        let bytes = compressed_data_frame_bytes(crate::compress::ALGORITHM_DEFLATE, &packed);
+        let (mut recv, _) = BytesReceiveStream::new(bytes);
+        let message = parse_message(&mut recv).await.unwrap();
+        match message {
+            Ssh3Message::Data(data) => {
+                assert_eq!(data.data_type, ssh3_proto::SSH_EXTENDED_DATA_NONE);
+                assert_eq!(data.data, payload);
+            }
+            other => panic!("expected a data message, got {other:?}"),
+        }
+    }
+
+    /// A frame whose payload does not decode is a protocol error: the
+    /// channel dies, the way the reference implementation drops the channel
+    /// of a frame that does not parse.
+    #[tokio::test]
+    async fn a_compressed_data_frame_that_does_not_decode_is_a_protocol_error() {
+        let bytes = compressed_data_frame_bytes(
+            crate::compress::ALGORITHM_DEFLATE,
+            b"not a deflate stream",
+        );
+        let (mut recv, _) = BytesReceiveStream::new(bytes);
+        match parse_message(&mut recv).await {
+            Err(Ssh3ChannelError::Proto(ssh3_proto::Ssh3Error::Compression(_))) => {}
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    /// An algorithm no implementation knows is refused the same way.
+    #[tokio::test]
+    async fn a_compressed_data_frame_of_an_unknown_algorithm_is_refused() {
+        let bytes = compressed_data_frame_bytes(42, b"whatever");
+        let (mut recv, _) = BytesReceiveStream::new(bytes);
+        match parse_message(&mut recv).await {
+            Err(Ssh3ChannelError::Proto(ssh3_proto::Ssh3Error::Compression(_))) => {}
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    /// Builds a channel that records everything it writes.
+    fn recording_channel() -> (Ssh3Channel, RecordingSendHandle) {
+        let (recv, _) = BytesReceiveStream::new(Vec::new());
+        let (send, handle) = RecordingSendStream::new();
+        let channel = Ssh3Channel::new(
+            11,
+            conversation_id(),
+            22,
+            b"session".to_vec(),
+            MIN_MAX_PACKET_SIZE,
+            recv,
+            send,
+            None,
+            true,
+            true,
+            true,
+            4,
+            None,
+        );
+        (channel, handle)
+    }
+
+    /// Returns the bytes of the stream without the channel header.
+    fn stream_without_header(handle: &RecordingSendHandle) -> Vec<u8> {
+        let header_len = Ssh3ChannelHeader {
+            conversation_stream_id: 11,
+            channel_type: b"session".to_vec(),
+            max_packet_size: MIN_MAX_PACKET_SIZE,
+        }
+        .encode(None)
+        .len();
+        handle.bytes()[header_len..].to_vec()
+    }
+
+    /// Builds the var-int prefix of a compressed frame of `algorithm`: the
+    /// message type and the algorithm id.
+    fn compressed_frame_prefix(algorithm: u64) -> Vec<u8> {
+        let mut prefix = Vec::new();
+        append_var_int(&mut prefix, ssh3_proto::SSH_MSG_CHANNEL_DATA_COMPRESSED);
+        append_var_int(&mut prefix, algorithm);
+        prefix
+    }
+
+    /// A channel with a negotiated codec compresses its data chunks into the
+    /// type-192 frames: the frame round-trips back into the plain payload.
+    #[tokio::test]
+    async fn write_data_compresses_the_chunk_of_a_negotiated_codec() {
+        let (channel, handle) = recording_channel();
+        channel.set_compression_algorithm(crate::compress::ALGORITHM_DEFLATE);
+
+        let payload = b"the compressed channel body ".repeat(64);
+        let written = channel
+            .write_data(&payload, ssh3_proto::SSH_EXTENDED_DATA_NONE)
+            .await
+            .unwrap();
+
+        let stream = stream_without_header(&handle);
+        // The payload shrinks far below the cutoff: the frame is compressed.
+        assert!(
+            stream.starts_with(&compressed_frame_prefix(crate::compress::ALGORITHM_DEFLATE)),
+            "the frame must be a compressed one, got {:?}",
+            &stream[..6]
+        );
+        let (mut recv, _) = BytesReceiveStream::new(stream);
+        let message = parse_message(&mut recv).await.unwrap();
+        match message {
+            Ssh3Message::Data(data) => {
+                assert_eq!(data.data_type, ssh3_proto::SSH_EXTENDED_DATA_NONE);
+                assert_eq!(data.data, payload);
+            }
+            other => panic!("expected a data message, got {other:?}"),
+        }
+        assert!(
+            written < payload.len(),
+            "the compressed form must be smaller"
+        );
+    }
+
+    /// The cutoff of the ZFS fast levels: a chunk that does not shrink
+    /// travels as a plain frame, so already compressed data is not
+    /// compressed twice.
+    #[tokio::test]
+    async fn write_data_keeps_an_incompressible_chunk_plain() {
+        let (channel, handle) = recording_channel();
+        channel.set_compression_algorithm(crate::compress::ALGORITHM_DEFLATE);
+
+        let payload = crate::compress::pseudo_random_bytes(2048);
+        channel
+            .write_data(&payload, ssh3_proto::SSH_EXTENDED_DATA_NONE)
+            .await
+            .unwrap();
+
+        let stream = stream_without_header(&handle);
+        assert!(
+            !stream.starts_with(&compressed_frame_prefix(crate::compress::ALGORITHM_DEFLATE)),
+            "an incompressible chunk must travel as a plain frame"
+        );
+        let (mut recv, _) = BytesReceiveStream::new(stream);
+        let message = parse_message(&mut recv).await.unwrap();
+        match message {
+            Ssh3Message::Data(data) => assert_eq!(data.data, payload),
+            other => panic!("expected a data message, got {other:?}"),
+        }
+    }
+
+    /// The stderr stream keeps the plain frames whatever the negotiated
+    /// codec, exactly like the reference implementation keeps it.
+    #[tokio::test]
+    async fn write_data_never_compresses_the_stderr_stream() {
+        let (channel, handle) = recording_channel();
+        channel.set_compression_algorithm(crate::compress::ALGORITHM_DEFLATE);
+
+        let payload = b"the stderr stream stays plain ".repeat(64);
+        channel
+            .write_data(&payload, ssh3_proto::SSH_EXTENDED_DATA_STDERR)
+            .await
+            .unwrap();
+
+        let stream = stream_without_header(&handle);
+        assert!(
+            !stream.starts_with(&compressed_frame_prefix(crate::compress::ALGORITHM_DEFLATE)),
+            "stderr must travel as a plain frame"
+        );
+    }
+
+    /// A channel that was opened before the negotiation learns the codec
+    /// when the conversation records it.
+    #[tokio::test]
+    async fn a_channel_of_a_conversation_picks_up_the_negotiated_codec() {
+        let conversation = Ssh3Conversation::new(
+            1,
+            conversation_id(),
+            MIN_MAX_PACKET_SIZE,
+            4,
+            Arc::new(RecordingDatagramSender::default()),
+        );
+        let (recv, _) = BytesReceiveStream::new(Vec::new());
+        let (send, _) = RecordingSendStream::new();
+        let channel = conversation.open_channel(2, b"session", MIN_MAX_PACKET_SIZE, 4, recv, send);
+        assert_eq!(
+            channel.compression_algorithm(),
+            crate::compress::ALGORITHM_NONE,
+            "a conversation without the negotiation sends plain frames"
+        );
+
+        conversation.set_compression_algorithm(crate::compress::ALGORITHM_ZSTD);
+        assert_eq!(
+            channel.compression_algorithm(),
+            crate::compress::ALGORITHM_ZSTD,
+            "the channel picks the codec up from the conversation"
+        );
+        assert_eq!(
+            conversation.compression_algorithm(),
+            crate::compress::ALGORITHM_ZSTD
+        );
     }
 
     #[tokio::test]

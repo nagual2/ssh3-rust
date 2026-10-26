@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::Cursor;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ssh3_proto::{append_var_int, build_forwarding_additional_bytes, read_var_int};
@@ -113,6 +114,10 @@ pub struct Ssh3Conversation {
     conversation_id: Ssh3ConversationId,
     max_packet_size: u64,
     default_datagrams_queue_size: usize,
+    /// The codec of the compressed data frames of this conversation: the
+    /// algorithm both sides derive from the capability the peer announced in
+    /// its version string. `ALGORITHM_NONE` sends plain frames.
+    compression_algorithm: AtomicU64,
     message_sender: Arc<dyn Ssh3DatagramSender>,
     channels_manager: ChannelsManager,
     channels_accept_queue: Ssh3AcceptQueue<Ssh3AcceptedChannel>,
@@ -136,10 +141,28 @@ impl Ssh3Conversation {
             conversation_id,
             max_packet_size,
             default_datagrams_queue_size,
+            compression_algorithm: AtomicU64::new(crate::compress::ALGORITHM_NONE),
             message_sender,
             channels_manager: ChannelsManager::new(),
             channels_accept_queue: Ssh3AcceptQueue::new(),
         }
+    }
+
+    /// Records the codec of the compressed data frames of this conversation.
+    ///
+    /// The codec is derived from the capability the peer announced in its
+    /// version string; every channel that is already registered picks it up,
+    /// and so does every channel that is opened or accepted afterwards.
+    pub fn set_compression_algorithm(&self, algorithm: u64) {
+        self.compression_algorithm
+            .store(algorithm, Ordering::SeqCst);
+        self.channels_manager
+            .for_each_channel(|channel| channel.set_compression_algorithm(algorithm));
+    }
+
+    /// Returns the codec of the compressed data frames of this conversation.
+    pub fn compression_algorithm(&self) -> u64 {
+        self.compression_algorithm.load(Ordering::SeqCst)
     }
 
     /// Opens a channel of the local side.
@@ -174,6 +197,7 @@ impl Ssh3Conversation {
             datagrams_queue_size,
             None,
         ));
+        channel.set_compression_algorithm(self.compression_algorithm());
         self.channels_manager.add_channel(channel.clone());
         channel
     }
@@ -225,6 +249,7 @@ impl Ssh3Conversation {
                 remote_addr.port(),
             )),
         ));
+        channel.set_compression_algorithm(self.compression_algorithm());
         channel.maybe_send_header().await?;
         self.channels_manager.add_channel(channel.clone());
         Ok(channel)
@@ -265,6 +290,7 @@ impl Ssh3Conversation {
                 remote_addr.port(),
             )),
         ));
+        channel.set_compression_algorithm(self.compression_algorithm());
         channel.maybe_send_header().await?;
         self.channels_manager.add_channel(channel.clone());
         Ok(channel)
@@ -384,6 +410,14 @@ impl ChannelsManager {
 
         if let Some(queue) = pending_queue {
             channel.set_datagram_queue(queue);
+        }
+    }
+
+    /// Calls `f` for every registered channel.
+    fn for_each_channel(&self, mut f: impl FnMut(&Arc<Ssh3Channel>)) {
+        let state = self.state.lock().unwrap();
+        for channel in state.channels.values() {
+            f(channel);
         }
     }
 

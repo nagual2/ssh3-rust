@@ -215,7 +215,21 @@ fn rust_encoders_match_the_reference_vectors() {
     })
     .to_vec();
 
+    // The compressed data frame of the channel body compression: the
+    // framing (the type-192 varints of the type, the algorithm id and the
+    // compressed size) is built here; the payload stays the verbatim bytes
+    // of the reference deflate, so the golden file pins both.
+    let go_compressed = vectors["channel_data_compressed_deflate"].clone();
+    // The frame is the three varints of the header (the type, the algorithm,
+    // the payload size) followed by the raw payload bytes: the size varint
+    // doubles as the length prefix the SSH string reader consumes.
+    let header_len = ssh3_proto::compressed_data_header(1, 0).len();
+    let payload = &go_compressed[header_len..];
+    let mut channel_data_compressed = ssh3_proto::compressed_data_header(1, payload.len() as u64);
+    channel_data_compressed.extend_from_slice(payload);
+
     let mut produced: Vec<(&str, Vec<u8>)> = vec![
+        ("channel_data_compressed_deflate", channel_data_compressed),
         ("channel_header_tcp_ipv4", tcp_ipv4),
         ("channel_header_tcp_ipv6", tcp_ipv6),
         ("channel_header_udp_ipv4", udp_ipv4),
@@ -354,6 +368,7 @@ fn the_vector_file_holds_the_vectors_of_the_reference_dumper() {
         "open_confirmation_30000",
         "open_failure",
         "channel_data",
+        "channel_data_compressed_deflate",
         "channel_extended_data",
         "channel_data_header_5",
         "channel_request_exec",

@@ -13,14 +13,16 @@
 //!
 //! | Module | Contents |
 //! |---|---|
+//! | [`compress`] | the codec of the compressed channel data frames |
 //! | [`conversation`] | the conversation and the registry of its channels |
 //! | [`channel`] | a single channel and the framing of its messages |
 //! | [`queue`] | the accept queue and the datagram queue |
 //! | [`transport`] | the stream and datagram traits a transport implements |
 //!
-//! The items of the four modules are re-exported at the crate root.
+//! The items of the five modules are re-exported at the crate root.
 
 pub mod channel;
+pub mod compress;
 pub mod conversation;
 pub mod queue;
 pub mod transport;
@@ -29,6 +31,10 @@ pub use channel::{
     MAX_MAX_PACKET_SIZE, MIN_MAX_PACKET_SIZE, Ssh3AcceptedChannel, Ssh3Channel, Ssh3ChannelError,
     Ssh3ChannelInfo, Ssh3ChannelOpenFailure, Ssh3MessageOnNonConfirmedChannel,
     Ssh3SentDatagramOnNonDatagramChannel, clamp_local_max_packet_size, clamp_peer_max_packet_size,
+};
+pub use compress::{
+    ALGORITHM_DEFLATE, ALGORITHM_LZ4, ALGORITHM_NONE, ALGORITHM_ZSTD, CompressError,
+    negotiate_with_version_string, parse_version_capability,
 };
 pub use conversation::{
     Ssh3Conversation, Ssh3ConversationDatagramSender, Ssh3ConversationError, Ssh3ConversationId,

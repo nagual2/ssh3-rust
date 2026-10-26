@@ -67,6 +67,16 @@ pub const SSH_MSG_CHANNEL_SUCCESS: u64 = 99;
 /// Message type of a failed channel request.
 pub const SSH_MSG_CHANNEL_FAILURE: u64 = 100;
 
+/// Message type of a compressed channel data frame.
+///
+/// The payload of a channel data frame is compressed independently with the
+/// algorithm named by the frame itself, so plain and compressed frames share
+/// a channel in any order and a frame never desynchronizes the decoder. The
+/// number sits in the private range of RFC 4253, so it collides with nothing
+/// of the SSH2 numbering. The value matches the reference implementation
+/// (`nagual2/ssh3-go`, `message/message.go`).
+pub const SSH_MSG_CHANNEL_DATA_COMPRESSED: u64 = 192;
+
 /// Discriminator of the payload of a data message.
 ///
 /// `0` marks standard data, `1` marks standard error; other values are
@@ -275,6 +285,23 @@ impl Ssh3DataOrExtendedDataMessage {
         }
         append_ssh_bytes(out, &self.data);
     }
+}
+
+/// Returns the framing of a compressed data frame: the message type `192`,
+/// the compression algorithm and the length of the compressed payload.
+///
+/// The concatenation of the returned header and the compressed payload is
+/// byte-for-byte identical to the frame of the reference implementation
+/// (`nagual2/ssh3-go`, `message/message.go`, `CompressedDataHeader`). The
+/// payload itself is not part of [`Ssh3Message`]: the sender writes it after
+/// the header without copying it into a message, exactly like the reference
+/// implementation does on its write path.
+pub fn compressed_data_header(algorithm: u64, data_size: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    append_var_int(&mut out, SSH_MSG_CHANNEL_DATA_COMPRESSED);
+    append_var_int(&mut out, algorithm);
+    append_var_int(&mut out, data_size);
+    out
 }
 
 /// A request sent by the client on an open channel.
@@ -869,7 +896,7 @@ mod tests {
         Ssh3ForwardingRequest, Ssh3Message, Ssh3PtyRequest, Ssh3SignalRequest,
         Ssh3SubsystemRequest, Ssh3WindowChangeRequest, Ssh3X11Request,
     };
-    use crate::wire::{append_ssh_bytes, append_var_int, write_bool};
+    use crate::wire::{append_ssh_bytes, append_var_int, read_var_int, write_bool};
 
     const EXTENDED_DATA_TYPE: u64 = 10_000_000;
 
@@ -1211,5 +1238,29 @@ mod tests {
             }),
         });
         assert_eq!(parse_message(&bytes), expected);
+    }
+
+    /// The golden bytes of the compressed frame header, pinned by the
+    /// reference implementation (`nagual2/ssh3-go`,
+    /// `message/compressed_data_test.go`, `TestCompressedDataGoldenBytes`):
+    /// the message type `192` (`0x40C0`), the deflate algorithm id (`1`) and
+    /// the payload length (`42`, `0x2A`).
+    #[test]
+    fn writes_the_compressed_data_header_golden_bytes() {
+        assert_eq!(
+            super::compressed_data_header(1, 42),
+            vec![0x40, 0xC0, 0x01, 0x2A]
+        );
+    }
+
+    /// The header is self-describing: it carries the algorithm and the
+    /// compressed length, so a decoder needs no negotiation of its own
+    /// (`TestCompressedDataHeaderIsSelfDescribing` of the reference).
+    #[test]
+    fn compressed_data_header_is_self_describing() {
+        let header = super::compressed_data_header(1, 1234);
+        let mut reader = Cursor::new(&header[2..]);
+        assert_eq!(read_var_int(&mut reader).unwrap(), 1);
+        assert_eq!(read_var_int(&mut reader).unwrap(), 1234);
     }
 }

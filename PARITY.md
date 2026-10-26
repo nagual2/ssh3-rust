@@ -29,7 +29,7 @@
 | 8 | Клиентских пробелов | **27** (+2 частичных: E3, H8) |
 | 9 | Серверных пробелов | **11** (+1 частичный: M6) |
 | 10 | Только в Rust (нет аналога в Go) | **1** (A7) |
-| 11 | Протокольных пробелов (сжатие тела канала) | **6** (N1–N6) |
+| 11 | Протокольных пробелов (сжатие тела канала) | **0** (N1–N6 закрыты, `wave/t9-compression`) |
 | 12 | Оценка закрытия разрыва | **≈ 25 человеко-дней** (эшелоны 0–2) или **≈ 80** (полный паритет, включая сжатие) |
 
 Контроль суммы: 61 (совпадение) + 1 (расхождение) + 3 (частично) + 44 (пробел) + 1 (только Rust) = **110**.
@@ -51,7 +51,7 @@
 | 11 | Сервер: лимиты и таймауты | 6 | 3 | 0 | 0 | 3 | 0 |
 | 12 | Сервер: функциональность | 9 | 6 | 0 | 0 | 3 | 0 |
 | 13 | Эксплуатация: упаковка, логи, exit-коды | 6 | 4 | 0 | 0 | 2 | 0 |
-| 14 | Протокол: сжатие тела канала (B8) | 6 | 0 | 0 | 0 | 6 | 0 |
+| 14 | Протокол: сжатие тела канала (B8) | 0 | 6 | 0 | 0 | 0 | 0 |
 | | **Итого** | **110** | **61** | **1** | **3** | **44** | **1** |
 
 ---
@@ -229,14 +229,16 @@
 
 ### 2.14. Протокол — сжатие тела канала (B8)
 
+> Обновление (волна сжатия): N1–N6 закрыты в `wave/t9-compression` — кадр 192 (`ssh3-proto`), кодеки и лимит бомбы (`ssh3-core/src/compress.rs`), запись с cutoff и negotiation по version string (`ssh3-core/src/channel.rs`, `ssh3-h3/src/lib.rs`), двусторонний interop против Go (17/18 сценариев с `compress=`) и golden-вектор кадра. Формулировки строк ниже — из исходного разбора; столбец Rust обновлён.
+
 | № | Подсистема | Возможность | Go | Rust | Файлы (путь:строка) | Сложность | Зависимости |
 |---|-----------|-------------|----|------|----------------------|-----------|-------------|
-| N1 | Сжатие | Capability `compress=<список>` в строке версии (объявление и разбор) | да | нет | Go `version.go:244-246` (объявление в `GetVersionString`), `version.go:305-317` (разбор поля в `ParseVersionString`), `compress/compress.go:139-148` (`Available`), `compress/compress.go:167-179` (`ParseCapability`); Rust — **не найдено**: строка версии без поля (`ssh3-h3/src/lib.rs:19`, `ssh3-client/src/lib.rs:95`), разбора capability нет | S | N2, N3 |
-| N2 | Сжатие | Сжатый кадр тела канала (тип сообщения 192: id алгоритма + сжатая полезная нагрузка) | да | нет | Go `message/message.go:44` (`SSH_MSG_CHANNEL_DATA_COMPRESSED = 192`), `message/message.go:158-166` (`CompressedDataHeader`), `message/message.go:168-186` (`ParseCompressedDataMessage`), `message/message.go:280` (диспетчер), `channel.go:429-441` (запись сжатого кадра); Rust — **не найдено**: `ssh3-core/src/channel.rs:884-889` — незнакомый тип даёт `UnknownMessageType`, кадр 192 рвёт канал | M | N1, N3 |
-| N3 | Сжатие | Кодеки deflate / lz4 (block) / zstd (frame) и общий порядок выбора (zstd → deflate → lz4) | да | нет | Go `compress/compress.go:64-69` (id 0–3), `compress/compress.go:122-131` (имена и порядок), `compress/compress.go:185-193` (`Choose`), `compress/compress.go:245-279` (`Compress`), `compress/compress.go:315-335` (`Decompress`); Rust — **не найдено** | L | — |
-| N4 | Сжатие | Cutoff «fast levels» ZFS: кадр, не уменьшившийся, едет в открытом виде | да | нет | Go `channel.go:430` (`len(packed) < len(chunk)`), `compress/compress.go:241-244` (контракт), `compress/compress.go:266-272` (отказ кодека lz4); Rust — **не найдено** | S | N3 |
-| N5 | Сжатие | Лимит «бомбы» декодера — 16 MiB (предел пакета канала) | да | нет | Go `compress/compress.go:81` (`MaxOutput = 16 << 20`), `compress/compress.go:315-335`, `compress/compress.go:367-389` (zstd: проверка FCS); Rust — **не найдено** | S | N3 |
-| N6 | Сжатие | Сервер сжимает в ответ (кодек — из capability, объявленной клиентом) | да | нет | Go `server.go:196-201` (`CompressAlgorithm` приёма канала), `server.go:225-233` (`newServerChannel`), `conversation.go:58-65` (`compressAlgorithm`), `conversation.go:353` (входящий канал); Rust — **не найдено** | M | N1, N2, N3 |
+| N1 | Сжатие | Capability `compress=<список>` в строке версии (объявление и разбор) | да | да | Go `version.go:244-246` (объявление в `GetVersionString`), `version.go:305-317` (разбор поля в `ParseVersionString`), `compress/compress.go:139-148` (`Available`), `compress/compress.go:167-179` (`ParseCapability`); Rust — **не найдено**: строка версии без поля (`ssh3-h3/src/lib.rs:19`, `ssh3-client/src/lib.rs:95`), разбора capability нет | S; Rust: `ssh3-h3/src/lib.rs` (`SSH3_VERSION_STRING` с `compress=zstd,deflate,lz4`), `ssh3-core/src/compress.rs` (`parse_version_capability`, `negotiate_with_version_string`); | N2, N3 |
+| N2 | Сжатие | Сжатый кадр тела канала (тип сообщения 192: id алгоритма + сжатая полезная нагрузка) | да | да | Go `message/message.go:44` (`SSH_MSG_CHANNEL_DATA_COMPRESSED = 192`), `message/message.go:158-166` (`CompressedDataHeader`), `message/message.go:168-186` (`ParseCompressedDataMessage`), `message/message.go:280` (диспетчер), `channel.go:429-441` (запись сжатого кадра); Rust — **не найдено**: `ssh3-core/src/channel.rs:884-889` — незнакомый тип даёт `UnknownMessageType`, кадр 192 рвёт канал | M; Rust: `ssh3-proto/src/message.rs` (`SSH_MSG_CHANNEL_DATA_COMPRESSED`, `compressed_data_header`), `ssh3-core/src/channel.rs` (`parse_message` ветка 192, `write_data` сжатие чанка); golden `ssh3-proto/tests/data/wire_vectors.txt` (`channel_data_compressed_deflate`); | N1, N3 |
+| N3 | Сжатие | Кодеки deflate / lz4 (block) / zstd (frame) и общий порядок выбора (zstd → deflate → lz4) | да | да | Go `compress/compress.go:64-69` (id 0–3), `compress/compress.go:122-131` (имена и порядок), `compress/compress.go:185-193` (`Choose`), `compress/compress.go:245-279` (`Compress`), `compress/compress.go:315-335` (`Decompress`); Rust — **не найдено** | L; Rust: `ssh3-core/src/compress.rs` (`compress`/`decompress`, порядок `CODECS`, lz4 block `lz4_flex`, zstd one-shot `zstd::bulk` с FCS); кросс-декомпрессия Go↔Rust проверена фикстурами `compress/interop_test.go` эталона; | — |
+| N4 | Сжатие | Cutoff «fast levels» ZFS: кадр, не уменьшившийся, едет в открытом виде | да | да | Go `channel.go:430` (`len(packed) < len(chunk)`), `compress/compress.go:241-244` (контракт), `compress/compress.go:266-272` (отказ кодека lz4); Rust — **не найдено** | S; Rust: `ssh3-core/src/channel.rs` (`write_data`: кадр едет открытым, если `packed >= chunk`); | N3 |
+| N5 | Сжатие | Лимит «бомбы» декодера — 16 MiB (предел пакета канала) | да | да | Go `compress/compress.go:81` (`MaxOutput = 16 << 20`), `compress/compress.go:315-335`, `compress/compress.go:367-389` (zstd: проверка FCS); Rust — **не найдено** | S; Rust: `ssh3-core/src/compress.rs` (`MAX_OUTPUT = 16 << 20`, `TooLarge`); | N3 |
+| N6 | Сжатие | Сервер сжимает в ответ (кодек — из capability, объявленной клиентом) | да | да | Go `server.go:196-201` (`CompressAlgorithm` приёма канала), `server.go:225-233` (`newServerChannel`), `conversation.go:58-65` (`compressAlgorithm`), `conversation.go:353` (входящий канал); Rust — **не найдено** | M; Rust: `ssh3-core/src/conversation.rs` (`compression_algorithm` + `set_compression_algorithm` на conversation и каналах), `ssh3-h3/src/lib.rs` (negotiation из User-Agent клиента и Server-заголовка ответа), `ssh3-quinn/src/channel.rs` (входящие каналы наследуют кодек); | N1, N2, N3 |
 
 ---
 
