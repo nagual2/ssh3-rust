@@ -20,6 +20,11 @@ use crate::runtime::serve_endpoint;
 /// on a connection that does not complete its handshake in time.
 pub fn apply_transport_timeouts(server_config: &mut ServerConfig, config: &Ssh3ServerConfig) {
     let mut transport = quinn::TransportConfig::default();
+    // SSH3 carries its UDP forwarding over the raw QUIC datagram API: the
+    // frame size parameter announces the ability to receive them. Without
+    // it a peer that speaks only quinn (the Rust client of a proxy jump
+    // chain, a local UDP forward) cannot send a single datagram.
+    transport.datagram_receive_buffer_size(Some(65_535));
     transport.max_idle_timeout(match quinn::IdleTimeout::try_from(config.max_idle_timeout) {
         Ok(idle_timeout) => Some(idle_timeout),
         Err(_) => {

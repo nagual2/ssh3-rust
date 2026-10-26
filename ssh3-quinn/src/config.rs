@@ -82,9 +82,16 @@ pub fn server_config_with_single_cert(
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)?;
     server_crypto.alpn_protocols = vec![H3_ALPN.to_vec()];
-    Ok(ServerConfig::with_crypto(Arc::new(
-        QuicServerConfig::try_from(server_crypto)?,
-    )))
+    let mut config =
+        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
+    // SSH3 carries its UDP forwarding over the raw QUIC datagram API: the
+    // frame size parameter announces the ability to receive them. Without
+    // it a peer that speaks only quinn (the Rust client of a proxy jump
+    // chain, a local UDP forward) cannot send a single datagram.
+    let mut transport = quinn::TransportConfig::default();
+    transport.datagram_receive_buffer_size(Some(65_535));
+    config.transport = Arc::new(transport);
+    Ok(config)
 }
 
 pub fn client_config_with_roots(roots: RootCertStore) -> Result<ClientConfig, Ssh3ConfigError> {

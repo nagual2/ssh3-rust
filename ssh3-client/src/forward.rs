@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -436,14 +437,57 @@ async fn forward_udp_socket(
             }
         };
 
-        if channel
-            .send_datagram(buffer[..read].to_vec())
-            .await
-            .is_err()
-        {
+        if let Err(error) = channel.send_datagram(buffer[..read].to_vec()).await {
+            // A packet past the datagram budget of the tunnel drops the way
+            // an oversized packet drops on a UDP path: the MTU discovery of
+            // the tunneled connection never learns to exceed the budget,
+            // and the packets that fit keep flowing.
+            if matches!(
+                error,
+                ssh3_core::Ssh3ChannelError::Io(ref io_error)
+                    if io_error.kind() == io::ErrorKind::InvalidData
+            ) {
+                continue;
+            }
             return;
         }
     }
+}
+
+/// Opens a UDP forward bridge of one proxy-jump hop: a local UDP listener
+/// whose datagrams travel to `target` through the SSH3 UDP forwarding
+/// channel of the connection, and whose answers travel back.
+///
+/// This is the `ForwardUDP` of the reference implementation: the QUIC
+/// packets of the next hop of the chain are dialed against the returned
+/// local address, so they ride the datagrams of this connection. The task
+/// of the bridge runs until the connection ends; the caller keeps the
+/// returned handle alive for as long as the tunnel is needed.
+pub(crate) async fn open_udp_forward_bridge(
+    conversation: Arc<Ssh3Conversation>,
+    connection: quinn::Connection,
+    max_packet_size: u64,
+    datagrams_queue_size: usize,
+    target: SocketAddr,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), Ssh3ClientError> {
+    let socket = Arc::new(
+        UdpSocket::bind("127.0.0.1:0")
+            .await
+            .map_err(Ssh3ClientError::Io)?,
+    );
+    let local = socket.local_addr().map_err(Ssh3ClientError::Io)?;
+    let task = tokio::spawn(async move {
+        forward_udp_socket(
+            conversation.as_ref(),
+            &connection,
+            socket,
+            target,
+            max_packet_size,
+            datagrams_queue_size,
+        )
+        .await;
+    });
+    Ok((local, task))
 }
 
 #[cfg(test)]
