@@ -109,13 +109,14 @@
 
 ### 2.4. Клиент — control master
 
+> Обновление (волна control master): D1–D5 закрыты в `wave/t4-control-master` — кодек кадров (`ssh3-client/src/cm.rs`, формат байт-в-байт по `client/cm` эталона), мастер с 0600-сокетом и stale-rebind (`ssh3-client/src/control.rs`), slave и `-O check|stop|exit` с JSON-статусом, CLI `-M/-S/-O` + `-control-master/-control-path/-control-persist`, daemon через detached re-exec. Формулировки строк ниже — из исходного разбора; столбец Rust обновлён.
 | № | Подсистема | Возможность | Go | Rust | Файлы (путь:строка) | Сложность | Зависимости |
 |---|-----------|-------------|----|------|----------------------|-----------|-------------|
-| D1 | Control master | `-M` / `-control-master=no\|yes\|auto` | да | нет | Go `cmd/ssh3.go:699`, `cmd/ssh3.go:696`, `cmd/controlmaster.go`; Rust — **не найдено** | L | A9, C1 |
-| D2 | Control master | `-S` / `-control-path` (unix-сокет) | да | нет | Go `cmd/ssh3.go:700`, `cmd/ssh3.go:697`, `client/control.go:109`; Rust — **не найдено** | M | D1 |
-| D3 | Control master | `-control-persist=no\|yes\|N` | да | нет | Go `cmd/ssh3.go:698`, `cmd/ssh3.go:926` (`-o ControlPersist`), `cmd/ssh3.go:978`; Rust — **не найдено** | M | D1 |
-| D4 | Control master | `-O check\|stop\|exit` | да | нет | Go `cmd/ssh3.go:695`, `cmd/cli_flags.go:180` (`validateControlOperation`), `client/control.go:28-31` (`ControlOpCheck/Stop/Exit`), `client/control.go:68` (`RunControlOp`); Rust — **не найдено** | M | D2 |
-| D5 | Control master | Протокол кадров control-сокета (`client/cm`) | да | нет | Go `client/cm/messages.go`, `client/cm/protocol.go`, `client/cm/framing.go`; Rust — **не найдено** | M | D2 |
+| D1 | Control master | `-M` / `-control-master=no\|yes\|auto` | да | да | Go `cmd/ssh3.go:699`, `cmd/ssh3.go:696`, `cmd/controlmaster.go`; Rust: `ssh3-client/src/main.rs` (флаг `-M`, `ControlMaster` в `-o` и ssh_config, policy no/yes/auto), `ssh3-client/src/control.rs` (`serve_control_master`) | L | A9, C1 |
+| D2 | Control master | `-S` / `-control-path` (unix-сокет) | да | да | Go `cmd/ssh3.go:700`, `cmd/ssh3.go:697`, `client/control.go:109`; Rust: `ssh3-client/src/main.rs` (`-S`, `ControlPath`), `ssh3-client/src/control.rs` (`default_control_path` `~/.ssh3/cm-<user>@<host>:<port>`, `listen_control_master` 0600 + stale-rebind) | M | D1 |
+| D3 | Control master | `-control-persist=no\|yes\|N` | да | да | Go `cmd/ssh3.go:698`, `cmd/ssh3.go:926` (`-o ControlPersist`), `cmd/ssh3.go:978`; Rust: `ssh3-client/src/main.rs` (`ControlPersist` no/yes/N), `ssh3-client/src/control.rs` (idle-timeout мастера) | M | D1 |
+| D4 | Control master | `-O check\|stop\|exit` | да | да | Go `cmd/ssh3.go:695`, `cmd/cli_flags.go:180` (`validateControlOperation`), `client/control.go:28-31` (`ControlOpCheck/Stop/Exit`), `client/control.go:68` (`RunControlOp`); Rust — **не найдено** | M; Rust: `ssh3-client/src/control.rs` (`run_control_op`, JSON `MasterStatus`, отказ «predates the extension» как в Go), `ssh3-client/src/main.rs` (`-O check|stop|exit`, вывод status line); | D2 |
+| D5 | Control master | Протокол кадров control-сокета (`client/cm`) | да | да | Go `client/cm/messages.go`, `client/cm/protocol.go`, `client/cm/framing.go`; Rust: `ssh3-client/src/cm.rs` (S3CM-фрейминг `magic S3CM + version + type + u32 len`, типы 1–11 + `MSG_CONTROL_OP=12`, `hello`/`call`, 20 юнит-тестов формата) | M | D2 |
 
 ### 2.5. Клиент — proxy jump
 

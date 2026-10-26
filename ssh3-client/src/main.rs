@@ -209,6 +209,45 @@ struct Cli {
     #[arg(short = 'N')]
     no_session: bool,
 
+    /// Run as the control master: share one authenticated connection across
+    /// the invocations through the control socket (-M).
+    ///
+    /// Unix only, and not compatible with the proxy jump chain.
+    #[cfg(unix)]
+    #[arg(short = 'M')]
+    master_mode: bool,
+
+    /// The control master unix socket path (-S).
+    #[cfg(unix)]
+    #[arg(short = 'S', value_name = "PATH", value_hint = ValueHint::FilePath)]
+    control_socket: Option<PathBuf>,
+
+    /// Run one control operation against the master (-O): check, stop or
+    /// exit. check prints the status line on the standard output.
+    #[cfg(unix)]
+    #[arg(
+        short = 'O',
+        value_name = "OP",
+        conflicts_with_all = ["no_session", "transfer", "master_mode" ]
+    )]
+    control_operation: Option<String>,
+
+    /// The control master policy: no, yes or auto (-control-master).
+    #[cfg(unix)]
+    #[arg(long = "control-master", value_name = "VALUE")]
+    control_master: Option<String>,
+
+    /// The control master unix socket path (-control-path).
+    #[cfg(unix)]
+    #[arg(long = "control-path", value_name = "PATH", value_hint = ValueHint::FilePath)]
+    control_path: Option<PathBuf>,
+
+    /// How long an idle master persists: no, yes or a number of seconds
+    /// (-control-persist).
+    #[cfg(unix)]
+    #[arg(long = "control-persist", value_name = "VALUE")]
+    control_persist: Option<String>,
+
     /// Print the version string of the client and exit.
     ///
     /// The string has the format of the Go implementation: the name of the
@@ -280,6 +319,9 @@ struct OptionOverrides {
     dynamic_forwards: Vec<Ssh3DynamicForwardSpec>,
     proxy_jump: Option<String>,
     server_alive_interval: Option<Duration>,
+    control_master: Option<String>,
+    control_path: Option<String>,
+    control_persist: Option<String>,
 }
 
 /// Parses the `-o KEY=VALUE` options.
@@ -353,6 +395,19 @@ fn parse_options(options: &[String]) -> Result<OptionOverrides, clap::Error> {
                     parse_timeout(&value)
                         .map_err(|err| cli_error(ErrorKind::ValueValidation, err))?,
                 );
+            }
+            "controlmaster" => {
+                parse_control_master_policy(&value)
+                    .map_err(|err| cli_error(ErrorKind::ValueValidation, err))?;
+                overrides.control_master = Some(value);
+            }
+            "controlpath" => {
+                overrides.control_path = Some(value);
+            }
+            "controlpersist" => {
+                parse_control_persist(&value)
+                    .map_err(|err| cli_error(ErrorKind::ValueValidation, err))?;
+                overrides.control_persist = Some(value);
             }
             other => {
                 return Err(cli_error(
@@ -441,6 +496,9 @@ struct SshConfigValues {
     forward_agent: bool,
     server_alive_interval: Option<Duration>,
     proxy_jump: Option<String>,
+    control_master: Option<String>,
+    control_path: Option<String>,
+    control_persist: Option<String>,
 }
 
 /// Loads the ssh_config file of the user.
@@ -485,6 +543,9 @@ fn ssh_config_values(
         forward_agent: false,
         server_alive_interval: None,
         proxy_jump: None,
+        control_master: None,
+        control_path: None,
+        control_persist: None,
     };
     let Some(host) = host else {
         return Ok(values);
@@ -537,6 +598,18 @@ fn ssh_config_values(
         validate_proxy_jump(&value).map_err(|err| cli_error(ErrorKind::ValueValidation, err))?;
         values.proxy_jump = Some(value);
     }
+    if let Some(value) = get("ControlMaster") {
+        parse_control_master_policy(&value)
+            .map_err(|err| cli_error(ErrorKind::ValueValidation, err))?;
+        values.control_master = Some(value);
+    }
+    if let Some(value) = get("ControlPath") {
+        values.control_path = Some(value);
+    }
+    if let Some(value) = get("ControlPersist") {
+        parse_control_persist(&value).map_err(|err| cli_error(ErrorKind::ValueValidation, err))?;
+        values.control_persist = Some(value);
+    }
     Ok(values)
 }
 
@@ -551,6 +624,74 @@ struct ClientPlan {
     no_session: bool,
     /// The transfer the mode asks for; `None` for the other modes.
     transfer: Option<Ssh3TransferPlan>,
+    /// The resolved control master settings of the command line.
+    control: ControlSettings,
+}
+
+/// The policy of the `-M`/`ControlMaster` flag: whether the invocations
+/// share one authenticated connection through a control socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlMasterPolicy {
+    /// Every invocation opens its own connection.
+    No,
+    /// The invocation reuses a live master or starts one.
+    Yes,
+    /// The invocation reuses a live master but never starts one.
+    Auto,
+}
+
+/// The `-control-persist` semantics: how long a master stays alive without
+/// any slave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlPersist {
+    /// No master at all (the `no` value).
+    No,
+    /// The master persists until the exit op or a shutdown.
+    Forever,
+    /// The master idles out after that many seconds.
+    Seconds(u64),
+}
+
+/// The resolved control master settings of the command line.
+#[derive(Debug)]
+struct ControlSettings {
+    /// The `-O <op>` operation; `None` for a session invocation.
+    operation: Option<String>,
+    /// The reuse policy.
+    master: ControlMasterPolicy,
+    /// The unix socket path of the master.
+    path: PathBuf,
+    /// The persistence of a started master.
+    persist: ControlPersist,
+}
+
+/// Parses the value of the `-control-master` keyword: `no`, `yes` or `auto`.
+fn parse_control_master_policy(value: &str) -> Result<ControlMasterPolicy, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "no" => Ok(ControlMasterPolicy::No),
+        "yes" => Ok(ControlMasterPolicy::Yes),
+        "auto" => Ok(ControlMasterPolicy::Auto),
+        other => Err(format!(
+            "invalid ControlMaster value {other:?}: want no, yes or auto"
+        )),
+    }
+}
+
+/// Parses the value of the `-control-persist` keyword: `no`, `yes` or a
+/// number of seconds.
+fn parse_control_persist(value: &str) -> Result<ControlPersist, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "no" | "" => Ok(ControlPersist::No),
+        "yes" => Ok(ControlPersist::Forever),
+        other => other
+            .parse::<u64>()
+            .map(ControlPersist::Seconds)
+            .map_err(|_| {
+                format!(
+                    "invalid ControlPersist value {other:?}: want no, yes or a number of seconds"
+                )
+            }),
+    }
 }
 
 /// Builds the plan of the command line.
@@ -575,7 +716,7 @@ fn build_config(cli: Cli) -> Result<ClientPlan, clap::Error> {
             format!("invalid URL {url:?}: {err}"),
         )
     })?;
-    let config = build_connection_config(cli, url, None)?;
+    let (config, control) = build_connection_config(cli, url, None)?;
     let request = if command.is_empty() {
         Ssh3SessionRequest::Shell
     } else {
@@ -586,6 +727,7 @@ fn build_config(cli: Cli) -> Result<ClientPlan, clap::Error> {
         request,
         no_session,
         transfer: None,
+        control,
     })
 }
 
@@ -677,13 +819,14 @@ fn build_transfer_config(cli: Cli) -> Result<ClientPlan, clap::Error> {
         )
     })?;
     // the user of the operand wins over the user of the command line
-    let config = build_connection_config(cli, url, Some(target.username))?;
+    let (config, control) = build_connection_config(cli, url, Some(target.username))?;
 
     Ok(ClientPlan {
         config,
         request: Ssh3SessionRequest::Shell,
         no_session: false,
         transfer: Some(transfer),
+        control,
     })
 }
 
@@ -696,7 +839,11 @@ fn build_connection_config(
     cli: Cli,
     url: Uri,
     username: Option<String>,
-) -> Result<Ssh3ClientConfig, clap::Error> {
+) -> Result<(Ssh3ClientConfig, ControlSettings), clap::Error> {
+    // The url fields move into the config: the control settings resolve
+    // from the copies taken here.
+    let url_host = url.host().map(str::to_string);
+    let url_port = url.port_u16().unwrap_or(443);
     let mut config = Ssh3ClientConfig::new(url);
     config.server_name = cli.server_name;
     config.username = username.or(cli.user);
@@ -897,7 +1044,295 @@ fn build_connection_config(
             "-N does not accept a remote command",
         ));
     }
-    Ok(config)
+
+    let control = resolve_control_settings(ControlInputs {
+        master_flag: cli.master_mode,
+        operation: cli.control_operation.clone(),
+        flag_master: cli.control_master.clone(),
+        flag_socket: cli.control_socket.clone(),
+        flag_path: cli.control_path.clone(),
+        flag_persist: cli.control_persist.clone(),
+        option_master: overrides.control_master.clone(),
+        option_path: overrides.control_path.clone(),
+        option_persist: overrides.control_persist.clone(),
+        config_master: ssh_config_values.control_master.clone(),
+        config_path: ssh_config_values.control_path.clone(),
+        config_persist: ssh_config_values.control_persist.clone(),
+        proxy_jump_set: config.proxy_jump.is_some(),
+        user: config.username.clone(),
+        host: url_host,
+        port: url_port,
+    })?;
+    Ok((config, control))
+}
+
+/// The raw control master inputs of the command line, taken before the
+/// values move into the configuration: the flags win over the `-o` options,
+/// which win over the ssh_config keywords.
+struct ControlInputs {
+    master_flag: bool,
+    operation: Option<String>,
+    flag_master: Option<String>,
+    flag_socket: Option<PathBuf>,
+    flag_path: Option<PathBuf>,
+    flag_persist: Option<String>,
+    option_master: Option<String>,
+    option_path: Option<String>,
+    option_persist: Option<String>,
+    config_master: Option<String>,
+    config_path: Option<String>,
+    config_persist: Option<String>,
+    proxy_jump_set: bool,
+    user: Option<String>,
+    host: Option<String>,
+    port: u16,
+}
+
+/// Resolves the control master settings of the command line: the flags win
+/// over the `-o` options, which win over the ssh_config keywords; the socket
+/// path falls back to the default one of the target.
+#[allow(unused_variables)]
+fn resolve_control_settings(inputs: ControlInputs) -> Result<ControlSettings, clap::Error> {
+    #[cfg(not(unix))]
+    {
+        // The control master is a unix-socket feature: a Windows invocation
+        // that asks for it is refused before a packet is sent.
+        let asked = inputs.operation.is_some()
+            || inputs.flag_master.is_some()
+            || inputs.flag_socket.is_some()
+            || inputs.flag_path.is_some()
+            || inputs.flag_persist.is_some()
+            || inputs.option_master.is_some()
+            || inputs.option_path.is_some()
+            || inputs.option_persist.is_some()
+            || inputs.config_master.is_some()
+            || inputs.config_path.is_some()
+            || inputs.config_persist.is_some();
+        if asked {
+            return Err(cli_error(
+                ErrorKind::ValueValidation,
+                "the control master is not available on Windows: the control socket is a unix domain socket",
+            ));
+        }
+        return Ok(ControlSettings {
+            operation: None,
+            master: ControlMasterPolicy::No,
+            path: PathBuf::new(),
+            persist: ControlPersist::No,
+        });
+    }
+    #[cfg(unix)]
+    {
+        // The -M flag is the `yes` form of the policy, like in the reference.
+        let master = if inputs.master_flag {
+            ControlMasterPolicy::Yes
+        } else if let Some(value) = inputs
+            .flag_master
+            .as_deref()
+            .or(inputs.option_master.as_deref())
+            .or(inputs.config_master.as_deref())
+        {
+            parse_control_master_policy(value)
+                .map_err(|err| cli_error(ErrorKind::ValueValidation, err))?
+        } else {
+            ControlMasterPolicy::No
+        };
+        // The reuse of a master through the proxy jump chain is not
+        // supported, the way the reference refuses it (the chain dials the
+        // hops itself, so there is nothing a control socket could share).
+        if master != ControlMasterPolicy::No && inputs.proxy_jump_set {
+            return Err(cli_error(
+                ErrorKind::ArgumentConflict,
+                "the control master is not compatible with the proxy jump chain",
+            ));
+        }
+        let path = inputs
+            .flag_socket
+            .or(inputs.flag_path)
+            .or_else(|| inputs.option_path.map(PathBuf::from))
+            .or_else(|| inputs.config_path.map(PathBuf::from))
+            .unwrap_or_else(|| {
+                ssh3_client::control::default_control_path(
+                    inputs.user.as_deref().unwrap_or(""),
+                    inputs.host.as_deref().unwrap_or(""),
+                    inputs.port,
+                )
+            });
+        let persist = match inputs
+            .flag_persist
+            .as_deref()
+            .or(inputs.option_persist.as_deref())
+            .or(inputs.config_persist.as_deref())
+        {
+            Some(value) => parse_control_persist(value)
+                .map_err(|err| cli_error(ErrorKind::ValueValidation, err))?,
+            None => ControlPersist::No,
+        };
+        Ok(ControlSettings {
+            operation: inputs.operation,
+            master,
+            path,
+            persist,
+        })
+    }
+}
+
+/// The control master modes of the CLI: the `-O <op>` operations, the daemon
+/// mode the master re-executes itself into (`SSH3_CM_DAEMON=1`), and the
+/// reuse-or-start policy of the `-M`/`ControlMaster` family. Returns `None`
+/// when the invocation goes the direct way, like the reference falls back to
+/// a fresh connection.
+#[cfg(unix)]
+async fn run_control_mode(plan: &ClientPlan) -> Option<ExitCode> {
+    use ssh3_client::control;
+    use std::time::Duration;
+
+    // The daemon mode: this process is the detached master the CLI
+    // re-executed; it serves the socket until a slave sends EXIT or STOP or
+    // the idle timeout fires, and never runs a session of its own.
+    if std::env::var("SSH3_CM_DAEMON").as_deref() == Ok("1") {
+        let client = match control::connect_shared(&plan.config).await {
+            Ok(client) => client,
+            Err(err) => {
+                eprintln!("ssh3-rust-client control master: {err}");
+                return Some(ExitCode::from(255));
+            }
+        };
+        let listener = match control::listen_control_master(&plan.control.path) {
+            Ok(listener) => listener,
+            Err(err) => {
+                eprintln!("ssh3-rust-client control master: {err}");
+                return Some(ExitCode::from(255));
+            }
+        };
+        let idle = match plan.control.persist {
+            ControlPersist::Seconds(seconds) => Some(Duration::from_secs(seconds)),
+            _ => None,
+        };
+        return Some(
+            match control::serve_control_master(client, plan.control.path.clone(), listener, idle)
+                .await
+            {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("ssh3-rust-client control master: {err}");
+                    ExitCode::from(255)
+                }
+            },
+        );
+    }
+
+    // The `-O <op>` operations run against a live master and end the process.
+    if let Some(op) = plan.control.operation.as_deref() {
+        return Some(
+            match control::run_control_op(&plan.control.path, op).await {
+                Ok(Some(status)) => {
+                    println!("{}", status.status_line());
+                    ExitCode::SUCCESS
+                }
+                Ok(None) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("ssh3-rust-client control operation {op:?} failed: {err}");
+                    ExitCode::from(255)
+                }
+            },
+        );
+    }
+
+    match plan.control.master {
+        ControlMasterPolicy::No => None,
+        ControlMasterPolicy::Auto => {
+            // Only the reuse: a live master carries the session, a missing
+            // one sends the invocation the direct way.
+            if control::ping_master(&plan.control.path).await {
+                Some(run_slave(plan).await)
+            } else {
+                None
+            }
+        }
+        ControlMasterPolicy::Yes => {
+            if !control::ping_master(&plan.control.path).await {
+                if let Err(err) = start_detached_master() {
+                    eprintln!("ssh3-rust-client: could not start the control master: {err}");
+                    return None;
+                }
+                if !wait_for_master(&plan.control.path).await {
+                    eprintln!(
+                        "ssh3-rust-client: the control master did not come up, connecting directly"
+                    );
+                    return None;
+                }
+            }
+            Some(run_slave(plan).await)
+        }
+    }
+}
+
+/// Runs one session through the control master of the plan: the command line
+/// of the request goes over the control socket, a shell request without a
+/// local terminal stays a plain pipe session.
+#[cfg(unix)]
+async fn run_slave(plan: &ClientPlan) -> ExitCode {
+    use ssh3_client::control;
+    let (command, wants_pty) = match &plan.request {
+        Ssh3SessionRequest::Shell => (Vec::new(), true),
+        Ssh3SessionRequest::Exec(command) => (vec![command.clone()], false),
+    };
+    let pty = if wants_pty {
+        control::local_console_pty(plan.config.term_type.as_deref())
+    } else {
+        None
+    };
+    match control::run_slave_session(
+        &plan.control.path,
+        command,
+        pty,
+        plan.config.forward_agent,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        tokio::io::stderr(),
+    )
+    .await
+    {
+        Ok(code) => ExitCode::from(code as u8),
+        Err(err) => {
+            eprintln!("ssh3-rust-client control-master session: {err}");
+            ExitCode::from(255)
+        }
+    }
+}
+
+/// Re-executes this binary detached with the daemon marker, the way
+/// `startDetached` does in the reference: no terminal, own process group.
+#[cfg(unix)]
+fn start_detached_master() -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let current = std::env::current_exe()?;
+    let child = std::process::Command::new(current)
+        .args(std::env::args_os().skip(1))
+        .env("SSH3_CM_DAEMON", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    drop(child);
+    Ok(())
+}
+
+/// Polls the control socket until a master answers or the deadline passes,
+/// the same 2 ms poll step the reference waits with.
+#[cfg(unix)]
+async fn wait_for_master(path: &Path) -> bool {
+    use ssh3_client::control;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !control::ping_master(path).await {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    true
 }
 
 #[tokio::main]
@@ -943,6 +1378,14 @@ async fn main() -> ExitCode {
                 ExitCode::from(255)
             }
         };
+    }
+
+    // The control master wiring: the control op, the daemon mode the master
+    // re-executes itself into, and the slave sessions. Unix only; the plan
+    // of a Windows build never carries control settings.
+    #[cfg(unix)]
+    if let Some(status) = run_control_mode(&plan).await {
+        return status;
     }
 
     if plan.no_session {
@@ -1576,5 +2019,92 @@ mod tests {
         assert_eq!(fields[2], "ssh3-rust");
         assert!(fields[3].starts_with("0."));
         assert_eq!(fields[4], "experimental_spec_version=alpha-00");
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::{Cli, ControlMasterPolicy, ControlPersist, build_config};
+    use clap::{Parser, error::ErrorKind};
+
+    fn plan_of(arguments: &[&str]) -> super::ClientPlan {
+        let mut argv = vec!["ssh3-rust-client"];
+        argv.extend_from_slice(arguments);
+        argv.push("https://localhost:4433/ssh3-term");
+        let cli = Cli::try_parse_from(argv).unwrap();
+        build_config(cli).unwrap()
+    }
+
+    fn plan_error(arguments: &[&str]) -> ErrorKind {
+        let mut argv = vec!["ssh3-rust-client"];
+        argv.extend_from_slice(arguments);
+        argv.push("https://localhost:4433/ssh3-term");
+        let cli = Cli::try_parse_from(argv).unwrap();
+        build_config(cli).unwrap_err().kind()
+    }
+
+    /// The `-M` flag is the `yes` form of the policy and builds the default
+    /// control path of the target.
+    #[cfg(unix)]
+    #[test]
+    fn a_master_mode_builds_the_default_control_path() {
+        let plan = plan_of(&["-M", "--user", "tester"]);
+        assert_eq!(plan.control.master, ControlMasterPolicy::Yes);
+        assert!(plan.control.operation.is_none());
+        let path = plan.control.path.display().to_string();
+        assert!(
+            path.contains(".ssh3"),
+            "the default path lives in ~/.ssh3: {path}"
+        );
+        assert!(path.contains("cm-tester@localhost:4433"), "{path}");
+    }
+
+    /// The `-o ControlMaster=` keyword follows the flag precedence: the flag
+    /// of the command line wins over the `-o` option.
+    #[cfg(unix)]
+    #[test]
+    fn the_control_master_keyword_loses_to_the_flag() {
+        let plan = plan_of(&["-M", "-o", "ControlMaster=auto"]);
+        assert_eq!(plan.control.master, ControlMasterPolicy::Yes);
+        let plan = plan_of(&["-o", "ControlMaster=auto"]);
+        assert_eq!(plan.control.master, ControlMasterPolicy::Auto);
+        let plan = plan_of(&["-o", "ControlPersist=30"]);
+        assert_eq!(plan.control.persist, ControlPersist::Seconds(30));
+        let plan = plan_of(&["-o", "ControlPersist=yes"]);
+        assert_eq!(plan.control.persist, ControlPersist::Forever);
+    }
+
+    /// The reuse of a master through the proxy jump chain is refused, the
+    /// way the reference refuses it.
+    #[cfg(unix)]
+    #[test]
+    fn a_master_mode_with_a_proxy_jump_is_refused() {
+        assert_eq!(
+            plan_error(&["-M", "-o", "ProxyJump=jump.example.org"]),
+            ErrorKind::ArgumentConflict
+        );
+    }
+
+    /// A broken value of the control keywords costs a process start and
+    /// nothing else.
+    #[test]
+    fn an_invalid_control_value_is_refused() {
+        assert_eq!(
+            plan_error(&["-o", "ControlMaster=maybe"]),
+            ErrorKind::ValueValidation
+        );
+        assert_eq!(
+            plan_error(&["-o", "ControlPersist=maybe"]),
+            ErrorKind::ValueValidation
+        );
+    }
+
+    /// The `-O` operation and the `-M` mode are mutually exclusive, like the
+    /// clap group enforces, and `-O` lands in the plan.
+    #[cfg(unix)]
+    #[test]
+    fn a_control_operation_lands_in_the_plan() {
+        let plan = plan_of(&["-O", "check", "--user", "tester"]);
+        assert_eq!(plan.control.operation.as_deref(), Some("check"));
     }
 }

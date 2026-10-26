@@ -2263,6 +2263,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "serde_json",
  "sha2",
  "signature",
  "ssh-key",
