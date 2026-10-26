@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -436,11 +437,18 @@ async fn forward_udp_socket(
             }
         };
 
-        if channel
-            .send_datagram(buffer[..read].to_vec())
-            .await
-            .is_err()
-        {
+        if let Err(error) = channel.send_datagram(buffer[..read].to_vec()).await {
+            // A packet past the datagram budget of the tunnel drops the way
+            // an oversized packet drops on a UDP path: the MTU discovery of
+            // the tunneled connection never learns to exceed the budget,
+            // and the packets that fit keep flowing.
+            if matches!(
+                error,
+                ssh3_core::Ssh3ChannelError::Io(ref io_error)
+                    if io_error.kind() == io::ErrorKind::InvalidData
+            ) {
+                continue;
+            }
             return;
         }
     }

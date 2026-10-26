@@ -737,10 +737,30 @@ struct ActiveClient {
     server_header: Option<String>,
     max_packet_size: u64,
     default_datagrams_queue_size: usize,
+    /// The clients of the proxy jump hops the connection rides.
+    ///
+    /// Their connections stay open while the destination connection lives,
+    /// and they close together with it in [`ActiveClient::shutdown`]: the
+    /// hop servers must not keep the dead hops of a chain until their idle
+    /// timeout.
+    tunnel_hops: Vec<ActiveClient>,
 }
 
 impl ActiveClient {
-    async fn shutdown(self) {
+    async fn shutdown(mut self) {
+        // The destination connection closes first: its CONNECTION_CLOSE
+        // rides the still live bridge of the hops. Closing the hops first
+        // would kill the transport under it, and the destination server
+        // would wait for its idle timeout instead of the close. A hop never
+        // carries a chain of its own, so the hop shutdown never recurses.
+        let hops = std::mem::take(&mut self.tunnel_hops);
+        self.shutdown_leaf().await;
+        for hop in hops {
+            hop.shutdown_leaf().await;
+        }
+    }
+
+    async fn shutdown_leaf(self) {
         self.connection.close(0u32.into(), b"done");
         let _ = self.driver_task.await;
         let _ = self.incoming_channels_task.await;
@@ -1441,6 +1461,7 @@ fn activate_client(
         server_header: response_server_header(&established.response).map(str::to_owned),
         max_packet_size: config.max_packet_size,
         default_datagrams_queue_size: config.default_datagrams_queue_size,
+        tunnel_hops: Vec::new(),
     }
 }
 
@@ -1625,7 +1646,7 @@ async fn connect_client(config: &Ssh3ClientConfig) -> Result<ActiveClient, Ssh3C
 async fn build_proxy_jump_tunnel(
     config: &Ssh3ClientConfig,
     chain: &str,
-) -> Result<(SocketAddr, u16), Ssh3ClientError> {
+) -> Result<(SocketAddr, u16, Vec<ActiveClient>), Ssh3ClientError> {
     let hops = crate::proxy_jump::parse_jump_hops(chain).map_err(|reason| {
         Ssh3ClientError::Io(io::Error::new(io::ErrorKind::InvalidInput, reason))
     })?;
@@ -1642,6 +1663,7 @@ async fn build_proxy_jump_tunnel(
         path.insert(0, '/');
     }
     let mut tunnel_remote: Option<SocketAddr> = None;
+    let mut hop_clients = Vec::new();
     for (index, hop) in hops.iter().enumerate() {
         // Each hop carries its own user@host[:port]; the authentication and
         // the trust of the client apply to every hop alike.
@@ -1663,15 +1685,11 @@ async fn build_proxy_jump_tunnel(
         }
         hop_config.server_name = Some(hop.host.clone());
 
-        // The hop rides the full client stack: the datagram pump and the
-        // channel router of an active connection carry the answers of the
-        // UDP forwarding channel, exactly like the reference client rides
-        // its own machinery on every hop. The first hop is dialed directly,
-        // the rest ride the bridge of the hop before them. A deeper chain
-        // would need the initial packet size of each level (the datagram
-        // budget of the level below); the destination side of this tunnel
-        // already applies the budget of the whole chain.
-        let _packet_size =
+        // Each level of the chain rides the datagrams of the level below
+        // it: the packet size of the level is announced to the hop (see the
+        // tunneled packet ceiling in the connect path) and the hop keeps
+        // its own packets inside the budget of the level before it.
+        let hop_packet_size =
             crate::proxy_jump::tunneled_packet_size(outer, index).map_err(|reason| {
                 Ssh3ClientError::Io(io::Error::new(io::ErrorKind::InvalidInput, reason))
             })?;
@@ -1688,17 +1706,16 @@ async fn build_proxy_jump_tunnel(
             &hop_config,
             default_browser_opener,
             Some(remote),
-            None,
+            Some(hop_packet_size),
         )
         .await?;
         let conversation = hop_client.conversation.clone();
         let connection = hop_client.connection.clone();
-        // The active client stays alive for the lifetime of the tunnel: it
-        // holds the datagram pump and the channel router of the hop.
-        tokio::spawn(async move {
-            std::future::pending::<()>().await;
-            drop(hop_client);
-        });
+        // The active client lives for the lifetime of the tunnel: it holds
+        // the datagram pump and the channel router of the hop, and it closes
+        // the hop connection together with the destination one (see the
+        // tunnel hops of the active client).
+        hop_clients.push(hop_client);
 
         // Each hop tunnels UDP towards the next one; the last hop tunnels
         // towards the final destination.
@@ -1730,7 +1747,7 @@ async fn build_proxy_jump_tunnel(
     }
     let last = tunnel_remote
         .ok_or_else(|| Ssh3ClientError::Io(io::Error::other("the chain carried no hop")))?;
-    Ok((last, destination_packet_size))
+    Ok((last, destination_packet_size, hop_clients))
 }
 
 async fn connect_client_with_browser_opener(
@@ -1742,20 +1759,22 @@ async fn connect_client_with_browser_opener(
     // chain also shrinks the packets of the destination: they travel as
     // datagrams of every level, so they must leave room for the framing of
     // each of them.
-    let (remote_override, tunneled_packet_size) = match config.proxy_jump.as_deref() {
-        None => (None, None),
+    let (remote_override, tunneled_packet_size, tunnel_hops) = match config.proxy_jump.as_deref() {
+        None => (None, None, Vec::new()),
         Some(chain) => {
-            let (bridge, packet_size) = build_proxy_jump_tunnel(config, chain).await?;
-            (Some(bridge), Some(packet_size))
+            let (bridge, packet_size, hops) = build_proxy_jump_tunnel(config, chain).await?;
+            (Some(bridge), Some(packet_size), hops)
         }
     };
-    connect_direct_with_browser_opener(
+    let mut client = connect_direct_with_browser_opener(
         config,
         browser_opener,
         remote_override,
         tunneled_packet_size,
     )
-    .await
+    .await?;
+    client.tunnel_hops = tunnel_hops;
+    Ok(client)
 }
 
 /// Dials one connection without any chain of its own: the destination of a
@@ -1773,7 +1792,22 @@ async fn connect_direct_with_browser_opener(
         None => resolve_target(&config.target_url).await?.remote_addr,
     };
     let bind_addr = client_bind_addr(remote_addr);
-    let mut endpoint = Endpoint::client(bind_addr).map_err(Ssh3ClientError::Endpoint)?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| Ssh3ClientError::Io(io::Error::other("no async runtime found for quinn")))?;
+    let mut endpoint_config = quinn::EndpointConfig::default();
+    // The packet size of a tunneled connection is announced to the peer
+    // too: the `max_udp_payload_size` transport parameter is the ceiling of
+    // the peer's MTU discovery, so the server of a tunneled connection
+    // keeps its packets inside the datagram budget of the outer levels
+    // instead of growing past it and starving the tunnel.
+    if let Some(size) = tunneled_packet_size {
+        endpoint_config
+            .max_udp_payload_size(size)
+            .map_err(|error| Ssh3ClientError::Io(io::Error::other(error)))?;
+    }
+    let socket = std::net::UdpSocket::bind(bind_addr).map_err(Ssh3ClientError::Io)?;
+    let mut endpoint = quinn::Endpoint::new(endpoint_config, None, socket, runtime)
+        .map_err(Ssh3ClientError::Io)?;
     let (quinn_config, host_key_state) = client_quinn_config(config, tunneled_packet_size)?;
     endpoint.set_default_client_config(quinn_config);
 
@@ -1974,10 +2008,12 @@ fn client_quinn_config(
     // A tunneled connection of a proxy jump chain keeps the initial packet
     // size of its level: its packets travel as datagrams of the outer
     // levels, and the MTU discovery would push them past their datagram
-    // budget. The size is the floor and the ceiling at once.
+    // budget. The size is the floor and the ceiling at once, so the
+    // discovery has nothing to learn here.
     if let Some(size) = tunneled_packet_size {
         transport.initial_mtu(size);
         transport.min_mtu(size);
+        transport.mtu_discovery_config(None);
     }
     client_config.transport_config(Arc::new(transport));
 
@@ -4774,16 +4810,10 @@ mod tests {
     /// hop, its QUIC packets riding the UDP forwarding channel of the hop
     /// connection. The one-connection servers prove the paths: the hop
     /// server sees exactly the hop connection, the destination server sees
-    /// exactly the tunneled one.
-    ///
-    /// Ignored until the SSH3 conversation of the tunneled destination
-    /// completes end to end: the bare QUIC handshake of the tunnel passes
-    /// (see the bridge scenario above), the CONNECT exchange on top of it
-    /// still stalls. The wire path (datagrams on, budget shrink) is in
-    /// place; the remaining gap is confined to this scenario.
+    /// exactly the tunneled one, and the SSH3 conversation of the
+    /// destination completes end to end over the tunnel.
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "the CONNECT exchange over the tunnel stalls; the QUIC path itself is proven"]
     async fn exec_round_trips_through_a_proxy_jump_hop() {
         // The hop server and the destination server share the certificate
         // bundle of the test, so one trust strategy covers both.

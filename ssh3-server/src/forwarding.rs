@@ -286,7 +286,18 @@ pub(crate) async fn handle_udp_forwarding(
                     _ = connection.closed() => return Ok::<(), Ssh3ServerError>(()),
                     result = socket.recv(&mut buf) => {
                         let n = result?;
-                        channel.send_datagram(buf[..n].to_vec()).await?;
+                        match channel.send_datagram(buf[..n].to_vec()).await {
+                            Ok(()) => {}
+                            // A packet past the datagram budget of the
+                            // channel drops the way an oversized packet
+                            // drops on a UDP path: the MTU discovery of the
+                            // tunneled peer never learns to exceed the
+                            // budget, and the packets that fit keep
+                            // flowing.
+                            Err(ssh3_core::Ssh3ChannelError::Io(error))
+                                if error.kind() == io::ErrorKind::InvalidData => {}
+                            Err(error) => return Err(error.into()),
+                        }
                     }
                 }
             }
