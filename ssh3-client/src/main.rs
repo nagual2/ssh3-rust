@@ -899,6 +899,27 @@ fn build_connection_config(
         (Some(_), None) | (None, Some(_)) => unreachable!("clap enforces OIDC requirements"),
     };
     let overrides = parse_options(&cli.option)?;
+    // The control master fields of the CLI are snapshot before the values
+    // of the command line move into the configuration: the unix-only struct
+    // fields are gone by the time the control settings resolve.
+    #[cfg(unix)]
+    let control_cli = (
+        cli.master_mode,
+        cli.control_operation.clone(),
+        cli.control_master.clone(),
+        cli.control_socket.clone(),
+        cli.control_path.clone(),
+        cli.control_persist.clone(),
+    );
+    #[cfg(not(unix))]
+    let control_cli = (
+        false,
+        None::<String>,
+        None::<String>,
+        None::<std::path::PathBuf>,
+        None::<std::path::PathBuf>,
+        None::<String>,
+    );
 
     // The configuration file of the user. The `-F` option names another
     // file; the default one is read when it is not given.
@@ -1079,25 +1100,71 @@ fn build_connection_config(
         ));
     }
 
-    let control = resolve_control_settings(ControlInputs {
-        master_flag: cli.master_mode,
-        operation: cli.control_operation.clone(),
-        flag_master: cli.control_master.clone(),
-        flag_socket: cli.control_socket.clone(),
-        flag_path: cli.control_path.clone(),
-        flag_persist: cli.control_persist.clone(),
-        option_master: overrides.control_master.clone(),
-        option_path: overrides.control_path.clone(),
-        option_persist: overrides.control_persist.clone(),
-        config_master: ssh_config_values.control_master.clone(),
-        config_path: ssh_config_values.control_path.clone(),
-        config_persist: ssh_config_values.control_persist.clone(),
-        proxy_jump_set: config.proxy_jump.is_some(),
-        user: config.username.clone(),
-        host: url_host,
-        port: url_port,
-    })?;
+    let control = resolve_control_settings(control_inputs_of(
+        control_cli,
+        (
+            overrides.control_master.clone(),
+            overrides.control_path.clone(),
+            overrides.control_persist.clone(),
+        ),
+        (
+            ssh_config_values.control_master.clone(),
+            ssh_config_values.control_path.clone(),
+            ssh_config_values.control_persist.clone(),
+        ),
+        config.proxy_jump.is_some(),
+        config.username.clone(),
+        url_host,
+        url_port,
+    ))?;
     Ok((config, control))
+}
+
+/// The raw control master inputs of the command line.
+///
+/// The `Cli` fields of the control master are unix-only (the struct hides
+/// them on Windows), so the flags are read only on unix; the non-unix build
+/// carries the empty inputs, and `resolve_control_settings` refuses any
+/// control-master request through the keyword channels on its own.
+/// The control master fields of the CLI, snapshotted before the values of
+/// the command line move into the configuration.
+type CliControlFields = (
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<std::path::PathBuf>,
+    Option<std::path::PathBuf>,
+    Option<String>,
+);
+
+fn control_inputs_of(
+    cli_fields: CliControlFields,
+    option_copies: (Option<String>, Option<String>, Option<String>),
+    config_copies: (Option<String>, Option<String>, Option<String>),
+    proxy_jump_set: bool,
+    user: Option<String>,
+    host: Option<String>,
+    port: u16,
+) -> ControlInputs {
+    let (master_flag, operation, flag_master, flag_socket, flag_path, flag_persist) = cli_fields;
+    ControlInputs {
+        master_flag,
+        operation,
+        flag_master,
+        flag_socket,
+        flag_path,
+        flag_persist,
+        option_master: option_copies.0,
+        option_path: option_copies.1,
+        option_persist: option_copies.2,
+        config_master: config_copies.0,
+        config_path: config_copies.1,
+        config_persist: config_copies.2,
+        proxy_jump_set,
+        user,
+        host,
+        port,
+    }
 }
 
 /// The raw control master inputs of the command line, taken before the
