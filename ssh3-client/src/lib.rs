@@ -1662,17 +1662,25 @@ async fn build_proxy_jump_tunnel(
     if !path.starts_with('/') {
         path.insert(0, '/');
     }
+    let destination_query = config.target_url.query().map(str::to_string);
     let mut tunnel_remote: Option<SocketAddr> = None;
     let mut hop_clients = Vec::new();
     for (index, hop) in hops.iter().enumerate() {
         // Each hop carries its own user@host[:port]; the authentication and
         // the trust of the client apply to every hop alike.
-        let hop_url = format!(
+        let mut hop_url = format!(
             "https://{}{}/{}",
             hop.host,
             hop.port.map(|port| format!(":{port}")).unwrap_or_default(),
             path.trim_start_matches('/')
         );
+        // The hop inherits the query of the destination: the username of the
+        // destination URL travels in the query, and the server of every hop
+        // resolves the same user for its own authentication.
+        if let Some(query) = &destination_query {
+            hop_url.push('?');
+            hop_url.push_str(query);
+        }
         let mut hop_config = config.clone();
         hop_config.target_url = hop_url.parse::<http::Uri>().map_err(|err| {
             Ssh3ClientError::Io(io::Error::other(format!(
@@ -3064,6 +3072,35 @@ mod tests {
         key_path: &Path,
         log_path: &Path,
     ) -> Option<tokio::process::Child> {
+        spawn_go_cli_server_with_args(
+            bind_addr,
+            username,
+            home_dir,
+            cert_path,
+            key_path,
+            log_path,
+            &[],
+        )
+        .await
+    }
+
+    /// Spawns the Go CLI server with extra command line arguments.
+    ///
+    /// The jump scenarios need them: the datagram budget of a hop server
+    /// has to carry the packets of the tunneled connection, so every hop of
+    /// a chain runs with `-initial-packet-size` of its own level (the
+    /// documented deployment posture of the reference: "the jump host runs
+    /// with the same size").
+    #[cfg(unix)]
+    pub(crate) async fn spawn_go_cli_server_with_args(
+        bind_addr: &str,
+        username: &str,
+        home_dir: &Path,
+        cert_path: &Path,
+        key_path: &Path,
+        log_path: &Path,
+        extra_arguments: &[&str],
+    ) -> Option<tokio::process::Child> {
         let binaries = go_cli_binaries()?;
         fs::create_dir_all(home_dir).unwrap();
         let stderr_log = fs::File::create(log_path).unwrap();
@@ -3071,6 +3108,7 @@ mod tests {
         let mut child = TokioCommand::new(&binaries.server)
             .arg("-bind")
             .arg(bind_addr)
+            .args(extra_arguments)
             .arg("-v")
             .arg("-url-path")
             .arg("/ssh3-term")
@@ -4589,6 +4627,7 @@ mod tests {
         "spawn_go_interop_server",
         "run_go_interop_client",
         "spawn_go_cli_server",
+        "spawn_go_cli_server_with_args",
         "spawn_go_cli_tcp_forwarder",
         "spawn_go_cli_udp_forwarder",
         "run_go_cli_client",
@@ -4943,6 +4982,179 @@ mod tests {
 
         let _ = server.kill().await;
         let _ = server.wait().await;
+    }
+
+    /// The proxy jump of the client against the real Go servers: the
+    /// destination is dialed through one Go hop, its QUIC packets riding the
+    /// UDP forwarding channel of the hop connection
+    /// (`ForwardUDP` of the reference). The hops run the real CLI server,
+    /// whose QUIC transport announces the datagram support the tunnel needs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rust_client_exec_capture_round_trips_through_one_real_go_server() {
+        let _guard = lock_go_binary_tests();
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let tempdir = TempDir::new().unwrap();
+        let home_dir = tempdir.path().join("home");
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::write(
+            home_dir.join(".ssh").join("authorized_keys"),
+            fs::read(&fixture.authorized_identities_path).unwrap(),
+        )
+        .unwrap();
+        let hop_port = reserve_udp_port();
+        let Some(mut hop_server) = spawn_go_cli_server_with_args(
+            &format!("127.0.0.1:{hop_port}"),
+            &fixture.username,
+            &home_dir,
+            &tempdir.path().join("cert-hop.pem"),
+            &tempdir.path().join("key-hop.pem"),
+            &home_dir.join("go-server-hop.log"),
+            &["-initial-packet-size", "1248"],
+        )
+        .await
+        else {
+            skip_interop("rust_client_exec_capture_round_trips_through_one_real_go_server");
+            return;
+        };
+        let destination_port = reserve_udp_port();
+        let Some(mut destination_server) = spawn_go_cli_server(
+            &format!("127.0.0.1:{destination_port}"),
+            &fixture.username,
+            &home_dir,
+            &tempdir.path().join("cert-destination.pem"),
+            &tempdir.path().join("key-destination.pem"),
+            &home_dir.join("go-server-destination.log"),
+        )
+        .await
+        else {
+            skip_interop("rust_client_exec_capture_round_trips_through_one_real_go_server");
+            return;
+        };
+
+        let mut config = Ssh3ClientConfig::new(
+            format!(
+                "https://127.0.0.1:{destination_port}/ssh3-term?user={}",
+                fixture.username
+            )
+            .parse()
+            .unwrap(),
+        );
+        config.trust = Ssh3TrustStrategy::Insecure;
+        config.username = Some(fixture.username.clone());
+        config.identity_file = Some(fixture.private_key_path.clone());
+        config.proxy_jump = Some(format!("127.0.0.1:{hop_port}"));
+
+        let session = tokio::time::timeout(
+            Duration::from_secs(40),
+            run_exec_capture(&config, "printf 'hello through the go hop\\n'"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(session.exit_status, 0);
+        assert_eq!(session.stdout, b"hello through the go hop\n".to_vec());
+
+        let _ = hop_server.kill().await;
+        let _ = hop_server.wait().await;
+        let _ = destination_server.kill().await;
+        let _ = destination_server.wait().await;
+    }
+
+    /// The two-hop chain of the proxy jump against the real Go servers: the
+    /// destination is dialed through two Go hops (`-J hop1,hop2`), the
+    /// packets of every level ride the UDP forwarding channel of the level
+    /// before it, and the datagram budget of each level shrinks by the
+    /// overhead of the level above it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rust_client_exec_capture_round_trips_through_two_real_go_servers() {
+        let _guard = lock_go_binary_tests();
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let tempdir = TempDir::new().unwrap();
+        let home_dir = tempdir.path().join("home");
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::write(
+            home_dir.join(".ssh").join("authorized_keys"),
+            fs::read(&fixture.authorized_identities_path).unwrap(),
+        )
+        .unwrap();
+        let hop1_port = reserve_udp_port();
+        let Some(mut hop1_server) = spawn_go_cli_server_with_args(
+            &format!("127.0.0.1:{hop1_port}"),
+            &fixture.username,
+            &home_dir,
+            &tempdir.path().join("cert-hop1.pem"),
+            &tempdir.path().join("key-hop1.pem"),
+            &home_dir.join("go-server-hop1.log"),
+            &["-initial-packet-size", "1296"],
+        )
+        .await
+        else {
+            skip_interop("rust_client_exec_capture_round_trips_through_two_real_go_servers");
+            return;
+        };
+        let hop2_port = reserve_udp_port();
+        let Some(mut hop2_server) = spawn_go_cli_server_with_args(
+            &format!("127.0.0.1:{hop2_port}"),
+            &fixture.username,
+            &home_dir,
+            &tempdir.path().join("cert-hop2.pem"),
+            &tempdir.path().join("key-hop2.pem"),
+            &home_dir.join("go-server-hop2.log"),
+            &["-initial-packet-size", "1248"],
+        )
+        .await
+        else {
+            skip_interop("rust_client_exec_capture_round_trips_through_two_real_go_servers");
+            return;
+        };
+        let destination_port = reserve_udp_port();
+        let Some(mut destination_server) = spawn_go_cli_server(
+            &format!("127.0.0.1:{destination_port}"),
+            &fixture.username,
+            &home_dir,
+            &tempdir.path().join("cert-destination.pem"),
+            &tempdir.path().join("key-destination.pem"),
+            &home_dir.join("go-server-destination.log"),
+        )
+        .await
+        else {
+            skip_interop("rust_client_exec_capture_round_trips_through_two_real_go_servers");
+            return;
+        };
+
+        let mut config = Ssh3ClientConfig::new(
+            format!(
+                "https://127.0.0.1:{destination_port}/ssh3-term?user={}",
+                fixture.username
+            )
+            .parse()
+            .unwrap(),
+        );
+        config.trust = Ssh3TrustStrategy::Insecure;
+        config.username = Some(fixture.username.clone());
+        config.identity_file = Some(fixture.private_key_path.clone());
+        config.proxy_jump = Some(format!("127.0.0.1:{hop1_port},127.0.0.1:{hop2_port}"));
+
+        let session = tokio::time::timeout(
+            Duration::from_secs(40),
+            run_exec_capture(&config, "printf 'hello through two go hops\\n'"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(session.exit_status, 0);
+        assert_eq!(session.stdout, b"hello through two go hops\n".to_vec());
+
+        let _ = hop1_server.kill().await;
+        let _ = hop1_server.wait().await;
+        let _ = hop2_server.kill().await;
+        let _ = hop2_server.wait().await;
+        let _ = destination_server.kill().await;
+        let _ = destination_server.wait().await;
     }
 
     #[cfg(unix)]

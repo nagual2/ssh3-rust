@@ -292,12 +292,12 @@ and the Rust workspace does not attempt to replicate it:
 | Direct TCP/UDP forwarding | yes | yes (runtime and CLI) |
 | Reverse forwarding (`-R`) | yes | yes (runtime and CLI) |
 | Dynamic SOCKS forwarding (`-D`) | yes | yes (runtime and CLI) |
-| Proxy jump | yes | no |
-| Control master / connection multiplexing | yes | no |
-| File transfer (`-transfer`) | yes | no |
-| Secret URL path | yes | no |
+| Proxy jump (`-J`, the UDP tunnel of the chain) | yes | yes |
+| Control master / connection multiplexing | yes | yes |
+| File transfer (`-transfer`) | yes | yes |
+| Secret URL path | yes | yes |
 | Public certificate automation (Let's Encrypt) | yes | no (self-signed only) |
-| Release packaging (`.deb`, systemd unit, goreleaser) | yes | no |
+| Release packaging (`.deb`, systemd unit, release pipeline) | yes | yes (no goreleaser) |
 
 ## Known limitations and audit findings
 

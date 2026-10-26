@@ -293,12 +293,12 @@ ausgelieferte Produkt, und der Rust-Workspace versucht nicht, sie nachzubauen:
 | Direkte TCP/UDP-Weiterleitung | ja | ja (Runtime und CLI) |
 | Reverse-Forwarding (`-R`) | ja | ja (Laufzeit und CLI) |
 | Dynamisches SOCKS-Forwarding (`-D`) | ja | ja (Laufzeit und CLI) |
-| Proxy-Jump | ja | nein |
-| Control Master / Verbindungs-Multiplexing | ja | nein |
-| Dateiübertragung (`-transfer`) | ja | nein |
-| Geheimer URL-Pfad | ja | nein |
+| Proxy-Jump (`-J`, der UDP-Tunnel der Kette) | ja | ja |
+| Control Master / Verbindungs-Multiplexing | ja | ja |
+| Dateiübertragung (`-transfer`) | ja | ja |
+| Geheimer URL-Pfad | ja | ja |
 | Automatisierung öffentlicher Zertifikate (Let's Encrypt) | ja | nein (nur selbstsigniert) |
-| Release-Verpackung (`.deb`, systemd-Unit, goreleaser) | ja | nein |
+| Release-Verpackung (`.deb`, systemd-Unit, Release-Pipeline) | ja | ja (ohne goreleaser) |
 
 ## Bekannte Einschränkungen und Audit-Fundstellen
 
