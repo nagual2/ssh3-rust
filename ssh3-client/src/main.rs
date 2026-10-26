@@ -409,6 +409,7 @@ fn parse_options(options: &[String]) -> Result<OptionOverrides, clap::Error> {
                 parse_control_persist(&value)
                     .map_err(|err| cli_error(ErrorKind::ValueValidation, err))?;
                 overrides.control_persist = Some(value);
+            }
             "verifyhostkeydns" => {
                 overrides.verify_host_key_dns = Some(
                     ssh3_client::sshfp::VerifyHostKeyDns::parse(&value)
@@ -617,6 +618,7 @@ fn ssh_config_values(
     if let Some(value) = get("ControlPersist") {
         parse_control_persist(&value).map_err(|err| cli_error(ErrorKind::ValueValidation, err))?;
         values.control_persist = Some(value);
+    }
     if let Some(value) = get("VerifyHostKeyDNS") {
         // The value is checked right away: a typo must cost a process start
         // and nothing else.
@@ -2060,12 +2062,6 @@ mod control_tests {
     use clap::{Parser, error::ErrorKind};
 
     fn plan_of(arguments: &[&str]) -> super::ClientPlan {
-mod sshfp_cli_tests {
-    use super::{Cli, build_config};
-    use clap::Parser;
-    use ssh3_client::sshfp::VerifyHostKeyDnsMode;
-
-    fn config_of(arguments: &[&str]) -> ssh3_client::Ssh3ClientConfig {
         let mut argv = vec!["ssh3-rust-client"];
         argv.extend_from_slice(arguments);
         argv.push("https://localhost:4433/ssh3-term");
@@ -2144,6 +2140,20 @@ mod sshfp_cli_tests {
     fn a_control_operation_lands_in_the_plan() {
         let plan = plan_of(&["-O", "check", "--user", "tester"]);
         assert_eq!(plan.control.operation.as_deref(), Some("check"));
+    }
+}
+
+#[cfg(test)]
+mod sshfp_cli_tests {
+    use super::{Cli, build_config};
+    use clap::Parser;
+    use ssh3_client::sshfp::VerifyHostKeyDnsMode;
+
+    fn config_of(arguments: &[&str]) -> ssh3_client::Ssh3ClientConfig {
+        let mut argv = vec!["ssh3-rust-client"];
+        argv.extend_from_slice(arguments);
+        argv.push("https://localhost:4433/ssh3-term");
+        let cli = Cli::try_parse_from(argv).unwrap();
         build_config(cli).unwrap().config
     }
 

@@ -1730,7 +1730,9 @@ fn normalize_dns_server(server: &str) -> Option<SocketAddr> {
     format!("{server}:53").parse().ok()
 }
 
-pub(crate) async fn connect_client(config: &Ssh3ClientConfig) -> Result<ActiveClient, Ssh3ClientError> {
+pub(crate) async fn connect_client(
+    config: &Ssh3ClientConfig,
+) -> Result<ActiveClient, Ssh3ClientError> {
     connect_client_with_browser_opener(config, default_browser_opener).await
 }
 
