@@ -670,6 +670,7 @@ enum ControlPersist {
 
 /// The resolved control master settings of the command line.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct ControlSettings {
     /// The `-O <op>` operation; `None` for a session invocation.
     operation: Option<String>,
@@ -1170,6 +1171,7 @@ fn control_inputs_of(
 /// The raw control master inputs of the command line, taken before the
 /// values move into the configuration: the flags win over the `-o` options,
 /// which win over the ssh_config keywords.
+#[allow(dead_code)]
 struct ControlInputs {
     master_flag: bool,
     operation: Option<String>,
@@ -1215,12 +1217,12 @@ fn resolve_control_settings(inputs: ControlInputs) -> Result<ControlSettings, cl
                 "the control master is not available on Windows: the control socket is a unix domain socket",
             ));
         }
-        return Ok(ControlSettings {
+        Ok(ControlSettings {
             operation: None,
             master: ControlMasterPolicy::No,
             path: PathBuf::new(),
             persist: ControlPersist::No,
-        });
+        })
     }
     #[cfg(unix)]
     {
@@ -2123,7 +2125,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod control_tests {
     use super::{Cli, ControlMasterPolicy, ControlPersist, build_config};
     use clap::{Parser, error::ErrorKind};
