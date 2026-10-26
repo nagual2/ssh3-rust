@@ -641,6 +641,10 @@ struct ClientPlan {
     /// The transfer the mode asks for; `None` for the other modes.
     transfer: Option<Ssh3TransferPlan>,
     /// The resolved control master settings of the command line.
+    ///
+    /// Read by the unix control modes only; the Windows build carries it
+    /// unresolved by design.
+    #[allow(dead_code)]
     control: ControlSettings,
 }
 
