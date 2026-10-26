@@ -24,6 +24,27 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # A vulnerability in the dependency graph blocks the build (default level).
 # Only the accepted risks are listed here. Everything else has to be fixed.
 ignore = [
+    # ACCEPTED RISK - crypto-bigint timing variability (RUSTSEC-2026-0387).
+    #
+    # The advisory has no fixed release reachable from this graph: the fix
+    # lives in the 0.6 line of `crypto-bigint`, and `ecdsa` (0.16) still
+    # depends on 0.5. The crate is pulled in transitively by `ssh-key`
+    # (feature `p256`) through `p256` -> `ecdsa` -> `elliptic-curve`.
+    #
+    # Why the risk is acceptable here:
+    #   * The affected operations are constant-time primitives of the
+    #     big-integer arithmetic (Montgomery multiplication, inversion).
+    #     This workspace uses them only for P-256 signing (client) and
+    #     signature verification (server) over already-public or
+    #     locally-held keys, never as a decryption oracle on attacker-fed
+    #     secrets.
+    #   * The SSH3 threat model is forged authentication by an untrusted
+    #     peer; a timing side channel on local signing primitives is not
+    #     reachable from it the way a decryption oracle is.
+    #   * The Rust implementation is not the shipped product (the Go
+    #     implementation is), so the exposure is limited to the tree until
+    #     the `ecdsa` stack moves to `crypto-bigint` 0.6.
+    "RUSTSEC-2026-0387",
     # ACCEPTED RISK - rsa / Marvin attack (RUSTSEC-2023-0071, CVE-2023-49092).
     #
     # The advisory has no fixed release: it covers every published version of
