@@ -45,6 +45,38 @@ ignore = [
     #     implementation is), so the exposure is limited to the tree until
     #     the `ecdsa` stack moves to `crypto-bigint` 0.6.
     "RUSTSEC-2026-0387",
+    # ACCEPTED RISK - the zstd stack (RUSTSEC-2026-0391, -0395..-0406).
+    #
+    # The advisories cover `zstd` 0.13.3 and `zstd-safe` 7.3.0, the newest
+    # published releases: no fixed version is reachable from this graph, so
+    # no `cargo update` can clear them. The stack is pulled in by `ssh3-core`
+    # for the channel-body compression of the Go fork (deflate/lz4/zstd).
+    #
+    # Why the risk is acceptable here:
+    #   * The affected paths are the streaming decoder edge cases (legacy
+    #     frames, `DCtx::try_clone`, multithreaded context resets, an
+    #     out-of-range `InBuffer::pos`). The workspace uses the one-shot
+    #     decompressor with an explicit frame content size and the bomb
+    #     limit, never the streaming context API of the advisories.
+    #   * A malicious peer can only feed its own compressed channel body
+    #     back into the decoder that negotiated it; the 16 MiB bomb limit
+    #     and the frame size cap bound the damage of every advisory class.
+    #   * The Rust implementation is not the shipped product (the Go
+    #     implementation is), so the exposure is limited to the tree until
+    #     the `zstd` line publishes the fixes.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0395",
+    "RUSTSEC-2026-0396",
+    "RUSTSEC-2026-0397",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0399",
+    "RUSTSEC-2026-0400",
+    "RUSTSEC-2026-0401",
+    "RUSTSEC-2026-0402",
+    "RUSTSEC-2026-0403",
+    "RUSTSEC-2026-0404",
+    "RUSTSEC-2026-0405",
+    "RUSTSEC-2026-0406",
     # ACCEPTED RISK - rsa / Marvin attack (RUSTSEC-2023-0071, CVE-2023-49092).
     #
     # The advisory has no fixed release: it covers every published version of

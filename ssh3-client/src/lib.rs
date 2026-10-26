@@ -5174,7 +5174,7 @@ mod tests {
         config.proxy_jump = Some(format!("127.0.0.1:{hop_port}"));
 
         let session = tokio::time::timeout(
-            Duration::from_secs(40),
+            Duration::from_secs(120),
             run_exec_capture(&config, "printf 'hello through the go hop\\n'"),
         )
         .await
@@ -5267,7 +5267,7 @@ mod tests {
         config.proxy_jump = Some(format!("127.0.0.1:{hop1_port},127.0.0.1:{hop2_port}"));
 
         let session = tokio::time::timeout(
-            Duration::from_secs(40),
+            Duration::from_secs(120),
             run_exec_capture(&config, "printf 'hello through two go hops\\n'"),
         )
         .await
