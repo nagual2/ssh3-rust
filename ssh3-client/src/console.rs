@@ -65,7 +65,7 @@ pub struct LocalTerminal {
     /// The metadata of the console.
     pub info: LocalTerminalInfo,
     /// The platform specific handle of the console.
-    pub platform: PlatformTerminal,
+    pub(crate) platform: PlatformTerminal,
 }
 
 /// The handle of the raw mode guard of the local console.

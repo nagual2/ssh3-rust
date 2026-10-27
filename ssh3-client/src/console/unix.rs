@@ -19,9 +19,9 @@ use crate::{Ssh3ClientError, send_signal_request, send_window_change_request};
 
 /// The platform specific handle of the local console.
 #[derive(Clone, Copy)]
-pub(crate) struct PlatformTerminal {
+pub struct PlatformTerminal {
     /// The file descriptor of the standard input.
-    fd: RawFd,
+    pub fd: RawFd,
 }
 
 /// The guard of the raw mode of the local console.

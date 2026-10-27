@@ -15,7 +15,7 @@ use crate::console::{LocalTerminal, RawModeGuardHandle};
 
 /// The platform specific handle of the local console.
 #[derive(Clone, Copy)]
-pub(crate) struct PlatformTerminal;
+pub struct PlatformTerminal;
 
 /// The guard of the raw mode of the local console.
 pub(crate) struct RawModeGuard;

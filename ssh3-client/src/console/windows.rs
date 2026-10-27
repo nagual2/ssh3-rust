@@ -126,7 +126,7 @@ unsafe extern "system" {
 
 /// The platform specific handle of the local console.
 #[derive(Clone, Copy)]
-pub(crate) struct PlatformTerminal {
+pub struct PlatformTerminal {
     /// The handle of the console input.
     input: ConsoleHandle,
     /// Tells whether the geometry of the console can be queried.
@@ -356,6 +356,29 @@ pub(crate) fn spawn_resize_forwarder(
     channel: Arc<Ssh3Channel>,
     terminal: PlatformTerminal,
 ) -> JoinHandle<()> {
+    spawn_resize_forwarder_with(
+        terminal,
+        Arc::new(move |size| {
+            let channel = channel.clone();
+            tokio::spawn(async move {
+                if send_window_change_request(channel.as_ref(), size)
+                    .await
+                    .is_err()
+                {
+                    // The channel died: the session is over anyway, and the
+                    // caller owns the lifetime of the watcher.
+                }
+            });
+        }),
+    )
+}
+
+/// The sink of the resize watcher without a session channel: the control
+/// master slave relays the new size to the master over the control socket.
+pub(crate) fn spawn_resize_forwarder_with(
+    terminal: PlatformTerminal,
+    on_resize: Arc<dyn Fn(TerminalSize) + Send + Sync>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         if !terminal.size_available {
             return;
@@ -381,12 +404,7 @@ pub(crate) fn spawn_resize_forwarder(
                 continue;
             }
             last = Some(current);
-            if send_window_change_request(channel.as_ref(), size)
-                .await
-                .is_err()
-            {
-                return;
-            }
+            on_resize(size);
         }
     })
 }
@@ -465,6 +483,29 @@ pub(crate) fn spawn_signal_forwarders(
     channel: Arc<Ssh3Channel>,
     interactive: bool,
 ) -> Vec<JoinHandle<()>> {
+    spawn_signal_forwarders_with(
+        interactive,
+        Arc::new(move |signal_name| {
+            let channel = channel.clone();
+            tokio::spawn(async move {
+                if send_signal_request(channel.as_ref(), signal_name)
+                    .await
+                    .is_err()
+                {
+                    // The channel died: the session is over anyway.
+                }
+            });
+        }),
+    )
+}
+
+/// The sink of the console ctrl events without a session channel: the
+/// control master slave relays the interrupts to the master over the
+/// control socket.
+pub(crate) fn spawn_signal_forwarders_with(
+    interactive: bool,
+    on_signal: Arc<dyn Fn(&'static str) + Send + Sync>,
+) -> Vec<JoinHandle<()>> {
     if !interactive {
         return Vec::new();
     }
@@ -488,12 +529,7 @@ pub(crate) fn spawn_signal_forwarders(
                 CtrlEvent::Interrupt => "INT",
                 CtrlEvent::Terminate => "TERM",
             };
-            if send_signal_request(channel.as_ref(), signal_name)
-                .await
-                .is_err()
-            {
-                break;
-            }
+            on_signal(signal_name);
         }
 
         // The handler of the console is removed when the last forwarder of

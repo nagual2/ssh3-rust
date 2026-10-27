@@ -870,6 +870,7 @@ async fn run_master_bridge(
 /// attaches first, then the full-duplex io stream), the way
 /// `RunSlaveSession` of the reference runs one session through the master.
 /// The returned code is the remote exit status (255 for transport failures).
+#[allow(clippy::too_many_arguments)] // the session surface: socket, request, console, streams
 pub async fn run_slave_session<R, W1, W2>(
     control_path: &Path,
     command: Vec<String>,
@@ -919,7 +920,7 @@ where
             }
         };
         let control_for_resize = clone_control_stream(&control)?;
-        let terminal_for_resize = terminal.platform.clone();
+        let terminal_for_resize = terminal.platform;
         watchers.push(crate::spawn_resize_forwarder_with(
             terminal_for_resize,
             Arc::new(move |size| {
@@ -1066,7 +1067,7 @@ fn clone_control_stream(stream: &UnixStream) -> Result<UnixStream, ControlMaster
         return Err(ControlMasterError::Io(io::Error::last_os_error()));
     }
     let std_stream = unsafe { StdUnixStream::from_raw_fd(cloned_fd) };
-    std_stream.set_nonblocking(true).map_err(io::Error::from)?;
+    std_stream.set_nonblocking(true)?;
     tokio::net::UnixStream::from_std(std_stream)
         .map_err(|err| ControlMasterError::Protocol(format!("could not wrap the socket: {err}")))
 }
