@@ -2990,6 +2990,36 @@ mod tests {
         true
     }
 
+    /// Patches the wait-order race of the reference interop server.
+    ///
+    /// `internal/interop/go_server` of the reference calls `cmd.Wait`
+    /// before joining the output pumps. os/exec closes the pipe readers
+    /// when `Wait` returns, so the pump that loses the race reads
+    /// "file already closed" instead of EOF and the exec skips the exit
+    /// status — the client then waits forever. The fix rides the Go fork
+    /// locally; until it publishes, the harness applies the same change
+    /// to the checked-out reference, so the scenario verifies the
+    /// protocol rather than the reference's exec lifecycle. A reference
+    /// that already carries the fix does not match the pattern and stays
+    /// untouched.
+    #[cfg(unix)]
+    fn patch_go_reference_wait_order_race(go_root: &Path) {
+        let source = go_root.join("internal/interop/go_server/main.go");
+        let Ok(content) = fs::read_to_string(&source) else {
+            return;
+        };
+        let broken = "\texitStatus := 1\n\twaitErr := cmd.Wait()\n\tif waitErr == nil {\n\t\tif status := cmd.ProcessState.ExitCode(); status >= 0 {\n\t\t\texitStatus = status\n\t\t}\n\t} else if exitErr, ok := waitErr.(*exec.ExitError); ok {\n\t\tif status := exitErr.ExitCode(); status >= 0 {\n\t\t\texitStatus = status\n\t\t}\n\t} else {\n\t\treturn waitErr\n\t}\n\n\tif err := <-stdoutDone; err != nil {\n\t\treturn err\n\t}\n\tif err := <-stderrDone; err != nil {\n\t\treturn err\n\t}\n";
+        let fixed = "\t// All pipe readers have drained: only now is Wait safe. os/exec\n\t// closes the pipe readers when Wait returns, so calling it earlier\n\t// races the output pumps: the losing pump reads \"file already\n\t// closed\" instead of EOF, and the exec then skips the exit status.\n\t// The product server carries the same posture.\n\tstdoutErr := <-stdoutDone\n\tstderrErr := <-stderrDone\n\n\texitStatus := 1\n\twaitErr := cmd.Wait()\n\tif waitErr == nil {\n\t\tif status := cmd.ProcessState.ExitCode(); status >= 0 {\n\t\t\texitStatus = status\n\t\t}\n\t} else if exitErr, ok := waitErr.(*exec.ExitError); ok {\n\t\tif status := exitErr.ExitCode(); status >= 0 {\n\t\t\texitStatus = status\n\t\t}\n\t} else {\n\t\treturn waitErr\n\t}\n\n\tif stdoutErr != nil {\n\t\treturn stdoutErr\n\t}\n\tif stderrErr != nil {\n\t\treturn stderrErr\n\t}\n";
+        if !content.contains(broken) {
+            return;
+        }
+        if fs::write(&source, content.replace(broken, fixed)).is_ok() {
+            eprintln!(
+                "ssh3-rust-client tests: patched the reference interop server wait-order race (the fix rides the Go fork, awaiting publication)"
+            );
+        }
+    }
+
     #[cfg(unix)]
     fn go_interop_binaries() -> Option<&'static GoInteropBinaries> {
         static BINARIES: OnceLock<Option<GoInteropBinaries>> = OnceLock::new();
@@ -3003,6 +3033,7 @@ mod tests {
                 if !build_go_binary(&go_root, "./internal/interop/go_client", &client) {
                     return None;
                 }
+                patch_go_reference_wait_order_race(&go_root);
                 if !build_go_binary(&go_root, "./internal/interop/go_server", &server) {
                     return None;
                 }
