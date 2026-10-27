@@ -9,7 +9,9 @@
 
 Обновление 2026-10-22 (вторая волна): в Go после волны CLI-паритета (`a5bea1c`) пришли **сжатие тела канала** (`f1d0415`, `93594d3`, `e6994e3`, `ce072f4`), **начальный размер QUIC-пакета 1200** (`d12b25e`, `30ccdfe`, `1a4ee04`) и **бюджет датаграмм цепочки proxy-jump** (`897161f`). Все ссылки на Go пересчитаны по текущему `ce072f4` (ранее таблица опиралась на `a5bea1c` — строки `cmd/ssh3.go` сдвинулись на +12, `cmd/ssh3-server.go` на +1, `channel.go` на +6). Одновременно пересмотрены утверждения о Rust: крейты ушли вперёд (PTY-политика, escape-последовательности, `-L`/`-R`/`-D` в CLI, политики форвардинга, DoS-guard, lockout, секретный URL-путь, клампы размера кадра, `128+signum`, упаковка, SFTP-сервер) — соответствующие строки переведены из «пробел» в «да».
 
-**Сноска †** — утверждение о Rust верно только для **незакоммиченного рабочего дерева** репозитория (`ssh3-server/src/sftp.rs`, `ssh3-server/src/sftp_child.rs`, `ssh3-server/src/sftp_stream.rs`, `packaging/build-deb.sh`, `packaging/ssh3-rust-server.control.in`, `packaging/ssh3-rust-server.postinst`, `packaging/ssh3-rust-server.prerm`, `ssh3-client/src/console.rs`, `ssh3-client/src/console/`); последний коммит — `108409b`.
+Обновление 2026-10-27 (аудит T8): сводка и строки пересчитаны по живому коду `main` @ `ee286fd` (`docs/audit-2026-10-27.md`). Синхронизированы с кодом строки F1–F5 (SFTP-клиент волны T3.2), I5 (root-gate, M2), I9 (клиентская SSHFP-проверка волны T5.2), A10 (влита в `main`); устаревшая сноска о незакоммиченном дереве снята. Пробел паритета: **21 из 110** (было 44).
+
+**Сноска †** — все упомянутые файлы закоммичены в `main` (актуальный HEAD `ee286fd`); незакоммиченного рабочего дерева больше нет.
 
 Обозначения: **Сложность** — S (≤1 чел.-день), M (2-5), L (>5). **Go**/**Rust** — `да` / `нет` / `частично`.
 
@@ -21,38 +23,38 @@
 |---|---------|----------|
 | 1 | Всего строк возможностей в таблице паритета | **110** |
 | 2 | Реализовано в Go | **109** |
-| 3 | Реализовано в Rust | **65** (61 полностью + 1 с расхождением + 3 частично) |
-| 4 | Полное совпадение (обе стороны, поведение эквивалентно) | **61** |
-| 5 | Расхождение по семантике при наличии в обеих | **1** полное (I4) + **3** частичных (E3, G10, H8) |
-| 6 | **Пробелов** (в Go есть, в Rust нет) | **44** |
-| 7 | Пробелов по безопасности (High/Critical) | **4** (A10, I5, I8, I9) |
-| 8 | Клиентских пробелов | **27** (+2 частичных: E3, H8) |
-| 9 | Серверных пробелов | **11** (+1 частичный: M6) |
+| 3 | Реализовано в Rust | **88** (86 полностью + 1 с расхождением + 1 частично) |
+| 4 | Полное совпадение (обе стороны, поведение эквивалентно) | **86** |
+| 5 | Расхождение по семантике при наличии в обеих | **1** (I4: парольный вход по умолчанию; Rust — в безопасную сторону) |
+| 6 | **Пробелов** (в Go есть, в Rust нет) | **21** |
+| 7 | Пробелов по безопасности (High/Critical) | **1** (I8; A10, I5, I9 закрыты — аудит 2026-10-27) |
+| 8 | Клиентских пробелов | **12** (A6, B10, B14, C5, F6, G11, G12, H1–H4, H9) |
+| 9 | Серверных пробелов | **9** (I8, K1–K3, L3, L4, L9, M4, M5) |
 | 10 | Только в Rust (нет аналога в Go) | **1** (A7) |
 | 11 | Протокольных пробелов (сжатие тела канала) | **0** (N1–N6 закрыты, `wave/t9-compression`) |
-| 12 | Оценка закрытия разрыва | **≈ 25 человеко-дней** (эшелоны 0–2) или **≈ 80** (полный паритет, включая сжатие) |
+| 12 | Оценка закрытия разрыва | **≈ 8–10 человеко-дней** (дешёвый эшелон: I8, K1–K3, H1–H4, H8, H9, A6, C5, G11) или **≈ 35** (полный паритет, включая ACME) |
 
-Контроль суммы: 61 (совпадение) + 1 (расхождение) + 3 (частично) + 44 (пробел) + 1 (только Rust) = **110**.
+Контроль суммы: 86 (совпадение) + 1 (расхождение) + 1 (частично) + 21 (пробел) + 1 (только Rust) = **110**.
 
 Разбивка по подсистемам:
 
 | № | Подсистема | Строк | Совпадает | Расхождение | Частично | Пробел | Только Rust |
 |---|-----------|-------|-----------|-------------|----------|--------|-------------|
-| 1 | Клиент: аутентификация | 11 | 8 | 0 | 0 | 2 | 1 |
+| 1 | Клиент: аутентификация | 11 | 9 | 0 | 0 | 1 | 1 |
 | 2 | Клиент: сессия / PTY / сигналы | 15 | 13 | 0 | 0 | 2 | 0 |
 | 3 | Клиент: форвардинг | 8 | 7 | 0 | 0 | 1 | 0 |
-| 4 | Клиент: control master | 5 | 0 | 0 | 0 | 5 | 0 |
+| 4 | Клиент: control master | 5 | 5 | 0 | 0 | 0 | 0 |
 | 5 | Клиент: proxy jump | 4 | 4 | 0 | 0 | 0 | 0 |
-| 6 | Клиент: передача файлов | 6 | 0 | 0 | 0 | 6 | 0 |
+| 6 | Клиент: передача файлов | 6 | 5 | 0 | 0 | 1 | 0 |
 | 7 | Клиент: конфигурация / `-o` / ssh_config | 12 | 10 | 0 | 0 | 2 | 0 |
 | 8 | Клиент: прочие флаги и сервисы | 9 | 3 | 0 | 1 | 5 | 0 |
-| 9 | Сервер: аутентификация и политики | 9 | 5 | 1 | 0 | 3 | 0 |
+| 9 | Сервер: аутентификация и политики | 9 | 7 | 1 | 0 | 1 | 0 |
 | 10 | Сервер: политики форвардинга | 4 | 4 | 0 | 0 | 0 | 0 |
 | 11 | Сервер: лимиты и таймауты | 6 | 3 | 0 | 0 | 3 | 0 |
 | 12 | Сервер: функциональность | 9 | 6 | 0 | 0 | 3 | 0 |
 | 13 | Эксплуатация: упаковка, логи, exit-коды | 6 | 4 | 0 | 0 | 2 | 0 |
-| 14 | Протокол: сжатие тела канала (B8) | 0 | 6 | 0 | 0 | 0 | 0 |
-| | **Итого** | **110** | **61** | **1** | **3** | **44** | **1** |
+| 14 | Протокол: сжатие тела канала (B8) | 6 | 6 | 0 | 0 | 0 | 0 |
+| | **Итого** | **110** | **86** | **1** | **1** | **21** | **1** |
 
 ---
 
@@ -71,7 +73,7 @@
 | A7 | Аутентификация | Bearer-токен из файла/argv (pre-computed) | нет | да | Go — CLI-флага нет, только внутренний `rawBearerTokenIdentity` (`client_auth.go:242`); Rust `ssh3-client/src/main.rs:92-101` (`--bearer-token`, `--bearer-token-file`) | — | — |
 | A8 | Аутентификация | `known_hosts` (чтение/проверка/дописывание) | да | да | Go `known_hosts.go:18` (`Knows`), `known_hosts.go:91` (`ParseKnownHosts`), `known_hosts.go:128` (`AppendKnownHost`); Rust `ssh3-client/src/known_hosts.rs` (`KnownHosts::parse`, `append_known_host`, `certificate_fingerprint`), `ssh3-client/src/host_key.rs` (сверка presented-сертификата) | — | — |
 | A9 | Аутентификация | `strict-host-key-checking` (yes / accept-new / no / ask) | да | да | Go `cmd/ssh3.go:679`, `strict_host_key.go:43` (`ParseStrictHostKeyChecking`), `strict_host_key.go:62` (`ResolveStrictHostKeyChecking`); Rust `ssh3-client/src/strict_host_key.rs` (`Ssh3StrictHostKeyChecking`, `resolve_strict_host_key_checking`, `decide_host_key`), `ssh3-client/src/main.rs` (`--strict-host-key-checking`, `-o StrictHostKeyChecking=`) | — | A8 |
-| A10 | Аутентификация | SSHFP / `VerifyHostKeyDNS` | да | да (клиент; в ветке `wave/t5-sshfp-x11`) | Go `cmd/cli_flags.go:226` (`parseVerifyHostKeyDNSValue`), `sshfp.go:663` (`CheckSSHFP`), `sshfp.go:500` (`UDPSSHFPResolver.LookupSSHFP`); Rust: `ssh3-client/src/sshfp.rs` (записи RFC 4255, SHA-1/SHA-256 от DER, constant-time сравнение, query name с реверс-зонами IP, DNS wire build/parse без сторонних резолверов, UDP-резолвер по `/etc/resolv.conf`), `ssh3-client/src/lib.rs` (`run_sshfp_verification` в connect-пути по сертификату handshake; mismatch — единственный фатальный исход), `ssh3-client/src/main.rs` (`-o VerifyHostKeyDNS=yes|no|ask[:alg]` + ssh_config) | L | A8, A9, DNS-резолвер |
+| A10 | Аутентификация | SSHFP / `VerifyHostKeyDNS` | да | да (клиент; `wave/t5-sshfp-x11` слита в `main`) | Go `cmd/cli_flags.go:226` (`parseVerifyHostKeyDNSValue`), `sshfp.go:663` (`CheckSSHFP`), `sshfp.go:500` (`UDPSSHFPResolver.LookupSSHFP`); Rust: `ssh3-client/src/sshfp.rs` (записи RFC 4255, SHA-1/SHA-256 от DER, constant-time сравнение, query name с реверс-зонами IP, DNS wire build/parse без сторонних резолверов, UDP-резолвер по `/etc/resolv.conf`), `ssh3-client/src/lib.rs` (`run_sshfp_verification` в connect-пути по сертификату handshake; mismatch — единственный фатальный исход), `ssh3-client/src/main.rs` (`-o VerifyHostKeyDNS=yes|no|ask[:alg]` + ssh_config) | L | A8, A9, DNS-резолвер |
 | A11 | Аутентификация | Проброс SSH-agent на сервер (`-A` / `-forward-agent`) | да | да | Go `cmd/ssh3.go:691-692`; Rust `ssh3-client/src/main.rs:65` (`--forward-agent`), `ssh3-client/src/lib.rs:1745` (`send_forward_agent_request`) | — | — |
 
 ### 2.2. Клиент — сессия, PTY, сигналы
@@ -131,12 +133,12 @@
 
 | № | Подсистема | Возможность | Go | Rust | Файлы (путь:строка) | Сложность | Зависимости |
 |---|-----------|-------------|----|------|----------------------|-----------|-------------|
-| F1 | Передача файлов | `-transfer SRC DST` (upload/download) | да | нет | Go `cmd/ssh3.go:714`, `cmd/sftp_client.go:135` (`runFileTransfer`), `cmd/sftp_client.go:41` (`isRemoteTransferSpec`); Rust — **не найдено** | L | B10, F5 |
-| F2 | Передача файлов | `-r` — рекурсивная передача каталогов | да | нет | Go `cmd/ssh3.go:718`, `cmd/sftp_client.go:195` (`uploadDir`), `cmd/sftp_client.go:269` (`downloadDir`); Rust — **не найдено** | M | F1 |
-| F3 | Передача файлов | `-continue` — докачка прерванного transfer | да | нет | Go `cmd/ssh3.go:719`, `cmd/sftp_client.go:513` (`hashResumePrefix`); Rust — **не найдено** | M | F1 |
-| F4 | Передача файлов | `-checksum` — проверка SHA-256 | да | нет | Go `cmd/ssh3.go:720`, `cmd/sftp_client.go:425` (`verifyRemoteChecksum`); Rust — **не найдено** | M | F1 |
-| F5 | Передача файлов | `-P` (порт) и `-U` (URL path) для операнда `user@host:path` | да | нет | Go `cmd/ssh3.go:716-717`, `cmd/sftp_client.go:67` (`parseRemoteTransferSpec`); Rust — **не найдено** | S | F1 |
-| F6 | Передача файлов | Интерактивный SFTP-клиент (`-s sftp`) | да | нет | Go `cmd/ssh3.go:727`, `cmd/sftp_client.go:135`; Rust — **не найдено** (серверная подсистема SFTP есть — см. L7, но клиента нет) | M | F1, B10 |
+| F1 | Передача файлов | `-transfer SRC DST` (upload/download) | да | да | Go `cmd/ssh3.go:714`, `cmd/sftp_client.go:135` (`runFileTransfer`), `cmd/sftp_client.go:41` (`isRemoteTransferSpec`); Rust `ssh3-client/src/main.rs:157` (`-transfer`), `ssh3-client/src/transfer.rs:415` (`parse_remote_transfer_spec`), `ssh3-client/src/lib.rs:1553` (`run_file_transfer`) — волна T3.2 | L | B10, F5 |
+| F2 | Передача файлов | `-r` — рекурсивная передача каталогов | да | да | Go `cmd/ssh3.go:718`, `cmd/sftp_client.go:195` (`uploadDir`), `cmd/sftp_client.go:269` (`downloadDir`); Rust `ssh3-client/src/transfer.rs:877` (`upload_tree`), `ssh3-client/src/transfer.rs:975` (`download_tree`) | M | F1 |
+| F3 | Передача файлов | `-continue` — докачка прерванного transfer | да | да | Go `cmd/ssh3.go:719`, `cmd/sftp_client.go:513` (`hashResumePrefix`); Rust `ssh3-client/src/main.rs:169-170` (`--continue`), `ssh3-client/src/transfer.rs:572,758` (resume-ветки) | M | F1 |
+| F4 | Передача файлов | `-checksum` — проверка SHA-256 | да | да | Go `cmd/ssh3.go:720`, `cmd/sftp_client.go:425` (`verifyRemoteChecksum`); Rust `ssh3-client/src/transfer.rs:1341` (`verify_remote_checksum`, вызовы `:686`, `:855`) | M | F1 |
+| F5 | Передача файлов | `-P` (порт) и `-U` (URL path) для операнда `user@host:path` | да | да | Go `cmd/ssh3.go:716-717`, `cmd/sftp_client.go:67` (`parseRemoteTransferSpec`); Rust `ssh3-client/src/main.rs:179-190` (`-P`-порт, `url_path`), `:817-822` (применение к цели) | S | F1 |
+| F6 | Передача файлов | Интерактивный SFTP-клиент (`-s sftp`) | да | нет | Go `cmd/ssh3.go:727`, `cmd/sftp_client.go:135`; Rust — **не найдено** (адаптер байтового потока SFTP-канала есть — `ssh3-client/src/sftp_stream.rs`, интерактивной `-s sftp`-сессии нет) | M | F1, B10 |
 
 ### 2.7. Конфигурация, `-o`, ssh_config
 
@@ -177,11 +179,11 @@
 | I2 | Сервер: аутентификация | Password (crypt/shadow) | да | да | Go `util/unix_util/linux_user.go:109` (`ComparePasswordWithHashedPassword`), `util/unix_util/user.go:123`; Rust `ssh3-server/src/auth.rs:358` (`default_password_verifier`) | — | — |
 | I3 | Сервер: аутентификация | OIDC identity token | да | да | Go `server_auth/auth.go`; Rust `ssh3-server/src/auth.rs:524-527` (`verify_oidc_identity_token`), `ssh3-auth/src/lib.rs` | — | — |
 | I4 | Сервер: аутентификация | Включение/выключение password-логина | да | да | Go `cmd/ssh3-server.go:993` (`-enable-password-login`); Rust `ssh3-server/src/main.rs:48` (`--enable-password-login`), `ssh3-server/src/auth.rs:314` (`should_authenticate`) | — | — |
-| I5 | Сервер: аутентификация | Root-gate (root не входит по паролю) | да | нет | Go `server_auth/root_gate.go:13` (`PasswordLoginRefused`); Rust — **не найдено** | S | I2 |
+| I5 | Сервер: аутентификация | Root-gate (root не входит по паролю) | да | да | Go `server_auth/root_gate.go:13` (`PasswordLoginRefused`); Rust `ssh3-server/src/auth.rs:204-206` (`password_login_refused("root")` до verify), `ssh3-server/src/auth.rs:463-471`, тест `ssh3-server/src/tests.rs:1328` (подтверждено аудитом 2026-10-27) | S | I2 |
 | I6 | Сервер: DoS-guard | Кап неавторизованных диалогов (аналог MaxStartups) | да | да | Go `server_auth/dos_guard.go:26` (`MaxUnauthenticatedConversations = 100`), `server_auth/dos_guard.go:44` (`TryAcquireUnauthenticatedConversation`), `cmd/ssh3-server.go:1012`; Rust `ssh3-server/src/runtime.rs:181-186` (`try_acquire_unauthenticated`), `ssh3-server/src/config.rs:200`, `ssh3-server/src/config.rs:312` | S | — |
 | I7 | Сервер: DoS-guard | Lockout после N неудачных паролей | да | да | Go `server_auth/dos_guard.go:30` (`MaxPasswordAuthFailures = 10`), `server_auth/dos_guard.go:33` (`PasswordLockoutDuration = 60s`), `cmd/ssh3-server.go:1017`, `cmd/ssh3-server.go:1022`; Rust `ssh3-server/src/auth.rs:164-186` (`password_failure`), `ssh3-server/src/config.rs:202-204`, `ssh3-server/src/config.rs:315-318` | M | I2 |
-| I8 | Сервер: аутентификация | Константно-временное сравнение хэша пароля | да | нет | Go `util/unix_util/linux_user.go:109` — сравнение через `subtle`; Rust `ssh3-server/src/auth.rs:411` — `==` (неконстантно) | S | I2 |
-| I9 | Сервер: аутентификация | Константно-временное сравнение SSHFP | да | частично | Go `sshfp.go:194` (`subtleEqual`); Rust: примитив есть — `ssh3-client/src/sshfp.rs` (`constant_time_eq`, используется в `SshfpRecord::matches`); сервер Rust сам SSHFP не проверяет (как и сервер Go — проверка живёт на клиенте в connect-пути), поэтому сравнение исполняется в клиентском коде | S | A10 |
+| I8 | Сервер: аутентификация | Константно-временное сравнение хэша пароля | да | нет | Go `util/unix_util/linux_user.go:109` — сравнение через `subtle`; Rust `ssh3-server/src/auth.rs:411` — `==` (неконстантно; подтверждено аудитом 2026-10-27, `docs/audit-2026-10-27.md` §2) | S | I2 |
+| I9 | Сервер: аутентификация | Константно-временное сравнение SSHFP | да | да | Go `sshfp.go:194` (`subtleEqual`); Rust `ssh3-client/src/sshfp.rs` (`constant_time_eq`, используется в `SshfpRecord::matches`) — как и в Go, проверка живёт на клиенте в connect-пути (волна T5.2) | S | A10 |
 
 ### 2.10. Сервер — политики форвардинга
 
@@ -261,9 +263,9 @@
 
 | № | Пробел | Подсистема | Поведение Go | Поведение Rust | Последствие |
 |---|--------|-----------|-------------|---------------|-------------|
-| P1 | A8, A9, A10 | Аутентификация | **Доверие к серверу**: три независимых слоя — TLS-CA, `known_hosts`/`StrictHostKeyChecking` (политика `ask` по умолчанию) и SSHFP. | `known_hosts` и `StrictHostKeyChecking` есть (`ssh3-client/src/known_hosts.rs`, `ssh3-client/src/strict_host_key.rs`); SSHFP нет; доверие к CA — выбор между `WebPkiRoots`, `--ca-cert` и `--insecure` (`ssh3-client/src/lib.rs:1644-1660`, `ssh3-client/src/main.rs:139`). | Ветка SSHFP отсутствует — у Rust нет второй, независимой проверки хоста, кроме отпечатка в `known_hosts` |
-| P2 | F1–F6 | Передача файлов | `-transfer`, `-r`, `-continue`, `-checksum`, `-P`/`-U`, интерактивный SFTP — `cmd/sftp_client.go`. | Не найдено ни клиента SFTP, ни режима передачи (в `ssh3-client/src/main.rs` нет таких флагов); серверная подсистема SFTP есть (L7 †) | Функциональность форвардинга и файловый сервис есть, а клиента передачи — нет: SFTP-клиент и `-transfer` — самые заметные пробелы продукта |
-| P3 | I8, I9 | Сервер: аутентификация | Сравнение хэша пароля константно-временно (`util/unix_util/linux_user.go:109`) и SSHFP — константно-временно (`sshfp.go:194`). | Обычный `==` с ранним выходом (`ssh3-server/src/auth.rs:411`); SSHFP нет. | Timing-канал на подбор пароля остаётся (lockout в `ssh3-server/src/auth.rs:164-186` ограничивает частоту, но не устраняет канал) |
+| P1 | A8, A9, A10 | Аутентификация | **Доверие к серверу**: три независимых слоя — TLS-CA, `known_hosts`/`StrictHostKeyChecking` (политика `ask` по умолчанию) и SSHFP. | Все три слоя есть: `known_hosts`/`StrictHostKeyChecking` (`ssh3-client/src/known_hosts.rs`, `ssh3-client/src/strict_host_key.rs`), SSHFP — волна T5.2 (`ssh3-client/src/sshfp.rs`); доверие к CA — выбор между `WebPkiRoots`, `--ca-cert` и `--insecure` (`ssh3-client/src/lib.rs:1644-1660`, `ssh3-client/src/main.rs:139`). | Закрыто: у Rust те же три независимые проверки хоста, что и у Go |
+| P2 | F6, B10 | Передача файлов | Интерактивный SFTP-клиент (`-s sftp`) и `-s`-подсистема — `cmd/sftp_client.go`. | Не найдено: `-s` и интерактивная SFTP-сессия (`Ssh3SessionRequest` = только `Shell`/`Exec`); пакетный `-transfer` закрыт волной T3.2 (`ssh3-client/src/transfer.rs`), серверная подсистема есть (L7) | Остался только интерактивный режим; пакетная передача (включая рекурсию, докачку, checksum) работает |
+| P3 | I8 | Сервер: аутентификация | Сравнение хэша пароля константно-временно (`util/unix_util/linux_user.go:109`). | Обычный `==` с ранним выходом (`ssh3-server/src/auth.rs:411`; подтверждено аудитом 2026-10-27). | Timing-канал на подбор пароля остаётся (lockout в `ssh3-server/src/auth.rs:164-186` ограничивает частоту, но не устраняет канал); SSHFP-сравнение уже константно-временное (I9) |
 | P4 | K1, K2, K3 | Сервер: лимиты | Кап SSH-строки `util.MaxSSHStringLen = 1<<24` (`util/wire.go:212`) и кламп `maxPacketSize` — закрыты в Rust (`ssh3-proto/src/wire.rs:243-255`, `ssh3-core/src/channel.rs:49-65`); **не закрыты** лимиты соединений, каналов и входящих потоков. | `ssh3-server/src/runtime.rs:42` — бесконечный цикл приёма: ни `-max-connections`, ни `-max-channels-per-conversation`, ни `-max-incoming-streams` нет. | Сервер не ограничивает число соединений и каналов — вектор исчерпания памяти остаётся |
 | P5 | L9 | Сервер | По SIGTERM/SIGINT сервер перестаёт принимать соединения и дренирует активные в течение `SSH3_SHUTDOWN_DRAIN` (по умолчанию 5 с) — `cmd/ssh3-server.go:1612`, `cmd/ssh3-server.go:1620-1633`. | Сигналы не ловятся: процесс умирает по умолчанию, активные сессии обрываются (`ssh3-server/src/runtime.rs:42-58`). | При обновлении сервера рвутся живые сессии; в systemd без `KillMode=process` — тем более |
 | P6 | D1–D5, E1 | Control master / proxy jump | Control master (`-M`/`-S`/`-O`, протокол `client/cm`) и цепочка `-J` с UDP-туннелем. | Закрыто: control master — `ssh3-client/src/control.rs` (T4), туннель — `ssh3-client/src/proxy_jump.rs` (T5.1); межпроцессные хвосты control master и Windows-отказ остаются в ROADMAP. | Каждое соединение — новое QUIC-рукопожатие; jump-хост недоступен |
