@@ -1114,6 +1114,11 @@ mod tests {
 
     /// The type of the HTTP/3 HEADERS frame.
     const HEADERS_FRAME_TYPE: u64 = 0x01;
+    /// The type of the client control stream (the HTTP/3 unidirectional
+    /// stream that carries the SETTINGS frame first).
+    const CLIENT_CONTROL_STREAM_TYPE: u64 = 0x00;
+    /// The type of the HTTP/3 SETTINGS frame.
+    const SETTINGS_FRAME_TYPE: u64 = 0x04;
     /// The HTTP/3 setting that announces the maximum field section size.
     const SETTING_MAX_HEADER_LIST_SIZE: u64 = 0x06;
 
@@ -1264,6 +1269,15 @@ mod tests {
         });
 
         let client_task = tokio::spawn(async move {
+            // The control stream with the (empty) SETTINGS goes first: the
+            // HTTP/3 layer of the server reads the request streams only
+            // after the settings of the peer arrived.
+            let (mut control, _) = client_quinn.open_uni().await.unwrap();
+            let mut settings = Vec::new();
+            ssh3_proto::append_var_int(&mut settings, CLIENT_CONTROL_STREAM_TYPE);
+            ssh3_proto::append_var_int(&mut settings, SETTINGS_FRAME_TYPE);
+            ssh3_proto::append_var_int(&mut settings, 0);
+            control.write_all(&settings).await.unwrap();
             send_raw_headers_frame(&client_quinn, oversized_field_section(17_000)).await;
             // The connection stays alive while the server rejects the request.
             tokio::time::sleep(Duration::from_secs(1)).await;
