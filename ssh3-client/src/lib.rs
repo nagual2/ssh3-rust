@@ -68,9 +68,11 @@ mod transfer_tests;
 
 pub use agent::Ssh3AgentSelection;
 use agent::{build_agent_bearer_token, resolve_agent_socket_path};
+pub use console::{LocalTerminal, TerminalSize, detect_local_terminal};
 use console::{
-    LocalTerminal, RawModeGuardHandle, TerminalSize, detect_local_terminal, enable_console_modes,
-    enable_raw_mode, spawn_resize_forwarder, spawn_signal_forwarders, suspend_local_process,
+    RawModeGuardHandle, enable_console_modes, enable_raw_mode, spawn_resize_forwarder,
+    spawn_resize_forwarder_with, spawn_signal_forwarders, spawn_signal_forwarders_with,
+    suspend_local_process,
 };
 pub use duration::{Ssh3DurationError, parse_duration};
 pub use dynamic::{

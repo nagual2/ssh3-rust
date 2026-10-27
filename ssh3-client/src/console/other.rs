@@ -30,7 +30,7 @@ pub(crate) fn test_platform_terminal() -> PlatformTerminal {
 }
 
 /// Detects the local console of the client.
-pub(crate) fn detect_local_terminal() -> Result<Option<LocalTerminal>, Ssh3ClientError> {
+pub fn detect_local_terminal() -> Result<Option<LocalTerminal>, Ssh3ClientError> {
     Ok(None)
 }
 

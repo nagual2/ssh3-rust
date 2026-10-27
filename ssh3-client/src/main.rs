@@ -1451,6 +1451,14 @@ async fn run_slave(plan: &ClientPlan) -> ExitCode {
         Ssh3SessionRequest::Shell => (Vec::new(), true),
         Ssh3SessionRequest::Exec(command) => (vec![command.clone()], false),
     };
+    // A pty session drives the local console: the raw mode of the slave
+    // matches the direct session, and the console events (a resize, the
+    // interrupts of the session process) relay to the master.
+    let terminal = if wants_pty {
+        ssh3_client::detect_local_terminal().ok().flatten()
+    } else {
+        None
+    };
     let pty = if wants_pty {
         control::local_console_pty(plan.config.term_type.as_deref())
     } else {
@@ -1461,6 +1469,7 @@ async fn run_slave(plan: &ClientPlan) -> ExitCode {
         command,
         pty,
         plan.config.forward_agent,
+        terminal,
         tokio::io::stdin(),
         tokio::io::stdout(),
         tokio::io::stderr(),

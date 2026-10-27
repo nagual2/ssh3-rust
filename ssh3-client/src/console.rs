@@ -29,41 +29,43 @@ pub(crate) use self::unix as platform;
 #[cfg(windows)]
 pub(crate) use self::windows as platform;
 
+pub use platform::detect_local_terminal;
 pub(crate) use platform::{
-    ConsoleModeGuard, PlatformTerminal, RawModeGuard, detect_local_terminal, enable_console_modes,
-    enable_raw_mode, spawn_resize_forwarder, spawn_signal_forwarders, suspend_local_process,
+    ConsoleModeGuard, PlatformTerminal, RawModeGuard, enable_console_modes, enable_raw_mode,
+    spawn_resize_forwarder, spawn_resize_forwarder_with, spawn_signal_forwarders,
+    spawn_signal_forwarders_with, suspend_local_process,
 };
 
 use std::sync::{Arc, Mutex};
 
 /// The size of the local console.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TerminalSize {
+pub struct TerminalSize {
     /// The width of the console in characters.
-    pub(crate) char_width: u16,
+    pub char_width: u16,
     /// The height of the console in characters.
-    pub(crate) char_height: u16,
+    pub char_height: u16,
     /// The width of the console in pixels.
-    pub(crate) pixel_width: u16,
+    pub pixel_width: u16,
     /// The height of the console in pixels.
-    pub(crate) pixel_height: u16,
+    pub pixel_height: u16,
 }
 
 /// The metadata of the local console.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LocalTerminalInfo {
+pub struct LocalTerminalInfo {
     /// The terminal type of the console, as the `TERM` variable reports it.
-    pub(crate) term: Option<String>,
+    pub term: Option<String>,
     /// The size of the console.
-    pub(crate) size: TerminalSize,
+    pub size: TerminalSize,
 }
 
 /// The local console of the client.
-pub(crate) struct LocalTerminal {
+pub struct LocalTerminal {
     /// The metadata of the console.
-    pub(crate) info: LocalTerminalInfo,
+    pub info: LocalTerminalInfo,
     /// The platform specific handle of the console.
-    pub(crate) platform: PlatformTerminal,
+    pub platform: PlatformTerminal,
 }
 
 /// The handle of the raw mode guard of the local console.

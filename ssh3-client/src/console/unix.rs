@@ -77,7 +77,7 @@ pub(crate) fn enable_console_modes() -> ConsoleModeGuard {
 }
 
 /// Detects the local console of the client.
-pub(crate) fn detect_local_terminal() -> Result<Option<LocalTerminal>, Ssh3ClientError> {
+pub fn detect_local_terminal() -> Result<Option<LocalTerminal>, Ssh3ClientError> {
     let stdin = std::io::stdin();
     let fd = stdin.as_raw_fd();
     let is_tty = unsafe { nix::libc::isatty(fd) } == 1;
@@ -134,6 +134,30 @@ pub(crate) fn spawn_resize_forwarder(
     channel: Arc<Ssh3Channel>,
     terminal: PlatformTerminal,
 ) -> JoinHandle<()> {
+    spawn_resize_forwarder_with(
+        terminal,
+        Arc::new(move |size| {
+            let channel = channel.clone();
+            tokio::spawn(async move {
+                if send_window_change_request(channel.as_ref(), size)
+                    .await
+                    .is_err()
+                {
+                    // The channel died: the session is over anyway, and the
+                    // caller owns the lifetime of the watcher.
+                }
+            });
+        }),
+    )
+}
+
+/// The sink of the resize watcher without a session channel: the control
+/// master slave has no channel of its own, so the new size travels through
+/// the callback (which relays it to the master over the control socket).
+pub(crate) fn spawn_resize_forwarder_with(
+    terminal: PlatformTerminal,
+    on_resize: Arc<dyn Fn(TerminalSize) + Send + Sync>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut winsize_signal = match signal(SignalKind::window_change()) {
             Ok(signal) => signal,
@@ -145,12 +169,7 @@ pub(crate) fn spawn_resize_forwarder(
                 Ok(size) => size,
                 Err(_) => return,
             };
-            if send_window_change_request(channel.as_ref(), size)
-                .await
-                .is_err()
-            {
-                return;
-            }
+            on_resize(size);
         }
     })
 }
@@ -163,6 +182,26 @@ pub(crate) fn spawn_signal_forwarders(
     channel: Arc<Ssh3Channel>,
     _interactive: bool,
 ) -> Vec<JoinHandle<()>> {
+    spawn_signal_forwarders_with(Arc::new(move |signal_name| {
+        let channel = channel.clone();
+        tokio::spawn(async move {
+            if send_signal_request(channel.as_ref(), signal_name)
+                .await
+                .is_err()
+            {
+                // The channel died: the session is over anyway, and the
+                // caller owns the lifetime of the watcher.
+            }
+        });
+    }))
+}
+
+/// The sink of the signal watcher without a session channel: the control
+/// master slave relays the console interrupts to the master over the
+/// control socket.
+pub(crate) fn spawn_signal_forwarders_with(
+    on_signal: Arc<dyn Fn(&'static str) + Send + Sync>,
+) -> Vec<JoinHandle<()>> {
     [
         ("INT", SignalKind::interrupt()),
         ("TERM", SignalKind::terminate()),
@@ -172,15 +211,10 @@ pub(crate) fn spawn_signal_forwarders(
     .into_iter()
     .filter_map(|(signal_name, kind)| {
         let mut signal = signal(kind).ok()?;
-        let channel = channel.clone();
+        let on_signal = on_signal.clone();
         Some(tokio::spawn(async move {
             while signal.recv().await.is_some() {
-                if send_signal_request(channel.as_ref(), signal_name)
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
+                on_signal(signal_name);
             }
         }))
     })

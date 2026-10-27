@@ -238,7 +238,7 @@ fn read_terminal_size() -> Option<TerminalSize> {
 }
 
 /// Detects the local console of the client.
-pub(crate) fn detect_local_terminal() -> Result<Option<LocalTerminal>, Ssh3ClientError> {
+pub fn detect_local_terminal() -> Result<Option<LocalTerminal>, Ssh3ClientError> {
     let Some(input) = standard_handle(STD_INPUT_HANDLE) else {
         return Ok(None);
     };
