@@ -203,6 +203,24 @@ pub struct Ssh3ServerConfig {
     pub max_idle_timeout: Duration,
     /// How long the server waits for a connection to complete its handshake.
     pub handshake_idle_timeout: Duration,
+    /// Maximum number of concurrent QUIC connections the server serves.
+    ///
+    /// An incoming connection over the cap is refused right after the QUIC
+    /// accept, without a handshake; `0` keeps the historical unbounded
+    /// behavior.
+    pub max_connections: usize,
+    /// Maximum number of channels one conversation may keep open at the same
+    /// time.
+    ///
+    /// A channel over the cap is torn down instead of being served, so the
+    /// peer sees the refusal; `0` keeps the historical unbounded behavior.
+    pub max_channels_per_conversation: usize,
+    /// Maximum number of concurrent peer-initiated bidirectional QUIC streams
+    /// per connection.
+    pub max_incoming_streams: u32,
+    /// Maximum number of concurrent peer-initiated unidirectional QUIC streams
+    /// per connection.
+    pub max_incoming_uni_streams: u32,
     /// Shared state of the authentication-phase DoS guards.
     ///
     /// The guard is shared by all connections of a server; cloning the
@@ -267,6 +285,13 @@ impl fmt::Debug for Ssh3ServerConfig {
             .field("password_lockout", &self.password_lockout)
             .field("max_idle_timeout", &self.max_idle_timeout)
             .field("handshake_idle_timeout", &self.handshake_idle_timeout)
+            .field("max_connections", &self.max_connections)
+            .field(
+                "max_channels_per_conversation",
+                &self.max_channels_per_conversation,
+            )
+            .field("max_incoming_streams", &self.max_incoming_streams)
+            .field("max_incoming_uni_streams", &self.max_incoming_uni_streams)
             .field("auth_guard", &self.auth_guard)
             .field("sftp_jail", &self.sftp_jail)
             .field(
@@ -303,6 +328,10 @@ impl Default for Ssh3ServerConfig {
             password_lockout: DEFAULT_PASSWORD_LOCKOUT,
             max_idle_timeout: DEFAULT_MAX_IDLE_TIMEOUT,
             handshake_idle_timeout: DEFAULT_HANDSHAKE_IDLE_TIMEOUT,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_channels_per_conversation: DEFAULT_MAX_CHANNELS_PER_CONVERSATION,
+            max_incoming_streams: DEFAULT_MAX_INCOMING_STREAMS,
+            max_incoming_uni_streams: DEFAULT_MAX_INCOMING_UNI_STREAMS,
             auth_guard: Arc::new(Ssh3AuthGuard::default()),
             sftp_jail: SftpJailMode::default(),
             max_sftp_sessions_per_user: DEFAULT_MAX_SFTP_SESSIONS_PER_USER,
@@ -329,6 +358,24 @@ pub const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60)
 
 /// The default handshake timeout of a connection (the ssh2 `LoginGraceTime` scale).
 pub const DEFAULT_HANDSHAKE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The default cap of concurrent connections: `0`, the unbounded Go default.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 0;
+
+/// The default channel budget of one conversation (the Go default).
+pub const DEFAULT_MAX_CHANNELS_PER_CONVERSATION: usize = 64;
+
+/// The default cap of peer-initiated bidirectional streams per connection.
+///
+/// The value is the explicit default of the Go implementation, which is the
+/// quic-go default as well.
+pub const DEFAULT_MAX_INCOMING_STREAMS: u32 = 100;
+
+/// The default cap of peer-initiated unidirectional streams per connection.
+///
+/// The value is the explicit default of the Go implementation, which is the
+/// quic-go default as well.
+pub const DEFAULT_MAX_INCOMING_UNI_STREAMS: u32 = 100;
 
 /// The default number of active reverse-forward listeners one user may hold.
 pub const DEFAULT_MAX_REVERSE_FORWARDS_PER_USER: usize = 10;

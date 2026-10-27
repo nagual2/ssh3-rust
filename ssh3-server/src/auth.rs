@@ -23,8 +23,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -194,6 +194,36 @@ impl Ssh3AuthGuard {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         failures.remove(user);
+    }
+}
+
+/// One slot of the unauthenticated phase, held for the phase's lifetime.
+///
+/// The audit of 2026-10-27 (risk 3.5.2) asks the slot to survive a cancelled
+/// phase: the guard gives the slot back when it is dropped, so the pre-auth
+/// timeout of the runtime cannot leak a slot it aborts mid-verification.
+pub(crate) struct UnauthenticatedSlot {
+    guard: Arc<Ssh3AuthGuard>,
+}
+
+impl UnauthenticatedSlot {
+    /// Admits one conversation into the unauthenticated phase.
+    ///
+    /// Returns `None` when the cap of the phase is reached; the caller
+    /// refuses the conversation then.
+    pub(crate) fn try_acquire(config: &Ssh3ServerConfig) -> Option<Self> {
+        config
+            .auth_guard
+            .try_acquire_unauthenticated(config.max_unauthenticated_conversations)
+            .then(|| Self {
+                guard: config.auth_guard.clone(),
+            })
+    }
+}
+
+impl Drop for UnauthenticatedSlot {
+    fn drop(&mut self) {
+        self.guard.release_unauthenticated();
     }
 }
 
@@ -408,7 +438,15 @@ fn default_password_verifier(username: &str, password: &str) -> io::Result<bool>
                 unsafe { std::ffi::CStr::from_ptr(computed).to_owned() }
             };
 
-            return Ok(computed_hash.as_c_str().to_bytes() == stored_bytes);
+            // the hash comparison runs in constant time (the audit of
+            // 2026-10-27, I8): the computed hash of a well-formed stored
+            // entry has the same length as the entry itself, but a malformed
+            // or unsupported entry may differ, so the length is folded into
+            // the comparison as well
+            return Ok(constant_time_eq(
+                computed_hash.as_c_str().to_bytes(),
+                stored_bytes,
+            ));
         }
 
         if status == nix::libc::ERANGE && buffer_len < 1 << 20 {
@@ -427,6 +465,27 @@ fn default_password_verifier(_username: &str, _password: &str) -> io::Result<boo
         io::ErrorKind::Unsupported,
         "password authentication is not supported on this platform",
     ))
+}
+
+/// Compares two byte slices without leaking their contents through timing.
+///
+/// The audit of 2026-10-27 (the F-16 remainder, I8) asks the password check
+/// not to leak where the stored and the computed `crypt(3)` hashes diverge:
+/// the plain `==` gives up on the first differing byte, so a locally timing
+/// attacker can probe the hash byte by byte. The comparison walks the longer
+/// of the slices and folds every byte of both inputs — and the difference of
+/// the lengths — into one accumulator, so the runtime of the check depends on
+/// the inputs only through their lengths, and a length mismatch is folded in
+/// rather than returned early.
+#[cfg(target_os = "linux")]
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u64;
+    for index in 0..a.len().max(b.len()) {
+        let left = a.get(index).copied().unwrap_or(0);
+        let right = b.get(index).copied().unwrap_or(0);
+        diff |= u64::from(left ^ right);
+    }
+    diff == 0
 }
 
 /// Verifies a password with the configured verifier or with the platform default.
@@ -540,5 +599,34 @@ pub(crate) async fn authorize_request(
             Ok(AuthOutcome::Unauthorized)
         }
         RequestAuthorization::None => Ok(AuthOutcome::Unauthorized),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod constant_time_eq_tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn equal_slices_compare_equal() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+        // a realistic crypt(3) shape: the computed hash equals the stored one
+        let stored = b"$6$salt$hashedpasswordvalue";
+        assert!(constant_time_eq(stored, stored));
+    }
+
+    #[test]
+    fn differing_slices_do_not_compare_equal() {
+        // the difference may sit in any byte, first or last
+        assert!(!constant_time_eq(b"abc", b"xbc"));
+        assert!(!constant_time_eq(b"abc", b"abx"));
+        assert!(!constant_time_eq(b"$6$a$b", b"$6$a$c"));
+    }
+
+    #[test]
+    fn slices_of_different_length_do_not_compare_equal() {
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"abcd", b"abc"));
+        assert!(!constant_time_eq(b"", b"a"));
     }
 }

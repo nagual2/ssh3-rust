@@ -17,8 +17,11 @@ use ssh3_h3::{
     response_with_server_header, route_registered_datagram,
 };
 use ssh3_quinn::Ssh3IncomingChannelRouter;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::auth::{AuthOutcome, authorize_request, parse_request_authorization};
+use crate::auth::{
+    AuthOutcome, UnauthenticatedSlot, authorize_request, parse_request_authorization,
+};
 use crate::config::{Ssh3ServerConfig, validate_server_config};
 use crate::dynamic_forward::{
     CHANNEL_TYPE_DYNAMIC_FORWARD, CHANNEL_TYPE_DYNAMIC_FORWARD_TCP, handle_dynamic_forward_channel,
@@ -35,19 +38,49 @@ use crate::session::{
 };
 use crate::sftp::{CHANNEL_TYPE_SFTP, handle_sftp_channel};
 
+/// Converts a resource cap into the number of semaphore permits.
+///
+/// The `0` of the `-max-connections` and `-max-channels-per-conversation`
+/// options means "no limit", which the semaphores express with the maximum
+/// number of permits they can hold.
+fn cap_permits(cap: usize) -> usize {
+    if cap == 0 {
+        Semaphore::MAX_PERMITS
+    } else {
+        cap
+    }
+}
+
 /// Serves an endpoint until it stops accepting connections.
 ///
 /// Every accepted connection is handled in its own task, so a slow or broken
-/// peer never blocks the others.
+/// peer never blocks the others. The `max_connections` configuration bounds
+/// the number of tasks: an incoming connection over the cap is refused right
+/// after the QUIC accept, without a handshake.
 pub async fn serve_endpoint(
     endpoint: Endpoint,
     config: Ssh3ServerConfig,
 ) -> Result<(), Ssh3ServerError> {
     validate_server_config(&config)?;
     let handshake_idle_timeout = config.handshake_idle_timeout;
+    // the connection cap (`-max-connections`): the permit of a connection is
+    // owned by its task below and is given back whatever the connection dies
+    // of, the pre-auth timeout included
+    let connection_slots = Arc::new(Semaphore::new(cap_permits(config.max_connections)));
     while let Some(incoming) = endpoint.accept().await {
         let config = config.clone();
+        let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
+            eprintln!(
+                "ssh3-rust-server too many connections ({} active), refusing the incoming connection",
+                config.max_connections
+            );
+            incoming.refuse();
+            continue;
+        };
         tokio::spawn(async move {
+            // the permit of the connection cap is owned by the task, so the
+            // slot is held for the whole life of the connection
+            let _connection_permit = permit;
             // the handshake timeout: a peer that opens a connection and
             // never finishes the handshake must not hold a slot forever
             match tokio::time::timeout(handshake_idle_timeout, incoming).await {
@@ -79,16 +112,43 @@ pub async fn serve_endpoint(
 ///
 /// The connection is upgraded to an SSH3 conversation; the call returns when
 /// the conversation ends.
+///
+/// The whole pre-auth phase — the HTTP/3 accept of the CONNECT request, the
+/// secret-path checks, the unauthenticated-slot acquisition and the
+/// credential verification (a slow OIDC provider included) — runs under
+/// `handshake_idle_timeout` (the audit of 2026-10-27, risk 3.5.2): without
+/// the cap a peer that trickled its request held a task, a conversation and
+/// the idle timeout of the transport (24 h by default, renewed by traffic)
+/// for as long as it kept dribbling bytes, without ever consuming a DoS
+/// slot. The value is the `LoginGraceTime` of the server: the time a
+/// connection may spend before it is authenticated.
 pub async fn serve_connection(
     connection: Connection,
     config: Ssh3ServerConfig,
 ) -> Result<(), Ssh3ServerError> {
     validate_server_config(&config)?;
-    let mut driver = Ssh3ServerConnectionDriver::new(connection.clone()).await?;
-    let Some(accepted) = driver
-        .accept_conversation(config.max_packet_size, config.default_datagrams_queue_size)
-        .await?
-    else {
+    let established = match tokio::time::timeout(
+        config.handshake_idle_timeout,
+        pre_auth_phase(&connection, &config),
+    )
+    .await
+    {
+        Ok(established) => established?,
+        Err(_) => {
+            // no refusal response is sent: at every point this can fire the
+            // control stream of the conversation is not at hand (it lives in
+            // the aborted phase), so the connection is closed the quiet way
+            // of the refusal path, without a status the peer could mistake
+            // for a credential verdict
+            eprintln!(
+                "ssh3-rust-server the pre-auth phase timed out after {}s, closing the connection",
+                config.handshake_idle_timeout.as_secs()
+            );
+            connection.close(0u32.into(), b"pre-auth phase timed out");
+            return Ok(());
+        }
+    };
+    let Some((driver, accepted, session_user)) = established else {
         return Ok(());
     };
 
@@ -97,6 +157,7 @@ pub async fn serve_connection(
         connection,
         driver.channel_router().clone(),
         config,
+        session_user,
     )
     .await
 }
@@ -151,77 +212,115 @@ async fn refuse(
     Ok(())
 }
 
-/// Runs an accepted conversation: authorize, then serve its channels.
+/// Runs the unauthenticated phase of an accepted connection.
+///
+/// The phase turns the QUIC connection into an authorized conversation: it
+/// accepts the HTTP/3 CONNECT request, checks it and verifies the credentials
+/// of the peer. `None` means the conversation was refused or never arrived;
+/// `Some` carries the pieces the serving phase continues with — the driver
+/// included, which owns the channel router and must outlive the conversation.
+async fn pre_auth_phase(
+    connection: &Connection,
+    config: &Ssh3ServerConfig,
+) -> Result<
+    Option<(
+        Ssh3ServerConnectionDriver,
+        Ssh3AcceptedServerConversation,
+        SessionUser,
+    )>,
+    Ssh3ServerError,
+> {
+    let mut driver = Ssh3ServerConnectionDriver::new(connection.clone()).await?;
+    let Some(mut accepted) = driver
+        .accept_conversation(config.max_packet_size, config.default_datagrams_queue_size)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(session_user) = authorize_conversation(&mut accepted, config).await? else {
+        return Ok(None);
+    };
+    Ok(Some((driver, accepted, session_user)))
+}
+
+/// Authorizes the CONNECT request of an accepted conversation.
+///
+/// The function runs the whole unauthenticated phase: the secret-path and
+/// method checks, the `MaxStartups` analog of the DoS guard and the
+/// credential verification. A refused conversation is answered here (`404`,
+/// `503`, `401` or `429`); the caller only serves the conversations the
+/// function authorizes.
+///
+/// The unauthenticated slot of the DoS guard is owned by an
+/// [`UnauthenticatedSlot`]: the slot is given back when the phase ends,
+/// whatever its verdict is — a successful authentication never keeps the
+/// slot, and a phase aborted by the pre-auth timeout cannot leak it.
+async fn authorize_conversation(
+    accepted: &mut Ssh3AcceptedServerConversation,
+    config: &Ssh3ServerConfig,
+) -> Result<Option<SessionUser>, Ssh3ServerError> {
+    // the secret URL path: a CONNECT on any other path is not an SSH3
+    // conversation at all and is answered like an unknown route
+    if !request_path_matches(&accepted.request, &config.url_path) {
+        refuse(&mut accepted.control_stream, StatusCode::NOT_FOUND).await?;
+        return Ok(None);
+    }
+
+    if !is_ssh3_connect(&accepted.request) {
+        refuse(&mut accepted.control_stream, StatusCode::NOT_FOUND).await?;
+        return Ok(None);
+    }
+
+    let Some(_unauthenticated_slot) = UnauthenticatedSlot::try_acquire(config) else {
+        eprintln!(
+            "ssh3-rust-server too many unauthenticated conversations ({} active), refusing the request",
+            config.max_unauthenticated_conversations
+        );
+        refuse(
+            &mut accepted.control_stream,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .await?;
+        return Ok(None);
+    };
+
+    let authorization = parse_request_authorization(&accepted.request);
+    let Ok(session_user) = resolve_session_user(&accepted.request, &authorization, config) else {
+        refuse(&mut accepted.control_stream, StatusCode::UNAUTHORIZED).await?;
+        return Ok(None);
+    };
+
+    let outcome = authorize_request(
+        &authorization,
+        &session_user,
+        &accepted.conversation.conversation_id(),
+        config,
+    )
+    .await?;
+
+    if outcome != AuthOutcome::Authorized {
+        let status = match outcome {
+            AuthOutcome::Authorized => StatusCode::OK,
+            AuthOutcome::Unauthorized => StatusCode::UNAUTHORIZED,
+            AuthOutcome::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+        };
+        refuse(&mut accepted.control_stream, status).await?;
+        return Ok(None);
+    }
+
+    Ok(Some(session_user))
+}
+
+/// Runs an authorized conversation: serve its channels.
 async fn handle_conversation(
     mut accepted: Ssh3AcceptedServerConversation,
     connection: Connection,
     channel_router: Arc<Ssh3IncomingChannelRouter>,
     config: Ssh3ServerConfig,
+    session_user: SessionUser,
 ) -> Result<(), Ssh3ServerError> {
     let control_stream_id = accepted.conversation.control_stream_id();
     let result = async {
-        // the secret URL path: a CONNECT on any other path is not an SSH3
-        // conversation at all and is answered like an unknown route
-        if !request_path_matches(&accepted.request, &config.url_path) {
-            refuse(&mut accepted.control_stream, StatusCode::NOT_FOUND).await?;
-            return Ok(());
-        }
-
-        if !is_ssh3_connect(&accepted.request) {
-            refuse(&mut accepted.control_stream, StatusCode::NOT_FOUND).await?;
-            return Ok(());
-        }
-
-        // the unauthenticated phase holds a DoS slot (the MaxStartups
-        // analog): the slot is taken before any per-request work worth
-        // protecting and is given back whatever the verdict is, so a
-        // successful authentication never keeps the slot
-        if !config
-            .auth_guard
-            .try_acquire_unauthenticated(config.max_unauthenticated_conversations)
-        {
-            eprintln!(
-                "ssh3-rust-server too many unauthenticated conversations ({} active), refusing the request",
-                config.max_unauthenticated_conversations
-            );
-            refuse(&mut accepted.control_stream, StatusCode::SERVICE_UNAVAILABLE).await?;
-            return Ok(());
-        }
-
-        let authorization = parse_request_authorization(&accepted.request);
-        let session_user = match resolve_session_user(&accepted.request, &authorization, &config) {
-            Ok(session_user) => session_user,
-            Err(_) => {
-                config.auth_guard.release_unauthenticated();
-                refuse(&mut accepted.control_stream, StatusCode::UNAUTHORIZED).await?;
-                return Ok(());
-            }
-        };
-        let outcome = match authorize_request(
-            &authorization,
-            &session_user,
-            &accepted.conversation.conversation_id(),
-            &config,
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                config.auth_guard.release_unauthenticated();
-                return Err(err.into());
-            }
-        };
-        config.auth_guard.release_unauthenticated();
-        if outcome != AuthOutcome::Authorized {
-            let status = match outcome {
-                AuthOutcome::Authorized => StatusCode::OK,
-                AuthOutcome::Unauthorized => StatusCode::UNAUTHORIZED,
-                AuthOutcome::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
-            };
-            refuse(&mut accepted.control_stream, status).await?;
-            return Ok(());
-        }
-
         accepted
             .control_stream
             .send_response(response_with_server_header(
@@ -269,11 +368,35 @@ async fn handle_conversation(
             }
         });
 
+        // the channel budget of the conversation (the Go server's
+        // `-max-channels-per-conversation`): every served channel holds a
+        // permit for its handler's lifetime, so a channel over the cap is
+        // torn down instead of being served and one account cannot grow the
+        // task count of its conversation without bounds. A budget of `0`
+        // disables the cap.
+        let channel_budget = Arc::new(Semaphore::new(cap_permits(
+            config.max_channels_per_conversation,
+        )));
+
         loop {
             tokio::select! {
                 _ = connection.closed() => break,
                 accepted_channel = accepted.conversation.accept_channel_with_metadata() => {
                     let accepted_channel = accepted_channel?;
+                    // the Go refusal: the confirmed channel is torn down
+                    // rather than served, so the peer sees the refusal
+                    // instead of a silently dead channel
+                    let Ok(permit) = channel_budget.clone().try_acquire_owned() else {
+                        let channel = accepted_channel.channel().clone();
+                        eprintln!(
+                            "ssh3-rust-server refusing channel {} of the conversation: the {}-channel budget is exhausted",
+                            channel.channel_id(),
+                            config.max_channels_per_conversation
+                        );
+                        channel.cancel_read().await;
+                        let _ = channel.close().await;
+                        continue;
+                    };
                     let config = config.clone();
                     let connection = connection.clone();
                     let conversation = accepted.conversation.clone();
@@ -289,6 +412,7 @@ async fn handle_conversation(
                             session_user,
                             agent_forwarding,
                             forwarding_state,
+                            permit,
                         )
                         .await
                         {
@@ -313,6 +437,10 @@ async fn handle_conversation(
 }
 
 /// Dispatches an accepted channel to the handler of its channel type.
+///
+/// The permit of the conversation's channel budget travels with the call: it
+/// is held for the handler's lifetime and given back when it ends.
+#[allow(clippy::too_many_arguments)]
 async fn handle_accepted_channel(
     accepted_channel: Ssh3AcceptedChannel,
     conversation: Arc<ssh3_core::Ssh3Conversation>,
@@ -321,6 +449,7 @@ async fn handle_accepted_channel(
     session_user: SessionUser,
     agent_forwarding: AgentForwardingSlot,
     forwarding_state: Arc<ForwardingState>,
+    _channel_budget_permit: OwnedSemaphorePermit,
 ) -> Result<(), Ssh3ServerError> {
     match accepted_channel {
         Ssh3AcceptedChannel::Channel(channel) => match channel.channel_type() {
