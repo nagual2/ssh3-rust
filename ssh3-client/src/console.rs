@@ -32,9 +32,13 @@ pub(crate) use self::windows as platform;
 pub use platform::detect_local_terminal;
 pub(crate) use platform::{
     ConsoleModeGuard, PlatformTerminal, RawModeGuard, enable_console_modes, enable_raw_mode,
-    spawn_resize_forwarder, spawn_resize_forwarder_with, spawn_signal_forwarders,
-    spawn_signal_forwarders_with, suspend_local_process,
+    spawn_resize_forwarder, spawn_signal_forwarders, suspend_local_process,
 };
+// The relay of the console events exists only where the control master
+// does (see the control module gate): the with-variants of the watchers
+// are unix only.
+#[cfg(unix)]
+pub(crate) use platform::{spawn_resize_forwarder_with, spawn_signal_forwarders_with};
 
 use std::sync::{Arc, Mutex};
 
