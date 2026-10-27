@@ -1191,11 +1191,12 @@ mod tests {
     /// request. The prefix integers of QPACK continue in little endian
     /// 7-bit groups.
     fn oversized_field_section(value_len: usize) -> Vec<u8> {
-        let mut block = Vec::new();
-        block.push(0x00); // the required insert count: 0
-        block.push(0x00); // the delta base: 0
-        block.push(0x21); // a literal field without name reference, name length 1
-        block.push(b'a');
+        let mut block = vec![
+            0x00, // the required insert count: 0
+            0x00, // the delta base: 0
+            0x21, // a literal field without name reference, name length 1
+            b'a',
+        ];
         let mut remaining = value_len as u64 - 127;
         block.push(0x7f); // the value length: the 7 inline bits are exhausted
         while remaining >= 128 {
@@ -1203,7 +1204,7 @@ mod tests {
             remaining /= 128;
         }
         block.push(remaining as u8);
-        block.extend(std::iter::repeat(b'x').take(value_len));
+        block.extend(std::iter::repeat_n(b'x', value_len));
         block
     }
 
@@ -1251,7 +1252,7 @@ mod tests {
             },);
         let (server_done_tx, server_done_rx) = oneshot::channel();
 
-        let server_task = tokio::spawn(async move {
+        let _server_task = tokio::spawn(async move {
             let mut server = new_server(server_quinn.clone()).await.unwrap();
             let accepted = tokio::time::timeout(
                 Duration::from_secs(5),

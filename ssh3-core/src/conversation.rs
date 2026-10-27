@@ -692,9 +692,14 @@ mod tests {
             other => panic!("expected missing channel error, got {other:?}"),
         }
 
-        let state = conversation.channels_manager.state.lock().unwrap();
-        assert_eq!(state.dangling_datagram_queues.len(), MAX_DANGLING_QUEUES);
-        drop(state);
+        let parked = conversation
+            .channels_manager
+            .state
+            .lock()
+            .unwrap()
+            .dangling_datagram_queues
+            .len();
+        assert_eq!(parked, MAX_DANGLING_QUEUES);
 
         let (recv, _) = BytesReceiveStream::new(Vec::new());
         let (send, _) = RecordingSendStream::new();
