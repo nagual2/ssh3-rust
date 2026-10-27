@@ -71,9 +71,12 @@ use agent::{build_agent_bearer_token, resolve_agent_socket_path};
 pub use console::{LocalTerminal, TerminalSize, detect_local_terminal};
 use console::{
     RawModeGuardHandle, enable_console_modes, enable_raw_mode, spawn_resize_forwarder,
-    spawn_resize_forwarder_with, spawn_signal_forwarders, spawn_signal_forwarders_with,
-    suspend_local_process,
+    spawn_signal_forwarders, suspend_local_process,
 };
+// The console events of a control-master slave relay to the master; the
+// control module (and with it the whole relay) is unix only.
+#[cfg(unix)]
+use console::{spawn_resize_forwarder_with, spawn_signal_forwarders_with};
 pub use duration::{Ssh3DurationError, parse_duration};
 pub use dynamic::{
     Ssh3DynamicForwardParseError, Ssh3DynamicForwardSpec, parse_dynamic_forward_spec,
