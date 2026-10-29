@@ -1210,17 +1210,23 @@ mod tests {
 
     /// Opens a raw QUIC stream and sends one HEADERS frame with the given
     /// field section, without any HTTP/3 client layer.
+    ///
+    /// The receive side stays with the caller: the server answers the
+    /// oversized request on it, and a dropped receive side would carry the
+    /// `STOP_SENDING` that turns the answer into a remote-terminate error
+    /// before the headers rejection comes through.
     async fn send_raw_headers_frame(
         connection: &h3_quinn::quinn::Connection,
         field_section: Vec<u8>,
-    ) {
-        let (mut send, _) = connection.open_bi().await.unwrap();
+    ) -> h3_quinn::quinn::RecvStream {
+        let (mut send, recv) = connection.open_bi().await.unwrap();
         let mut frame = Vec::new();
         ssh3_proto::append_var_int(&mut frame, HEADERS_FRAME_TYPE);
         ssh3_proto::append_var_int(&mut frame, field_section.len() as u64);
         frame.extend_from_slice(&field_section);
         send.write_all(&frame).await.unwrap();
         send.finish().unwrap();
+        recv
     }
 
     /// The field section limit holds before any authentication: a rogue peer
@@ -1282,7 +1288,8 @@ mod tests {
             ssh3_proto::append_var_int(&mut decoder_header, 0x03);
             let mut decoder = client_quinn.open_uni().await.unwrap();
             decoder.write_all(&decoder_header).await.unwrap();
-            send_raw_headers_frame(&client_quinn, oversized_field_section(17_000)).await;
+            let _answer_recv =
+                send_raw_headers_frame(&client_quinn, oversized_field_section(17_000)).await;
             // The connection stays alive while the server rejects the request.
             tokio::time::sleep(Duration::from_secs(1)).await;
         });
