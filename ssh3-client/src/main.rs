@@ -1430,9 +1430,7 @@ async fn run_control_mode(plan: &ClientPlan) -> Option<ExitCode> {
                     return None;
                 }
                 if !wait_for_master(&plan.control.path).await {
-                    eprintln!(
-                        "ssh3: the control master did not come up, connecting directly"
-                    );
+                    eprintln!("ssh3: the control master did not come up, connecting directly");
                     return None;
                 }
             }
@@ -1664,13 +1662,8 @@ mod tests {
 
     #[test]
     fn the_mutually_exclusive_pty_flags_are_refused() {
-        let err = Cli::try_parse_from([
-            "ssh3",
-            "-t",
-            "-T",
-            "https://localhost:4433/ssh3-term",
-        ])
-        .unwrap_err();
+        let err = Cli::try_parse_from(["ssh3", "-t", "-T", "https://localhost:4433/ssh3-term"])
+            .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
     }
 
@@ -1700,13 +1693,8 @@ mod tests {
 
     #[test]
     fn a_malformed_local_forward_is_refused() {
-        let err = Cli::try_parse_from([
-            "ssh3",
-            "-L",
-            "8080",
-            "https://localhost:4433/ssh3-term",
-        ])
-        .unwrap();
+        let err = Cli::try_parse_from(["ssh3", "-L", "8080", "https://localhost:4433/ssh3-term"])
+            .unwrap();
         let err = build_config(err).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ValueValidation);
     }
@@ -1746,13 +1734,8 @@ mod tests {
 
     #[test]
     fn a_malformed_reverse_forward_is_refused() {
-        let err = Cli::try_parse_from([
-            "ssh3",
-            "-R",
-            "8080",
-            "https://localhost:4433/ssh3-term",
-        ])
-        .unwrap();
+        let err = Cli::try_parse_from(["ssh3", "-R", "8080", "https://localhost:4433/ssh3-term"])
+            .unwrap();
         let err = build_config(err).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ValueValidation);
     }
@@ -1776,13 +1759,9 @@ mod tests {
 
     #[test]
     fn a_malformed_dynamic_forward_is_refused() {
-        let err = Cli::try_parse_from([
-            "ssh3",
-            "-D",
-            "::1:1080",
-            "https://localhost:4433/ssh3-term",
-        ])
-        .unwrap();
+        let err =
+            Cli::try_parse_from(["ssh3", "-D", "::1:1080", "https://localhost:4433/ssh3-term"])
+                .unwrap();
         let err = build_config(err).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ValueValidation);
     }
@@ -2011,13 +1990,8 @@ mod tests {
 
     #[test]
     fn the_no_session_flag_refuses_a_remote_command() {
-        let err = Cli::try_parse_from([
-            "ssh3",
-            "-N",
-            "ls",
-            "https://localhost:4433/ssh3-term",
-        ])
-        .unwrap();
+        let err =
+            Cli::try_parse_from(["ssh3", "-N", "ls", "https://localhost:4433/ssh3-term"]).unwrap();
         let err = build_config(err).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
     }

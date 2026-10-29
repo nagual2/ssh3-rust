@@ -173,9 +173,7 @@ impl IncomingChannels {
     /// Forwards an agent connection to the local SSH agent.
     async fn serve_agent_connection(&self, channel: Arc<Ssh3Channel>) {
         let Some(agent_socket) = self.agent_socket.clone() else {
-            eprintln!(
-                "ssh3 rejecting an agent connection: the agent forwarding is not enabled"
-            );
+            eprintln!("ssh3 rejecting an agent connection: the agent forwarding is not enabled");
             let _ = channel.close().await;
             return;
         };
@@ -193,9 +191,7 @@ impl IncomingChannels {
             // The local SSH agent is a Unix socket, so there is nothing to
             // forward a connection to on the other platforms.
             let _ = agent_socket;
-            eprintln!(
-                "ssh3 rejecting an agent connection: the agent forwarding is unix-only"
-            );
+            eprintln!("ssh3 rejecting an agent connection: the agent forwarding is unix-only");
             let _ = channel.close().await;
         }
     }

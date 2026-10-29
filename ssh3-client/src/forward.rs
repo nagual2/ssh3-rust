@@ -415,9 +415,7 @@ async fn forward_udp_socket(
                 {
                     Ok(channel) => channel,
                     Err(err) => {
-                        eprintln!(
-                            "ssh3 could not open the UDP forwarding channel: {err}"
-                        );
+                        eprintln!("ssh3 could not open the UDP forwarding channel: {err}");
                         return;
                     }
                 };

@@ -1090,9 +1090,7 @@ async fn start_dynamic_forwards(
                     spec.bind_port,
                 )
             });
-        eprintln!(
-            "ssh3 dynamic port forwarding: SOCKS5 proxy listening on {listen_addr}"
-        );
+        eprintln!("ssh3 dynamic port forwarding: SOCKS5 proxy listening on {listen_addr}");
         client
             .forward_control_channels
             .lock()
