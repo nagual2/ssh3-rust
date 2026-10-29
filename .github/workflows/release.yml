@@ -226,9 +226,12 @@ jobs:
           # libcrypt when the libxcrypt split reached them: the library of
           # the arm64 port is unpacked into the cross sysroot by hand.
           if ! test -e /usr/aarch64-linux-gnu/lib/libcrypt.so; then
-            pool="http://ports.ubuntu.com/pool/main/libx/libxcrypt"
-            package="$(curl -fsSL "$pool/" | grep -o 'libcrypt-dev_[^"]*arm64\.deb' | sort -u | tail -n1)"
-            curl -fsSL -o /tmp/libcrypt-dev-arm64.deb "$pool/$package"
+            pool="https://ports.ubuntu.com/pool/main/libx/libxcrypt"
+            listing="$(curl -fL --retry 3 --show-error -sS "$pool/")"
+            package="$(printf '%s' "$listing" | grep -o 'libcrypt-dev_[^"]*arm64\.deb' | sort -uV | tail -n1)"
+            echo "the libcrypt package of the arm64 port: $package"
+            test -n "$package"
+            curl -fL --retry 3 --show-error -sS -o /tmp/libcrypt-dev-arm64.deb "$pool/$package"
             unpack="$(mktemp -d)"
             sudo dpkg-deb -x /tmp/libcrypt-dev-arm64.deb "$unpack"
             for directory in lib lib/aarch64-linux-gnu; do
