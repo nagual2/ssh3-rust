@@ -1264,15 +1264,22 @@ mod tests {
         });
 
         let client_task = tokio::spawn(async move {
-            // The control stream with the (empty) SETTINGS goes first: the
-            // HTTP/3 layer of the server reads the request streams only
-            // after the settings of the peer arrived.
+            // The unidirectional streams of a real HTTP/3 client go first:
+            // the control stream carries the (empty) SETTINGS, and the QPACK
+            // encoder and decoder streams complete the connection preamble
+            // the server waits for before it reads the request streams.
             let mut control = client_quinn.open_uni().await.unwrap();
             let mut settings = Vec::new();
             ssh3_proto::append_var_int(&mut settings, CONTROL_STREAM_TYPE);
             ssh3_proto::append_var_int(&mut settings, SETTINGS_FRAME_TYPE);
             ssh3_proto::append_var_int(&mut settings, 0);
             control.write_all(&settings).await.unwrap();
+            let mut encoder = client_quinn.open_uni().await.unwrap();
+            ssh3_proto::append_var_int(&mut encoder, 0x02);
+            encoder.write_all(&[]).await.unwrap();
+            let mut decoder = client_quinn.open_uni().await.unwrap();
+            ssh3_proto::append_var_int(&mut decoder, 0x03);
+            decoder.write_all(&[]).await.unwrap();
             send_raw_headers_frame(&client_quinn, oversized_field_section(17_000)).await;
             // The connection stays alive while the server rejects the request.
             tokio::time::sleep(Duration::from_secs(1)).await;
