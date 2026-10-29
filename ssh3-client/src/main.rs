@@ -10,9 +10,9 @@ use ssh3_client::{
     Ssh3ClientError, Ssh3DynamicForwardSpec, Ssh3KnownHostsTrust, Ssh3LocalForwardSpec,
     Ssh3OidcConfig, Ssh3PtyPolicy, Ssh3ReverseForwardSpec, Ssh3SessionRequest,
     Ssh3StrictHostKeyChecking, Ssh3TransferOptions, Ssh3TransferPlan, Ssh3TrustStrategy, SshConfig,
-    default_known_hosts_path, default_ssh_config_path, exit_code_for_exit_signal,
-    is_remote_transfer_spec, load_certificates, load_ssh_config, parse_duration,
-    parse_dynamic_forward_spec, parse_escape_char, parse_local_forward_spec,
+    default_known_hosts_path, default_ssh_config_path, diag_error, diag_info,
+    exit_code_for_exit_signal, is_remote_transfer_spec, load_certificates, load_ssh_config,
+    parse_duration, parse_dynamic_forward_spec, parse_escape_char, parse_local_forward_spec,
     parse_remote_transfer_spec, parse_reverse_forward_spec, read_config_text,
     resolve_strict_host_key_checking, run_file_transfer, run_forwards_only, run_session_stdio,
 };
@@ -264,6 +264,16 @@ struct Cli {
     /// The deprecated alias of `-J`.
     #[arg(long = "proxy-jump", value_name = "DESTINATION")]
     proxy_jump: Option<String>,
+
+    /// Quiet mode: suppress the diagnostic messages, the errors stay
+    /// (ssh2 -q).
+    #[arg(short = 'q', long, conflicts_with = "verbose")]
+    quiet: bool,
+
+    /// Verbose mode: add the details of the connection to the
+    /// diagnostics (ssh2 -v).
+    #[arg(short = 'v', long)]
+    verbose: bool,
 
     /// Print the version string of the client and exit.
     ///
@@ -546,7 +556,7 @@ fn load_user_ssh_config(path: Option<&Path>) -> SshConfig {
     match load_ssh_config(&path) {
         Ok(configuration) => configuration,
         Err(err) => {
-            eprintln!(
+            crate::diag_info!(
                 "ssh3: could not open {}: {err}, ignoring config",
                 path.display()
             );
@@ -1393,14 +1403,14 @@ async fn run_control_mode(plan: &ClientPlan) -> Option<ExitCode> {
         let client = match control::connect_shared(&plan.config).await {
             Ok(client) => client,
             Err(err) => {
-                eprintln!("ssh3 control master: {err}");
+                crate::diag_error!("ssh3 control master: {err}");
                 return Some(ExitCode::from(255));
             }
         };
         let listener = match control::listen_control_master(&plan.control.path) {
             Ok(listener) => listener,
             Err(err) => {
-                eprintln!("ssh3 control master: {err}");
+                crate::diag_error!("ssh3 control master: {err}");
                 return Some(ExitCode::from(255));
             }
         };
@@ -1414,7 +1424,7 @@ async fn run_control_mode(plan: &ClientPlan) -> Option<ExitCode> {
             {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
-                    eprintln!("ssh3 control master: {err}");
+                    crate::diag_error!("ssh3 control master: {err}");
                     ExitCode::from(255)
                 }
             },
@@ -1431,7 +1441,7 @@ async fn run_control_mode(plan: &ClientPlan) -> Option<ExitCode> {
                 }
                 Ok(None) => ExitCode::SUCCESS,
                 Err(err) => {
-                    eprintln!("ssh3 control operation {op:?} failed: {err}");
+                    crate::diag_error!("ssh3 control operation {op:?} failed: {err}");
                     ExitCode::from(255)
                 }
             },
@@ -1452,11 +1462,13 @@ async fn run_control_mode(plan: &ClientPlan) -> Option<ExitCode> {
         ControlMasterPolicy::Yes => {
             if !control::ping_master(&plan.control.path).await {
                 if let Err(err) = start_detached_master() {
-                    eprintln!("ssh3: could not start the control master: {err}");
+                    crate::diag_info!("ssh3: could not start the control master: {err}");
                     return None;
                 }
                 if !wait_for_master(&plan.control.path).await {
-                    eprintln!("ssh3: the control master did not come up, connecting directly");
+                    crate::diag_info!(
+                        "ssh3: the control master did not come up, connecting directly"
+                    );
                     return None;
                 }
             }
@@ -1502,7 +1514,7 @@ async fn run_slave(plan: &ClientPlan) -> ExitCode {
     {
         Ok(code) => ExitCode::from(code as u8),
         Err(err) => {
-            eprintln!("ssh3 control-master session: {err}");
+            crate::diag_error!("ssh3 control-master session: {err}");
             ExitCode::from(255)
         }
     }
@@ -1628,6 +1640,10 @@ async fn main() -> ExitCode {
             return status;
         }
     };
+    // The diagnostic level of this invocation rides the `-q` / `-v` pair:
+    // the errors stay in every mode, the quiet hides the diagnostics, the
+    // verbose adds the connection details.
+    ssh3_client::log::configure(cli.quiet, cli.verbose);
     // The version string is printed on the standard output, like the Go
     // implementation does, and the connection is not opened.
     if cli.print_version {
@@ -1652,7 +1668,7 @@ async fn main() -> ExitCode {
         return match run_file_transfer(&plan.config, &transfer).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("ssh3: {err}");
+                crate::diag_error!("ssh3: {err}");
                 // the Go implementation leaves the process with the code -1,
                 // which the shell sees as 255
                 ExitCode::from(255)
@@ -1672,7 +1688,7 @@ async fn main() -> ExitCode {
         return match run_forwards_only(&plan.config).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("ssh3 failed: {err}");
+                crate::diag_error!("ssh3 failed: {err}");
                 ExitCode::FAILURE
             }
         };
@@ -1683,11 +1699,11 @@ async fn main() -> ExitCode {
         Err(Ssh3ClientError::ExitSignal(signal)) => {
             let name = String::from_utf8_lossy(&signal.signal_name_without_sig).to_string();
             let code = exit_code_for_exit_signal(name.strip_prefix("SIG").unwrap_or(&name));
-            eprintln!("ssh3: the remote process exited with signal {name}");
+            crate::diag_error!("ssh3: the remote process exited with signal {name}");
             ExitCode::from(code as u8)
         }
         Err(err) => {
-            eprintln!("ssh3 failed: {err}");
+            crate::diag_error!("ssh3 failed: {err}");
             ExitCode::FAILURE
         }
     }
@@ -1824,6 +1840,23 @@ mod tests {
         .unwrap();
         let plan = build_config(cli).unwrap();
         assert_eq!(plan.config.username.as_deref(), Some("admin"));
+    }
+
+    /// The diagnostic levels of the ssh2 canon: `-q` and `-v` parse
+    /// alone and refuse each other.
+    #[test]
+    fn the_quiet_and_verbose_flags_parse_and_conflict() {
+        let cli = Cli::try_parse_from(["ssh3", "-q", "https://localhost:4433/ssh3-term"]).unwrap();
+        assert!(cli.quiet);
+        assert!(!cli.verbose);
+
+        let cli = Cli::try_parse_from(["ssh3", "-v", "https://localhost:4433/ssh3-term"]).unwrap();
+        assert!(cli.verbose);
+        assert!(!cli.quiet);
+
+        let err = Cli::try_parse_from(["ssh3", "-q", "-v", "https://localhost:4433/ssh3-term"])
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
     }
 
     /// The policy of the known_hosts check of a configuration.

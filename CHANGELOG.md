@@ -20,6 +20,12 @@
 
 ## [Unreleased] / Не выпущено / Nicht veröffentlicht
 
+### Added / Добавлено / Hinzugefügt
+
+| English | Русский | Deutsch |
+|---------|---------|---------|
+| **The diagnostic levels of the ssh2 canon: `-v` / `-q`.** The `-v` flag adds the details of the connection (the resolution of the target, the session user) to the diagnostics, the `-q` flag suppresses the diagnostics and keeps the errors, the default level carries the ordinary status lines, and the pair refuses itself. The diagnostics of the client ride the three levels now: the failures and the rejects stay in every mode, the statuses hide under `-q`, and the connection details appear under `-v`. | **Диагностические уровни канона ssh2: `-v` / `-q`.** Флаг `-v` добавляет к диагностике детали соединения (резолв цели, пользователь сессии), флаг `-q` скрывает диагностику и оставляет ошибки, дефолтный уровень несёт обычные статусные строки, а пара флагов взаимоисключает себя. Диагностика клиента теперь едет по трём уровням: сбои и отказы видны всегда, статусы скрываются под `-q`, детали соединения появляются под `-v`. | **Die Diagnosestufen des ssh2-Kanons: `-v` / `-q`.** Das Flag `-v` ergibt der Diagnose die Verbindungsdetails (die Auflösung des Ziels, der Sitzungsbenutzer), das Flag `-q` unterdrückt die Diagnose und behält die Fehler, die Standardstufe trägt die üblichen Statuszeilen, und das Paar schließt sich gegenseitig aus. Die Diagnose des Clients fährt nun über drei Stufen: Fehlschläge und Ablehnungen bleiben in jedem Modus sichtbar, die Status verbergen sich unter `-q`, und die Verbindungsdetails erscheinen unter `-v`. |
+
 ## [0.2.3] - 2026-10-29
 
 ### Fixed / Исправлено / Behoben
