@@ -20,6 +20,8 @@
 
 ## [Unreleased] / Не выпущено / Nicht veröffentlicht
 
+## [0.2.2] - 2026-10-29
+
 ### Changed / Изменено / Geändert
 
 | English | Русский | Deutsch |
