@@ -1274,12 +1274,14 @@ mod tests {
             ssh3_proto::append_var_int(&mut settings, SETTINGS_FRAME_TYPE);
             ssh3_proto::append_var_int(&mut settings, 0);
             control.write_all(&settings).await.unwrap();
+            let mut encoder_header = Vec::new();
+            ssh3_proto::append_var_int(&mut encoder_header, 0x02);
             let mut encoder = client_quinn.open_uni().await.unwrap();
-            ssh3_proto::append_var_int(&mut encoder, 0x02);
-            encoder.write_all(&[]).await.unwrap();
+            encoder.write_all(&encoder_header).await.unwrap();
+            let mut decoder_header = Vec::new();
+            ssh3_proto::append_var_int(&mut decoder_header, 0x03);
             let mut decoder = client_quinn.open_uni().await.unwrap();
-            ssh3_proto::append_var_int(&mut decoder, 0x03);
-            decoder.write_all(&[]).await.unwrap();
+            decoder.write_all(&decoder_header).await.unwrap();
             send_raw_headers_frame(&client_quinn, oversized_field_section(17_000)).await;
             // The connection stays alive while the server rejects the request.
             tokio::time::sleep(Duration::from_secs(1)).await;
