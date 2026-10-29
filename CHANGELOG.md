@@ -20,6 +20,8 @@
 
 ## [Unreleased] / Не выпущено / Nicht veröffentlicht
 
+## [0.2.1] - 2026-10-29
+
 ### Fixed / Исправлено / Behoben
 
 | English | Русский | Deutsch |
