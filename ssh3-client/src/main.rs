@@ -13,8 +13,8 @@ use ssh3_client::{
     default_known_hosts_path, default_ssh_config_path, exit_code_for_exit_signal,
     is_remote_transfer_spec, load_certificates, load_ssh_config, parse_duration,
     parse_dynamic_forward_spec, parse_escape_char, parse_local_forward_spec,
-    parse_remote_transfer_spec, parse_reverse_forward_spec, resolve_strict_host_key_checking,
-    run_file_transfer, run_forwards_only, run_session_stdio,
+    parse_remote_transfer_spec, parse_reverse_forward_spec, read_config_text,
+    resolve_strict_host_key_checking, run_file_transfer, run_forwards_only, run_session_stdio,
 };
 
 #[derive(Debug, Parser)]
@@ -503,7 +503,10 @@ fn resolve_timeout(
 }
 
 fn read_secret_file(path: &Path, label: &str) -> Result<String, clap::Error> {
-    std::fs::read_to_string(path)
+    // The secrets ride the byte-tolerant reader of the configuration
+    // files: a PowerShell-created file carries a byte-order mark the
+    // strict UTF-8 read would reject.
+    read_config_text(path)
         .map(|contents| contents.trim_end_matches(['\r', '\n']).to_string())
         .map_err(|err| cli_error(ErrorKind::Io, format!("failed to read {label}: {err}")))
 }

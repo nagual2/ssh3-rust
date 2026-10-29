@@ -20,6 +20,14 @@
 
 ## [Unreleased] / Не выпущено / Nicht veröffentlicht
 
+## [0.2.3] - 2026-10-29
+
+### Fixed / Исправлено / Behoben
+
+| English | Русский | Deutsch |
+|---------|---------|---------|
+| **The ssh_config rides the bytes of the reference readers.** The configuration files are read as bytes with a byte-order-mark decode (the UTF-16 bodies of the PowerShell editors) and a lossy body decode, the way the byte-reading parsers of the reference get the same file: the ASCII directives of an ANSI (`cp1251`) ssh_config keep working, and the file with the non-UTF-8 bytes no longer dies with `stream did not contain valid UTF-8`. The includes and the secret files ride the same reader. | **ssh_config едет байтами, как у эталонных читателей.** Файлы конфигурации читаются байтами с декодированием по BOM (UTF-16-тела редакторов PowerShell) и lossy-декодированием тела, как получают тот же файл байтовые парсеры эталона: ASCII-директивы ANSI (`cp1251`) ssh_config продолжают работать, а файл с не-UTF-8 байтами больше не умирает с `stream did not contain valid UTF-8`. Include-файлы и файлы секретов едут тем же читателем. | **Die ssh_config fährt über die Bytes der Referenz-Leser.** Die Konfigurationsdateien werden als Bytes gelesen mit einer BOM-Dekodierung (die UTF-16-Körper der PowerShell-Editoren) und einer verlustbehafteten Dekodierung des Körpers, wie der bytelesende Parser der Referenz dieselbe Datei erhält: die ASCII-Direktiven einer ANSI-(`cp1251`-)ssh_config bleiben lebendig, und die Datei mit Nicht-UTF-8-Bytes stirbt nicht mehr an `stream did not contain valid UTF-8`. Include-Dateien und Geheimnisdateien fahren über denselben Leser. |
+
 ## [0.2.2] - 2026-10-29
 
 ### Changed / Изменено / Geändert

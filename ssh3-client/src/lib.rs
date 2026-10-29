@@ -95,7 +95,7 @@ pub use reverse::{
     Ssh3ReverseForwardParseError, Ssh3ReverseForwardProtocol, Ssh3ReverseForwardSpec,
     parse_reverse_forward_spec,
 };
-pub use ssh_config::{SshConfig, default_ssh_config_path, load_ssh_config};
+pub use ssh_config::{SshConfig, default_ssh_config_path, load_ssh_config, read_config_text};
 pub use strict_host_key::{
     HostKeyContext, HostKeyDecision, HostKeyOutcome, Ssh3StrictHostKeyChecking,
     Ssh3StrictHostKeyCheckingError, decide_host_key, resolve_strict_host_key_checking,

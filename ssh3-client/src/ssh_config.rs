@@ -311,11 +311,46 @@ fn first_value<'a>(section: &'a SshConfigSection, keyword: &str) -> Option<&'a s
         .map(|(_, value)| value.as_str())
 }
 
+/// Reads a configuration file the way the reference implementations do:
+/// the bytes of the file, not a UTF-8 requirement.
+///
+/// A byte-order mark picks the decoding (the UTF-16 files of the
+/// PowerShell editors are common on Windows), and a body without one
+/// rides the lossy decoding: the ASCII directives of an ANSI file stay
+/// alive, which is what the byte-reading reference parsers get out of
+/// the same file.
+pub fn read_config_text(path: &Path) -> io::Result<String> {
+    let bytes = fs::read(path)?;
+    Ok(match bytes.as_slice() {
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        [0xFF, 0xFE, rest @ ..] => decode_utf16(rest, true),
+        [0xFE, 0xFF, rest @ ..] => decode_utf16(rest, false),
+        _ => String::from_utf8_lossy(&bytes).into_owned(),
+    })
+}
+
+/// Decodes the UTF-16 body of a byte-order-marked file (little or big
+/// endian). An odd trailing byte or a broken pair becomes the
+/// replacement character instead of failing the whole file.
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
 /// Loads the ssh_config file of the user.
 ///
 /// A file that does not exist leaves the configuration empty.
 pub fn load_ssh_config(path: &Path) -> Result<SshConfig, io::Error> {
-    match fs::read_to_string(path) {
+    match read_config_text(path) {
         Ok(content) => Ok(SshConfig::parse_with_base(
             &content,
             path.parent()
@@ -596,7 +631,7 @@ fn expand_includes(
                     // include: the expansion stops, it does not fail.
                     continue;
                 }
-                let Ok(included) = fs::read_to_string(&path) else {
+                let Ok(included) = read_config_text(&path) else {
                     // An unreadable include does not invalidate the rest of
                     // the configuration.
                     continue;
@@ -994,5 +1029,42 @@ mod tests {
             config.values_for_user("example.org", "", "LocalForward"),
             vec!["8080:example.org:80", "8081:example.org:81"]
         );
+    }
+
+    /// The configuration rides the bytes the byte-reading reference
+    /// parsers get: an ANSI body keeps its ASCII directives, the UTF-16
+    /// body of the PowerShell editors rides the byte-order mark, and the
+    /// UTF-8 BOM of the notepad editors is stripped.
+    #[test]
+    fn the_config_rides_the_bytes_the_reference_readers_get() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config");
+
+        fs::write(
+            &path,
+            b"# \xCF\xF0\xE8\xE2\xE5\xF2 \xD2\xC5\xD1\xD2\xCE\xC2\r\nHost ansi\r\n  User max\r\n",
+        )
+        .unwrap();
+        let config = load_ssh_config(&path).unwrap();
+        assert_eq!(config.get("ansi", "User"), Some("max"));
+
+        let mut body: Vec<u8> = vec![0xFF, 0xFE];
+        for unit in "Host utf16\r\n  User max\r\n".encode_utf16() {
+            body.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(&path, body).unwrap();
+        let config = load_ssh_config(&path).unwrap();
+        assert_eq!(config.get("utf16", "User"), Some("max"));
+
+        fs::write(
+            &path,
+            [0xEF, 0xBB, 0xBF]
+                .into_iter()
+                .chain(b"Host bom\r\n  User max\r\n".iter().copied())
+                .collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        let config = load_ssh_config(&path).unwrap();
+        assert_eq!(config.get("bom", "User"), Some("max"));
     }
 }
