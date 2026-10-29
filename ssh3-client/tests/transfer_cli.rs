@@ -93,7 +93,7 @@ impl TransferServer {
 
 /// Runs the client of the transfer mode.
 fn run_transfer(arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ssh3-rust-client"))
+    Command::new(env!("CARGO_BIN_EXE_ssh3"))
         .args(arguments)
         .output()
         .expect("the client of the test did not run")
