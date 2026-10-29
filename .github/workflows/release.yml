@@ -324,13 +324,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --workspace --locked --release --bins --target "${{ matrix.target }}"
+          # The Windows server is frozen by the owner decision: the windows
+          # archive carries the client only, and no time is spent on the
+          # Windows patches of the server.
+          if [ "${{ matrix.windows }}" = "true" ]; then
+            cargo build -p ssh3-client --locked --release --bins --target "${{ matrix.target }}"
+          else
+            cargo build --workspace --locked --release --bins --target "${{ matrix.target }}"
+          fi
 
       - name: Check the architecture of the binaries
         shell: bash
         run: |
           set -euo pipefail
-          "${{ matrix.python }}" packaging/check-arch.py "${{ matrix.target }}" "target/${{ matrix.target }}/release"
+          extra=""
+          if [ "${{ matrix.windows }}" = "true" ]; then
+            extra="--client-only"
+          fi
+          "${{ matrix.python }}" packaging/check-arch.py "${{ matrix.target }}" "target/${{ matrix.target }}/release" $extra
 
       - name: Smoke test the binaries
         if: matrix.native
@@ -338,9 +349,14 @@ jobs:
         run: |
           set -euo pipefail
           # The binaries of a native leg have to start: a release must not
-          # publish a binary that does not answer `--version`.
+          # publish a binary that does not answer `--version`. The frozen
+          # Windows server is not part of the windows archive.
           directory="target/${{ matrix.target }}/release"
-          for name in ssh3 ssh3-rust-server; do
+          names="ssh3 ssh3-rust-server"
+          if [ "${{ matrix.windows }}" = "true" ]; then
+            names="ssh3"
+          fi
+          for name in $names; do
             binary="$directory/$name"
             if [ ! -f "$binary" ]; then
               binary="$binary.exe"
@@ -359,7 +375,11 @@ jobs:
           rm -rf "$stage"
           mkdir -p "$stage"
           directory="target/${{ matrix.target }}/release"
-          for name in ssh3 ssh3-rust-server; do
+          names="ssh3 ssh3-rust-server"
+          if [ "${{ matrix.windows }}" = "true" ]; then
+            names="ssh3"
+          fi
+          for name in $names; do
             if [ -f "$directory/$name" ]; then
               cp "$directory/$name" "$stage/$name"
             else

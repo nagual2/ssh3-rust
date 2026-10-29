@@ -20,6 +20,12 @@
 
 ## [Unreleased] / Не выпущено / Nicht veröffentlicht
 
+### Changed / Изменено / Geändert
+
+| English | Русский | Deutsch |
+|---------|---------|---------|
+| **The Windows archive carries the client only.** By the owner decision the Windows build of the server is frozen: the Windows release is built without the server binary, the composition matches the reference distributions (the Go and the C windows packages ship the client alone), and no time is spent on the Windows patches of the server. The Linux server packages are unchanged. | **Windows-архив несёт только клиента.** По решению владельца Windows-сборка сервера заморожена: Windows-релиз собирается без серверного бинарника, состав совпадает с эталонными дистрибутивами (Windows-пакеты Go и C возят одного клиента), а время на Windows-патчи сервера не тратится. Linux-пакеты сервера без изменений. | **Das Windows-Archiv trägt nur den Client.** Nach der Entscheidung des Eigentümers ist der Windows-Bau des Servers eingefroren: das Windows-Release wird ohne das Server-Binary gebaut, die Zusammensetzung entspricht den Referenz-Distributionen (die Windows-Pakete von Go und C liefern allein den Client), und keine Zeit fließt in die Windows-Patches des Servers. Die Linux-Serverpakete bleiben unverändert. |
+
 ## [0.2.1] - 2026-10-29
 
 ### Fixed / Исправлено / Behoben

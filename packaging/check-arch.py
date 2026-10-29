@@ -51,8 +51,8 @@ def detect(path: str) -> tuple[str, int]:
 
 def main(argv: list[str]) -> int:
     """Checks the binaries of the given target."""
-    if len(argv) != 3:
-        print(f"usage: {argv[0]} <target> <directory>", file=sys.stderr)
+    if len(argv) not in (3, 4):
+        print(f"usage: {argv[0]} <target> <directory> [--client-only]", file=sys.stderr)
         return 2
 
     target, directory = argv[1], argv[2]
@@ -60,8 +60,12 @@ def main(argv: list[str]) -> int:
         print(f"error: unknown target '{target}'", file=sys.stderr)
         return 2
 
+    # The Windows server is frozen by the owner decision: the windows
+    # release carries the client only.
+    binaries = ("ssh3",) if "--client-only" in argv else BINARIES
+
     expected_format, expected_machine = EXPECTED[target]
-    for name in BINARIES:
+    for name in binaries:
         path = ""
         for candidate in (os.path.join(directory, name), os.path.join(directory, f"{name}.exe")):
             if os.path.isfile(candidate):
