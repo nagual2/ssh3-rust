@@ -226,12 +226,17 @@ jobs:
           # libcrypt when the libxcrypt split reached them: the library of
           # the arm64 port is unpacked into the cross sysroot by hand.
           if ! test -e /usr/aarch64-linux-gnu/lib/libcrypt.so; then
+            set -x
             pool="https://ports.ubuntu.com/pool/main/libx/libxcrypt"
             listing="$(curl -fL --retry 3 --show-error -sS "$pool/")"
             package="$(printf '%s' "$listing" | grep -o 'libcrypt-dev_[^"]*arm64\.deb' | sort -uV | tail -n1)"
             echo "the libcrypt package of the arm64 port: $package"
             test -n "$package"
-            curl -fL --retry 3 --show-error -sS -o /tmp/libcrypt-dev-arm64.deb "$pool/$package"
+            if ! curl -fL --retry 3 --show-error -sS -o /tmp/libcrypt-dev-arm64.deb "$pool/$package"; then
+              echo "the download of the libcrypt package failed: $?"
+              exit 1
+            fi
+            ls -la /tmp/libcrypt-dev-arm64.deb
             unpack="$(mktemp -d)"
             sudo dpkg-deb -x /tmp/libcrypt-dev-arm64.deb "$unpack"
             for directory in lib lib/aarch64-linux-gnu; do
@@ -364,29 +369,13 @@ jobs:
           # dependency tree of the binaries.
           cp Cargo.lock "$stage/Cargo.lock"
 
-      - name: Generate the SBOM
-        if: ${{ !matrix.windows }}
-        uses: anchore/sbom-action@v0
-        with:
-          path: stage/${{ matrix.target }}
-          format: spdx-json
-          # `file` is the input name of the current major of the action:
-          # the former `output-file` is silently ignored, and the checksum
-          # step of the target waits for the file.
-          file: sbom-${{ matrix.target }}.spdx.json
-          artifact-name: sbom-${{ matrix.target }}
-          # The SBOM is published inside the archive of the target, the
-          # action does not have to upload it a second time.
-          upload-artifact: false
-
       - name: Install syft
-        if: matrix.windows
-        # `anchore/sbom-action` is a docker action and cannot run on the
-        # windows runners, so the syft binary is used directly there.
+        # The sbom action scans its input and uploads an artifact, it does
+        # not write the file of the document anymore; the direct syft call
+        # keeps the SBOM on disk for the archive and the checksums.
         uses: anchore/sbom-action/download-syft@v0
 
       - name: Generate the SBOM
-        if: matrix.windows
         shell: bash
         run: |
           set -euo pipefail
