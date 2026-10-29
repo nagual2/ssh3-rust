@@ -229,21 +229,26 @@ jobs:
             set -x
             pool="https://ports.ubuntu.com/pool/main/libx/libxcrypt"
             listing="$(curl -fL --retry 3 --show-error -sS "$pool/")"
-            package="$(printf '%s' "$listing" | grep -o 'libcrypt-dev_[^"]*arm64\.deb' | sort -uV | tail -n1)"
-            echo "the libcrypt package of the arm64 port: $package"
-            test -n "$package"
-            if ! curl -fL --retry 3 --show-error -sS -o /tmp/libcrypt-dev-arm64.deb "$pool/$package"; then
-              echo "the download of the libcrypt package failed: $?"
-              exit 1
-            fi
-            ls -la /tmp/libcrypt-dev-arm64.deb
             unpack="$(mktemp -d)"
-            sudo dpkg-deb -x /tmp/libcrypt-dev-arm64.deb "$unpack"
+            # The dev package carries only the broken `libcrypt.so` symlink
+            # of its release: the runtime library lives in `libcrypt1`, so
+            # both packages unpack into the cross sysroot together.
+            for name in libcrypt1 libcrypt-dev; do
+              package="$(printf '%s' "$listing" | grep -o "${name}_[^\"]*arm64\.deb" | sort -uV | tail -n1)"
+              echo "the $name package of the arm64 port: $package"
+              test -n "$package"
+              if ! curl -fL --retry 3 --show-error -sS -o "/tmp/$name-arm64.deb" "$pool/$package"; then
+                echo "the download of the $name package failed: $?"
+                exit 1
+              fi
+              sudo dpkg-deb -x "/tmp/$name-arm64.deb" "$unpack"
+            done
             for directory in lib lib/aarch64-linux-gnu; do
               sudo mkdir -p "/usr/aarch64-linux-gnu/$directory"
               sudo cp -a "$unpack/usr/lib/aarch64-linux-gnu/." "/usr/aarch64-linux-gnu/$directory/"
             done
             test -e /usr/aarch64-linux-gnu/lib/libcrypt.so
+            test -e /usr/aarch64-linux-gnu/lib/libcrypt.a
           fi
 
       - name: Install the build prerequisites of the target
@@ -391,6 +396,9 @@ jobs:
           cp "sbom-${{ matrix.target }}.spdx.json" "$stage/sbom.spdx.json"
           archive="ssh3-rust_${version}_${{ matrix.os }}_${{ matrix.arch }}.${{ matrix.archive }}"
           mkdir -p dist
+          # The checksums of the target sign the archive and the SBOM
+          # document: the copy rides to the release assets with the archive.
+          cp "sbom-${{ matrix.target }}.spdx.json" "dist/sbom-${{ matrix.target }}.spdx.json"
           "${{ matrix.python }}" packaging/make-archive.py \
             --format "${{ matrix.archive }}" \
             --output "dist/$archive" \
