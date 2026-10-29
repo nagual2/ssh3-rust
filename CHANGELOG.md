@@ -20,6 +20,8 @@
 
 ## [Unreleased] / Не выпущено / Nicht veröffentlicht
 
+## [0.2.4] - 2026-10-29
+
 ### Added / Добавлено / Hinzugefügt
 
 | English | Русский | Deutsch |
