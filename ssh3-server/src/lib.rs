@@ -63,4 +63,4 @@ pub use forwarding_wire::Ssh3ForwardingWireError;
 pub use runtime::{serve_connection, serve_endpoint};
 pub use sftp::SftpSessionBudget;
 pub use sftp_child::{InternalSftpOptions, run_internal_sftp_server};
-pub use tls::{apply_transport_timeouts, run_with_self_signed};
+pub use tls::{apply_transport_limits, run_with_self_signed};

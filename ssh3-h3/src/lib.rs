@@ -25,7 +25,17 @@ pub const SSH3_USER_HEADER: &str = "x-ssh3-user";
 /// mask of the channel body compression). The field is optional on the wire:
 /// a peer without it simply never sends compressed frames.
 pub const SSH3_VERSION_STRING: &str =
-    "SSH 3.0 ssh3-rust 0.1.0 experimental_spec_version=alpha-00 compress=zstd,deflate,lz4";
+    "SSH 3.0 ssh3-rust 0.2.0 experimental_spec_version=alpha-00 compress=zstd,deflate,lz4";
+/// The maximum size of the HEADERS field section an endpoint accepts.
+///
+/// The HTTP/3 layer buffers the whole compressed field section of a HEADERS
+/// frame before it decodes it, and the library default lets that buffer grow
+/// up to `VarInt::MAX`: without this limit a peer grows the receive buffers
+/// of the connection with oversized HEADERS before any authentication
+/// happens. 16 KiB holds the SSH3 CONNECT request (the method, the
+/// `:protocol` pseudo-header, the path, the `Authorization` and the user
+/// agent headers) with room to spare (audit 2026-10-27, finding 3.5.1).
+pub const MAX_FIELD_SECTION_SIZE: u64 = 16 * 1024;
 
 pub type Ssh3QuinnConnection = h3_quinn::Connection;
 pub type Ssh3ClientConnection = h3::client::Connection<Ssh3QuinnConnection, Bytes>;
@@ -341,6 +351,11 @@ pub fn ssh3_protocol() -> Protocol {
 /// The extended CONNECT is required: SSH3 tunnels its conversation over a
 /// CONNECT request with the `:protocol` pseudo-header set to `ssh3`.
 ///
+/// The HEADERS field sections the peer sends stay bounded by
+/// [`MAX_FIELD_SECTION_SIZE`]: the HTTP/3 layer buffers a whole field
+/// section before it decodes it, and the client applies the limit to the
+/// response headers of the server before any conversation is established.
+///
 /// The HTTP/3 datagram setting stays disabled on purpose. SSH3 carries its
 /// own datagrams (the UDP forwarding) directly over the QUIC datagram API,
 /// and the HTTP/3 datagram layer of the peer would open a second reader on
@@ -350,15 +365,24 @@ pub fn ssh3_protocol() -> Protocol {
 /// support (quic-go does it in `http3/conn.go`, `handleControlStream`), so
 /// the setting must not be announced at all.
 pub fn configure_client_builder(builder: &mut h3::client::Builder) -> &mut h3::client::Builder {
-    builder.enable_extended_connect(true).enable_datagram(false)
+    builder
+        .enable_extended_connect(true)
+        .enable_datagram(false)
+        .max_field_section_size(MAX_FIELD_SECTION_SIZE)
 }
 
 /// Configures the HTTP/3 layer of the server.
 ///
 /// See [`configure_client_builder`] for the reason why the HTTP/3 datagram
-/// setting stays disabled.
+/// setting stays disabled, and for the reason why the HEADERS field
+/// sections of the peer stay bounded by [`MAX_FIELD_SECTION_SIZE`]. On the
+/// server the limit applies to the request headers of the client, before
+/// any authentication happens.
 pub fn configure_server_builder(builder: &mut h3::server::Builder) -> &mut h3::server::Builder {
-    builder.enable_extended_connect(true).enable_datagram(false)
+    builder
+        .enable_extended_connect(true)
+        .enable_datagram(false)
+        .max_field_section_size(MAX_FIELD_SECTION_SIZE)
 }
 
 pub async fn new_client(
@@ -573,10 +597,11 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        SSH3_PROTOCOL_NAME, SSH3_VERSION_STRING, Ssh3ServerConnectionDriver,
-        accept_server_conversation, build_connect_request, establish_client_conversation,
-        is_ssh3_connect, new_client, new_server, request_protocol, request_user_agent,
-        response_server_header, response_with_server_header,
+        MAX_FIELD_SECTION_SIZE, SSH3_PROTOCOL_NAME, SSH3_VERSION_STRING,
+        Ssh3ServerConnectionDriver, Ssh3ServerConversationError, accept_server_conversation,
+        build_connect_request, establish_client_conversation, is_ssh3_connect, new_client,
+        new_server, request_protocol, request_user_agent, response_server_header,
+        response_with_server_header,
     };
 
     #[test]
@@ -1085,5 +1110,206 @@ mod tests {
 
         let (server_result, client_result) = tokio::join!(server_task, client_task);
         let _ = (server_result, client_result);
+    }
+
+    /// The type of the HTTP/3 HEADERS frame.
+    const HEADERS_FRAME_TYPE: u64 = 0x01;
+    /// The HTTP/3 setting that announces the maximum field section size.
+    const SETTING_MAX_HEADER_LIST_SIZE: u64 = 0x06;
+
+    /// The limit stays at the pre-auth bound the endpoints are built for:
+    /// the number is pinned so a casual edit does not silently widen it.
+    #[test]
+    fn the_field_section_limit_is_16_kib() {
+        assert_eq!(MAX_FIELD_SECTION_SIZE, 16384);
+    }
+
+    /// Each endpoint announces its field section limit in the SETTINGS frame
+    /// of its control stream: the peer uses the announced value as the bound
+    /// of the HEADERS it sends back, so the limit only protects the endpoint
+    /// if the setting is actually on the wire.
+    #[tokio::test]
+    async fn the_endpoints_announce_their_max_field_section_size() {
+        let (server_config, server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server_endpoint = h3_quinn::quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let mut client_endpoint = h3_quinn::quinn::Endpoint::client(SocketAddr::V4(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        ))
+        .unwrap();
+        client_endpoint
+            .set_default_client_config(client_config_for_certificate(server_certificate).unwrap());
+
+        let client_connecting = client_endpoint.connect(server_addr, "localhost").unwrap();
+        let (client_quinn, server_quinn) =
+            tokio::join!(async { client_connecting.await.unwrap() }, async {
+                let incoming = server_endpoint.accept().await.unwrap();
+                incoming.await.unwrap()
+            },);
+
+        let client_quinn_for_settings = client_quinn.clone();
+        let client_task = tokio::spawn(async move {
+            let _client = new_client(client_quinn_for_settings).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let server_quinn_for_settings = server_quinn.clone();
+        let server_task = tokio::spawn(async move {
+            let _server = new_server(server_quinn_for_settings).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        // The settings of the client, read on the server endpoint.
+        let client_settings = read_peer_settings(&server_quinn).await;
+        // The settings of the server, read on the client endpoint.
+        let server_settings = read_peer_settings(&client_quinn).await;
+        client_task.abort();
+        server_task.abort();
+
+        for (who, settings) in [("client", client_settings), ("server", server_settings)] {
+            assert!(
+                settings.iter().any(|(id, value)| {
+                    *id == SETTING_MAX_HEADER_LIST_SIZE && *value == MAX_FIELD_SECTION_SIZE
+                }),
+                "the {who} must announce the field section limit: {settings:?}"
+            );
+        }
+    }
+
+    /// Builds a QPACK stateless field section with one literal header field
+    /// without name reference whose decoded size exceeds
+    /// [`MAX_FIELD_SECTION_SIZE`].
+    ///
+    /// The wire format is written by hand: a rogue peer ignores the limit
+    /// announced by the SETTINGS frame of its peer and does not go through
+    /// the HTTP/3 layer of the client, which would refuse to send the
+    /// request. The prefix integers of QPACK continue in little endian
+    /// 7-bit groups.
+    fn oversized_field_section(value_len: usize) -> Vec<u8> {
+        let mut block = vec![
+            0x00, // the required insert count: 0
+            0x00, // the delta base: 0
+            0x21, // a literal field without name reference, name length 1
+            b'a',
+        ];
+        let mut remaining = value_len as u64 - 127;
+        block.push(0x7f); // the value length: the 7 inline bits are exhausted
+        while remaining >= 128 {
+            block.push((remaining % 128) as u8 + 128);
+            remaining /= 128;
+        }
+        block.push(remaining as u8);
+        block.extend(std::iter::repeat_n(b'x', value_len));
+        block
+    }
+
+    /// Opens a raw QUIC stream and sends one HEADERS frame with the given
+    /// field section, without any HTTP/3 client layer.
+    ///
+    /// The receive side stays with the caller: the server answers the
+    /// oversized request on it, and a dropped receive side would carry the
+    /// `STOP_SENDING` that turns the answer into a remote-terminate error
+    /// before the headers rejection comes through.
+    async fn send_raw_headers_frame(
+        connection: &h3_quinn::quinn::Connection,
+        field_section: Vec<u8>,
+    ) -> h3_quinn::quinn::RecvStream {
+        let (mut send, recv) = connection.open_bi().await.unwrap();
+        let mut frame = Vec::new();
+        ssh3_proto::append_var_int(&mut frame, HEADERS_FRAME_TYPE);
+        ssh3_proto::append_var_int(&mut frame, field_section.len() as u64);
+        frame.extend_from_slice(&field_section);
+        send.write_all(&frame).await.unwrap();
+        send.finish().unwrap();
+        recv
+    }
+
+    /// The field section limit holds before any authentication: a rogue peer
+    /// that sends request headers above the announced limit gets its request
+    /// rejected instead of having its headers buffered by the HTTP/3 layer.
+    #[tokio::test]
+    async fn the_server_rejects_request_headers_above_the_field_section_limit() {
+        let (server_config, server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server_endpoint = h3_quinn::quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let mut client_endpoint = h3_quinn::quinn::Endpoint::client(SocketAddr::V4(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        ))
+        .unwrap();
+        client_endpoint
+            .set_default_client_config(client_config_for_certificate(server_certificate).unwrap());
+
+        let client_connecting = client_endpoint.connect(server_addr, "localhost").unwrap();
+        let (client_quinn, server_quinn) =
+            tokio::join!(async { client_connecting.await.unwrap() }, async {
+                let incoming = server_endpoint.accept().await.unwrap();
+                incoming.await.unwrap()
+            },);
+        let (server_done_tx, server_done_rx) = oneshot::channel();
+
+        let _server_task = tokio::spawn(async move {
+            let mut server = new_server(server_quinn.clone()).await.unwrap();
+            let accepted = tokio::time::timeout(
+                Duration::from_secs(5),
+                accept_server_conversation(&mut server, server_quinn, 30_000, 10),
+            )
+            .await
+            .unwrap();
+            let _ = server_done_tx.send(accepted);
+        });
+
+        let client_task = tokio::spawn(async move {
+            // The unidirectional streams of a real HTTP/3 client go first:
+            // the control stream carries the (empty) SETTINGS, and the QPACK
+            // encoder and decoder streams complete the connection preamble
+            // the server waits for before it reads the request streams.
+            let mut control = client_quinn.open_uni().await.unwrap();
+            let mut settings = Vec::new();
+            ssh3_proto::append_var_int(&mut settings, CONTROL_STREAM_TYPE);
+            ssh3_proto::append_var_int(&mut settings, SETTINGS_FRAME_TYPE);
+            ssh3_proto::append_var_int(&mut settings, 0);
+            control.write_all(&settings).await.unwrap();
+            let mut encoder_header = Vec::new();
+            ssh3_proto::append_var_int(&mut encoder_header, 0x02);
+            let mut encoder = client_quinn.open_uni().await.unwrap();
+            encoder.write_all(&encoder_header).await.unwrap();
+            let mut decoder_header = Vec::new();
+            ssh3_proto::append_var_int(&mut decoder_header, 0x03);
+            let mut decoder = client_quinn.open_uni().await.unwrap();
+            decoder.write_all(&decoder_header).await.unwrap();
+            let _answer_recv =
+                send_raw_headers_frame(&client_quinn, oversized_field_section(17_000)).await;
+            // The connection stays alive while the server rejects the request.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let accepted = tokio::time::timeout(Duration::from_secs(5), server_done_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        client_task.abort();
+
+        match accepted {
+            Err(Ssh3ServerConversationError::Stream(err)) => assert!(
+                matches!(err, h3::error::StreamError::HeaderTooBig { .. }),
+                "expected a too big headers error, got {err:?}"
+            ),
+            Err(err) => panic!("expected a too big headers error, got {err:?}"),
+            Ok(accepted) => panic!(
+                "expected the oversized request to be rejected, got a conversation on stream {}",
+                accepted.unwrap().conversation.control_stream_id()
+            ),
+        }
     }
 }

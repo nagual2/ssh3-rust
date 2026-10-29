@@ -22,6 +22,17 @@ pub type Ssh3ConversationId = [u8; 32];
 
 const DANGLING_DATAGRAM_QUEUE_SIZE: usize = 10;
 
+/// The number of channel ids a conversation parks datagram queues for.
+///
+/// A datagram for a channel that does not exist yet parks in a dangling
+/// queue until the channel opens; the queue itself stays bounded by
+/// [`DANGLING_DATAGRAM_QUEUE_SIZE`]. The set of parked ids stays bounded
+/// too: when the map is full, a datagram for a still unknown id is dropped
+/// instead of adding one more entry, so a peer cannot grow the map with
+/// arbitrary channel ids it never opens. A channel id that already parked a
+/// queue keeps replacing it (audit 2026-10-27, finding 3.5.3a).
+const MAX_DANGLING_QUEUES: usize = 256;
+
 /// Everything that can fail while a conversation is used.
 #[derive(Debug)]
 pub enum Ssh3ConversationError {
@@ -427,6 +438,14 @@ impl ChannelsManager {
             if let Some(channel) = state.channels.get(&channel_id) {
                 Some(channel.clone())
             } else {
+                // The datagram of a new unknown id is dropped once the map
+                // reached its cap: the queue handed over by the caller keeps
+                // holding it and dies at the end of the scope.
+                if !state.dangling_datagram_queues.contains_key(&channel_id)
+                    && state.dangling_datagram_queues.len() >= MAX_DANGLING_QUEUES
+                {
+                    return;
+                }
                 state
                     .dangling_datagram_queues
                     .insert(channel_id, queue.clone());
@@ -458,7 +477,7 @@ mod tests {
 
     use ssh3_proto::{Ssh3ChannelOpenConfirmationMessage, Ssh3Message};
 
-    use super::{Ssh3Conversation, Ssh3ConversationError};
+    use super::{MAX_DANGLING_QUEUES, Ssh3Conversation, Ssh3ConversationError};
     use crate::channel::{Ssh3AcceptedChannel, Ssh3Channel};
     use crate::transport::testutil::{
         BytesReceiveStream, RecordingDatagramSender, RecordingSendStream,
@@ -619,6 +638,72 @@ mod tests {
         let (send, _) = RecordingSendStream::new();
         let channel = conversation.open_channel(42, b"session".to_vec(), 1024, 8, recv, send);
 
+        assert_eq!(channel.receive_datagram().await, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn dangling_datagram_queues_stay_capped_on_unknown_channel_ids() {
+        let sender = Arc::new(RecordingDatagramSender::default());
+        let conversation = Ssh3Conversation::new(10, conversation_id(), 2048, 8, sender);
+
+        for channel_id in 0..(MAX_DANGLING_QUEUES as u64 + 50) {
+            let mut datagram = Vec::new();
+            ssh3_proto::append_var_int(&mut datagram, channel_id);
+            datagram.extend_from_slice(&[7]);
+
+            match conversation.add_datagram(&datagram).await {
+                Err(Ssh3ConversationError::ChannelNotFound { channel_id: id }) => {
+                    assert_eq!(id, channel_id)
+                }
+                other => panic!("expected missing channel error, got {other:?}"),
+            }
+        }
+
+        let state = conversation.channels_manager.state.lock().unwrap();
+        assert_eq!(
+            state.dangling_datagram_queues.len(),
+            MAX_DANGLING_QUEUES,
+            "the datagrams above the cap must be dropped, not parked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_datagram_for_a_known_id_is_kept_when_the_dangling_map_is_full() {
+        let sender = Arc::new(RecordingDatagramSender::default());
+        let conversation = Ssh3Conversation::new(10, conversation_id(), 2048, 8, sender);
+
+        // Fill the map up to the cap.
+        for channel_id in 0..MAX_DANGLING_QUEUES as u64 {
+            let mut datagram = Vec::new();
+            ssh3_proto::append_var_int(&mut datagram, channel_id);
+            datagram.extend_from_slice(&[7]);
+            conversation.add_datagram(&datagram).await.unwrap_err();
+        }
+
+        // A datagram for an id that already parked a queue is still taken:
+        // it replaces the parked queue of that id instead of being dropped.
+        let mut datagram = Vec::new();
+        ssh3_proto::append_var_int(&mut datagram, 0);
+        datagram.extend_from_slice(&[1, 2, 3]);
+        match conversation.add_datagram(&datagram).await {
+            Err(Ssh3ConversationError::ChannelNotFound { channel_id }) => {
+                assert_eq!(channel_id, 0)
+            }
+            other => panic!("expected missing channel error, got {other:?}"),
+        }
+
+        let parked = conversation
+            .channels_manager
+            .state
+            .lock()
+            .unwrap()
+            .dangling_datagram_queues
+            .len();
+        assert_eq!(parked, MAX_DANGLING_QUEUES);
+
+        let (recv, _) = BytesReceiveStream::new(Vec::new());
+        let (send, _) = RecordingSendStream::new();
+        let channel = conversation.open_channel(0, b"session".to_vec(), 1024, 8, recv, send);
         assert_eq!(channel.receive_datagram().await, vec![1, 2, 3]);
     }
 

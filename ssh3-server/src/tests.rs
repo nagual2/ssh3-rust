@@ -42,7 +42,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::config::{Ssh3ServerConfig, current_username, parse_duration};
 use crate::forwarding::ForwardPolicy;
-use crate::runtime::serve_connection;
+use crate::runtime::{serve_connection, serve_endpoint};
 use crate::session::{effective_shell, lookup_session_user};
 
 pub(crate) struct TestHarness {
@@ -1292,6 +1292,194 @@ async fn conversations_over_the_unauthenticated_cap_are_refused() {
         connect_status(config, "/ssh3-term", None).await,
         http::StatusCode::OK
     );
+}
+
+#[tokio::test]
+async fn a_connection_that_stays_silent_is_closed_by_the_pre_auth_timeout() {
+    let config = Ssh3ServerConfig {
+        handshake_idle_timeout: Duration::from_secs(1),
+        ..Default::default()
+    };
+    let (server_tls, server_certificate) =
+        self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+    let server_endpoint = quinn::Endpoint::server(
+        server_tls,
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+    )
+    .unwrap();
+    let server_addr = server_endpoint.local_addr().unwrap();
+    let server_task = tokio::spawn(serve_endpoint(server_endpoint, config));
+
+    let mut client_endpoint =
+        quinn::Endpoint::client(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+    client_endpoint
+        .set_default_client_config(client_config_for_certificate(server_certificate).unwrap());
+
+    // the client completes the QUIC handshake and then stays silent: no
+    // control stream, no CONNECT
+    let client_connection = timeout(
+        Duration::from_secs(5),
+        client_endpoint.connect(server_addr, "localhost").unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // the server closes the connection after the pre-auth timeout instead of
+    // letting the silent peer hold a task for the idle timeout of the
+    // transport (the audit of 2026-10-27, risk 3.5.2)
+    let started = std::time::Instant::now();
+    timeout(Duration::from_secs(4), client_connection.closed())
+        .await
+        .expect("the server closes the silent connection within the pre-auth timeout");
+    assert!(
+        started.elapsed() >= Duration::from_millis(500),
+        "the connection was closed before the pre-auth timeout could elapse"
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn connections_over_the_max_connections_cap_are_refused_until_a_slot_frees() {
+    let config = Ssh3ServerConfig {
+        max_connections: 1,
+        ..Default::default()
+    };
+    let (server_tls, server_certificate) =
+        self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+    let server_endpoint = quinn::Endpoint::server(
+        server_tls,
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+    )
+    .unwrap();
+    let server_addr = server_endpoint.local_addr().unwrap();
+    let server_task = tokio::spawn(serve_endpoint(server_endpoint, config));
+
+    // the first client occupies the only connection slot
+    let mut first_endpoint =
+        quinn::Endpoint::client(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+    first_endpoint.set_default_client_config(
+        client_config_for_certificate(server_certificate.clone()).unwrap(),
+    );
+    let first_connection = timeout(
+        Duration::from_secs(5),
+        first_endpoint.connect(server_addr, "localhost").unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let (mut driver, mut send_request) = new_client(first_connection.clone()).await.unwrap();
+    let driver_task = tokio::spawn(async move {
+        let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+    let request = build_connect_request(
+        "https://localhost/ssh3-term".parse().unwrap(),
+        SSH3_VERSION_STRING,
+    )
+    .unwrap();
+    timeout(
+        Duration::from_secs(5),
+        establish_client_conversation(
+            &mut send_request,
+            first_connection.clone(),
+            request,
+            30_000,
+            10,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // a second client is refused while the slot is held
+    let mut second_endpoint =
+        quinn::Endpoint::client(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+    second_endpoint.set_default_client_config(
+        client_config_for_certificate(server_certificate.clone()).unwrap(),
+    );
+    let refused = timeout(
+        Duration::from_secs(5),
+        second_endpoint.connect(server_addr, "localhost").unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        refused.is_err(),
+        "a connection over the cap must be refused"
+    );
+
+    // the first client goes away: its slot frees up and a new client is
+    // admitted (the close of the client and the release of the slot on the
+    // server race each other, so the admission is retried)
+    first_connection.close(0u32.into(), b"done");
+    let _ = timeout(Duration::from_secs(5), driver_task).await.unwrap();
+    first_endpoint.wait_idle().await;
+
+    let mut admitted = None;
+    for _ in 0..20 {
+        let connecting = second_endpoint.connect(server_addr, "localhost").unwrap();
+        match timeout(Duration::from_secs(2), connecting).await {
+            Ok(Ok(connection)) => {
+                admitted = Some(connection);
+                break;
+            }
+            Ok(Err(_)) => sleep(Duration::from_millis(100)).await,
+            Err(_) => panic!("the retried client was neither admitted nor refused in time"),
+        }
+    }
+    assert!(
+        admitted.is_some(),
+        "the server never admitted a client after a slot freed up"
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn channels_over_the_conversation_budget_are_refused() {
+    let config = Ssh3ServerConfig {
+        max_channels_per_conversation: 1,
+        ..Default::default()
+    };
+    let harness = setup_harness(config).await;
+    let kept = harness.open_session_channel().await;
+    // the header of an outgoing channel is written lazily: the open only
+    // reaches the server once it is flushed
+    kept.maybe_send_header().await.unwrap();
+    let _kept = kept;
+
+    // the channel over the budget is confirmed at the protocol level, but
+    // the server refuses to serve it and tears it down: the peer sees the
+    // refusal instead of a silently dead channel
+    let refused = harness.open_channel(b"session").await;
+    refused.maybe_send_header().await.unwrap();
+    let verdict = timeout(Duration::from_secs(5), refused.next_message()).await;
+    assert!(verdict.is_ok(), "the refused channel ends promptly");
+    assert!(
+        verdict.unwrap().is_err(),
+        "the refused channel is torn down, not kept open"
+    );
+
+    harness.shutdown().await;
+}
+
+#[test]
+fn the_resource_limit_defaults_follow_the_go_reference() {
+    let config = Ssh3ServerConfig::default();
+    // the Go reference: -max-connections 0 (unbounded), the 64-channel budget
+    // of a conversation, and the quic-go defaults of 100 concurrent
+    // peer-initiated streams of each direction
+    assert_eq!(config.max_connections, 0);
+    assert_eq!(config.max_channels_per_conversation, 64);
+    assert_eq!(config.max_incoming_streams, 100);
+    assert_eq!(config.max_incoming_uni_streams, 100);
+
+    // the stream caps are valid transport parameters (quinn exposes no
+    // getters, so the check is that the application does not panic)
+    let (mut server_tls, _certificate) =
+        self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+    crate::tls::apply_transport_limits(&mut server_tls, &config);
 }
 
 #[tokio::test]

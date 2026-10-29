@@ -18,6 +18,10 @@ const ENV_URL_PATH: &str = "SSH3_URL_PATH";
 const ENV_HANDSHAKE_IDLE_TIMEOUT: &str = "SSH3_HANDSHAKE_IDLE_TIMEOUT";
 const ENV_MAX_IDLE_TIMEOUT: &str = "SSH3_MAX_IDLE_TIMEOUT";
 const ENV_MAX_UNAUTH_CONVERSATIONS: &str = "SSH3_MAX_UNAUTH_CONVERSATIONS";
+const ENV_MAX_CONNECTIONS: &str = "SSH3_MAX_CONNECTIONS";
+const ENV_MAX_CHANNELS_PER_CONVERSATION: &str = "SSH3_MAX_CHANNELS_PER_CONVERSATION";
+const ENV_MAX_INCOMING_STREAMS: &str = "SSH3_MAX_INCOMING_STREAMS";
+const ENV_MAX_INCOMING_UNI_STREAMS: &str = "SSH3_MAX_INCOMING_UNI_STREAMS";
 const ENV_MAX_PASSWORD_FAILURES: &str = "SSH3_MAX_PASSWORD_FAILURES";
 const ENV_PASSWORD_LOCKOUT: &str = "SSH3_PASSWORD_LOCKOUT_SECONDS";
 const ENV_PASSWORD_LOCKOUT_ALIAS: &str = "SSH3_MAX_PASSWORD_FAILOUT_SECONDS";
@@ -111,6 +115,25 @@ struct Cli {
     #[arg(long = "max-unauth-conversations", value_name = "COUNT")]
     max_unauthenticated_conversations: Option<usize>,
 
+    /// Maximum number of concurrent QUIC connections; `0` disables the cap.
+    #[arg(long = "max-connections", value_name = "COUNT")]
+    max_connections: Option<usize>,
+
+    /// Maximum number of concurrently open channels per conversation; `0`
+    /// disables the budget.
+    #[arg(long = "max-channels-per-conversation", value_name = "COUNT")]
+    max_channels_per_conversation: Option<usize>,
+
+    /// Maximum number of concurrent peer-initiated bidirectional QUIC streams
+    /// per connection.
+    #[arg(long = "max-incoming-streams", value_name = "COUNT")]
+    max_incoming_streams: Option<u32>,
+
+    /// Maximum number of concurrent peer-initiated unidirectional QUIC streams
+    /// per connection.
+    #[arg(long = "max-incoming-uni-streams", value_name = "COUNT")]
+    max_incoming_uni_streams: Option<u32>,
+
     /// Number of failed password attempts that locks an account out.
     #[arg(long = "max-password-failures", value_name = "COUNT")]
     max_password_failures: Option<u32>,
@@ -176,6 +199,10 @@ const GO_STYLE_OPTIONS: &[&str] = &[
     "handshake-idle-timeout",
     "max-idle-timeout",
     "max-unauth-conversations",
+    "max-connections",
+    "max-channels-per-conversation",
+    "max-incoming-streams",
+    "max-incoming-uni-streams",
     "max-password-failures",
     "password-lockout",
     "sftp-jail",
@@ -343,6 +370,34 @@ fn build_config(cli: Cli) -> Result<Ssh3ServerConfig, clap::Error> {
         .or_else(|| env_number(ENV_MAX_UNAUTH_CONVERSATIONS))
     {
         config.max_unauthenticated_conversations = max;
+    }
+
+    if let Some(max) = cli
+        .max_connections
+        .or_else(|| env_number(ENV_MAX_CONNECTIONS))
+    {
+        config.max_connections = max;
+    }
+
+    if let Some(max) = cli
+        .max_channels_per_conversation
+        .or_else(|| env_number(ENV_MAX_CHANNELS_PER_CONVERSATION))
+    {
+        config.max_channels_per_conversation = max;
+    }
+
+    if let Some(max) = cli
+        .max_incoming_streams
+        .or_else(|| env_number(ENV_MAX_INCOMING_STREAMS))
+    {
+        config.max_incoming_streams = max;
+    }
+
+    if let Some(max) = cli
+        .max_incoming_uni_streams
+        .or_else(|| env_number(ENV_MAX_INCOMING_UNI_STREAMS))
+    {
+        config.max_incoming_uni_streams = max;
     }
 
     if let Some(max) = cli

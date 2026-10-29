@@ -13,12 +13,15 @@ use crate::config::{Ssh3ServerConfig, validate_server_config};
 use crate::error::Ssh3ServerError;
 use crate::runtime::serve_endpoint;
 
-/// Applies the configured QUIC timeouts to a server configuration.
+/// Applies the configured QUIC transport limits to a server configuration.
 ///
-/// The idle timeout of the transport is the `max-idle-timeout` of the
-/// server; the handshake timeout is enforced by the runtime, which gives up
-/// on a connection that does not complete its handshake in time.
-pub fn apply_transport_timeouts(server_config: &mut ServerConfig, config: &Ssh3ServerConfig) {
+/// The idle timeout of the transport is the `max-idle-timeout` of the server;
+/// the handshake timeout is enforced by the runtime, which gives up on a
+/// connection that does not complete its handshake in time. The stream caps
+/// are the `-max-incoming-streams` / `-max-incoming-uni-streams` options of
+/// the audit of 2026-10-27 (K3): the peer cannot open more concurrent streams
+/// per connection than the caps allow.
+pub fn apply_transport_limits(server_config: &mut ServerConfig, config: &Ssh3ServerConfig) {
     let mut transport = quinn::TransportConfig::default();
     // SSH3 carries its UDP forwarding over the raw QUIC datagram API: the
     // frame size parameter announces the ability to receive them. Without
@@ -35,6 +38,8 @@ pub fn apply_transport_timeouts(server_config: &mut ServerConfig, config: &Ssh3S
             None
         }
     });
+    transport.max_concurrent_bidi_streams(config.max_incoming_streams.into());
+    transport.max_concurrent_uni_streams(config.max_incoming_uni_streams.into());
     server_config.transport = Arc::new(transport);
 }
 
@@ -50,7 +55,7 @@ pub async fn run_with_self_signed(config: Ssh3ServerConfig) -> Result<(), Ssh3Se
     validate_server_config(&config)?;
     let (mut server_config, _certificate) =
         self_signed_server_config(config.cert_subject_alt_names.clone())?;
-    apply_transport_timeouts(&mut server_config, &config);
+    apply_transport_limits(&mut server_config, &config);
     let endpoint = Endpoint::server(server_config, config.bind_addr)?;
     serve_endpoint(endpoint, config).await
 }
