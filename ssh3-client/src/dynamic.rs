@@ -681,7 +681,7 @@ pub(crate) async fn serve_socks5_connection(
         Ok(Ok(channel)) => {
             if let Err(err) = bridge_dynamic_forward(channel, stream).await {
                 if !crate::is_benign_client_error(&err) {
-                    eprintln!("ssh3-rust-client dynamic forwarding error: {err}");
+                    eprintln!("ssh3 dynamic forwarding error: {err}");
                 }
             }
         }

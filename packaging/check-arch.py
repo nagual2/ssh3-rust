@@ -31,7 +31,7 @@ EXPECTED: dict[str, tuple[str, int]] = {
     "aarch64-apple-darwin": ("macho", 0x0100000C),
 }
 
-BINARIES = ("ssh3-rust-client", "ssh3-rust-server")
+BINARIES = ("ssh3", "ssh3-rust-server")
 
 
 def detect(path: str) -> tuple[str, int]:

@@ -20,6 +20,12 @@
 
 ## [Unreleased] / Не выпущено / Nicht veröffentlicht
 
+### Changed / Изменено / Geändert
+
+| English | Русский | Deutsch |
+|---------|---------|---------|
+| **The client binary is named `ssh3`.** The `ssh3-rust-client` name was a stopgap against a PATH collision with the Go binaries of the same purpose; the owner closed the final-name question of the rebranding, and the client of the three distributions (the Go reference, the C port, the Rust line) is named `ssh3` alike. The crate stays `ssh3-client`, and the server keeps `ssh3-rust-server` for now. | **Бинарник клиента называется `ssh3`.** Имя `ssh3-rust-client` было временной защитой от коллизии в PATH с Go-бинарниками того же назначения; владелец закрыл вопрос финального имени ребрендинга, и клиент трёх дистрибутивов (Go-эталон, C-порт, Rust-линия) называется одинаково — `ssh3`. Крейт остаётся `ssh3-client`, сервер пока носит имя `ssh3-rust-server`. | **Das Client-Binary heißt `ssh3`.** Der Name `ssh3-rust-client` war ein Provisorium gegen eine PATH-Kollision mit den Go-Binaries desselben Zwecks; der Eigentümer hat die Frage des finalen Namens des Rebrandings geschlossen, und der Client der drei Distributionen (Go-Referenz, C-Port, Rust-Linie) heißt gleichermaßen `ssh3`. Das Crate bleibt `ssh3-client`, der Server trägt vorläufig weiter den Namen `ssh3-rust-server`. |
+
 ## [0.2.0] - 2026-10-27
 
 ### Added / Добавлено / Hinzugefügt

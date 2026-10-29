@@ -21,7 +21,7 @@ categories = ["network-programming", "command-line-utilities"]
 path = "src/lib.rs"
 
 [[bin]]
-name = "ssh3-rust-client"
+name = "ssh3"
 path = "src/main.rs"
 
 [dependencies]

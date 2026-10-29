@@ -915,7 +915,7 @@ where
         let guard = match crate::enable_raw_mode(&terminal.platform) {
             Ok(guard) => Some(guard),
             Err(err) => {
-                eprintln!("ssh3-rust-client control-master session: raw mode: {err}");
+                eprintln!("ssh3 control-master session: raw mode: {err}");
                 None
             }
         };

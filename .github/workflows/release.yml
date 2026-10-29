@@ -340,7 +340,7 @@ jobs:
           # The binaries of a native leg have to start: a release must not
           # publish a binary that does not answer `--version`.
           directory="target/${{ matrix.target }}/release"
-          for name in ssh3-rust-client ssh3-rust-server; do
+          for name in ssh3 ssh3-rust-server; do
             binary="$directory/$name"
             if [ ! -f "$binary" ]; then
               binary="$binary.exe"
@@ -359,7 +359,7 @@ jobs:
           rm -rf "$stage"
           mkdir -p "$stage"
           directory="target/${{ matrix.target }}/release"
-          for name in ssh3-rust-client ssh3-rust-server; do
+          for name in ssh3 ssh3-rust-server; do
             if [ -f "$directory/$name" ]; then
               cp "$directory/$name" "$stage/$name"
             else
@@ -553,9 +553,9 @@ jobs:
           rm -rf unpack
           mkdir -p unpack
           tar -xzf "$archive" -C unpack --strip-components=1
-          ./unpack/ssh3-rust-client --version
+          ./unpack/ssh3 --version
           ./unpack/ssh3-rust-server --version
-          ./unpack/ssh3-rust-client --help >/dev/null
+          ./unpack/ssh3 --help >/dev/null
           ./unpack/ssh3-rust-server --help >/dev/null
 
       - name: Verify the Debian packages

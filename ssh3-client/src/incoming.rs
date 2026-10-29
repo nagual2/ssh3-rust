@@ -99,7 +99,7 @@ impl IncomingChannels {
                 other => {
                     let channel = other.channel();
                     eprintln!(
-                        "ssh3-rust-client rejecting unexpected server-initiated channel {} of type {}",
+                        "ssh3 rejecting unexpected server-initiated channel {} of type {}",
                         channel.channel_id(),
                         String::from_utf8_lossy(channel.channel_type())
                     );
@@ -113,14 +113,14 @@ impl IncomingChannels {
     async fn serve_forwarded_tcp(&self, channel: Arc<Ssh3Channel>, target: SocketAddr) {
         if !self.is_authorized(Ssh3ReverseForwardProtocol::Tcp, target) {
             eprintln!(
-                "ssh3-rust-client rejecting a forwarded-tcp channel towards {target}: the target was not requested with -R"
+                "ssh3 rejecting a forwarded-tcp channel towards {target}: the target was not requested with -R"
             );
             let _ = channel.close().await;
             return;
         }
         let Some(guard) = ForwardedChannelGuard::acquire(&self.open_forwarded_channels) else {
             eprintln!(
-                "ssh3-rust-client too many open forwarded channels (limit {MAX_FORWARDED_CHANNELS}), closing the channel towards {target}"
+                "ssh3 too many open forwarded channels (limit {MAX_FORWARDED_CHANNELS}), closing the channel towards {target}"
             );
             let _ = channel.close().await;
             return;
@@ -134,7 +134,7 @@ impl IncomingChannels {
             if let Err(err) = bridge_forwarded_tcp(channel, target).await
                 && !crate::is_benign_client_error(&err)
             {
-                eprintln!("ssh3-rust-client reverse forwarding error: {err}");
+                eprintln!("ssh3 reverse forwarding error: {err}");
             }
         });
     }
@@ -143,14 +143,14 @@ impl IncomingChannels {
     async fn serve_forwarded_udp(&self, channel: Arc<Ssh3Channel>, target: SocketAddr) {
         if !self.is_authorized(Ssh3ReverseForwardProtocol::Udp, target) {
             eprintln!(
-                "ssh3-rust-client rejecting a forwarded-udp channel towards {target}: the target was not requested with -R"
+                "ssh3 rejecting a forwarded-udp channel towards {target}: the target was not requested with -R"
             );
             let _ = channel.close().await;
             return;
         }
         let Some(guard) = ForwardedChannelGuard::acquire(&self.open_forwarded_channels) else {
             eprintln!(
-                "ssh3-rust-client too many open forwarded channels (limit {MAX_FORWARDED_CHANNELS}), closing the channel towards {target}"
+                "ssh3 too many open forwarded channels (limit {MAX_FORWARDED_CHANNELS}), closing the channel towards {target}"
             );
             let _ = channel.close().await;
             return;
@@ -165,7 +165,7 @@ impl IncomingChannels {
             if let Err(err) = bridge_forwarded_udp(&connection, channel, target).await
                 && !crate::is_benign_client_error(&err)
             {
-                eprintln!("ssh3-rust-client reverse forwarding error: {err}");
+                eprintln!("ssh3 reverse forwarding error: {err}");
             }
         });
     }
@@ -174,7 +174,7 @@ impl IncomingChannels {
     async fn serve_agent_connection(&self, channel: Arc<Ssh3Channel>) {
         let Some(agent_socket) = self.agent_socket.clone() else {
             eprintln!(
-                "ssh3-rust-client rejecting an agent connection: the agent forwarding is not enabled"
+                "ssh3 rejecting an agent connection: the agent forwarding is not enabled"
             );
             let _ = channel.close().await;
             return;
@@ -185,7 +185,7 @@ impl IncomingChannels {
             if let Err(err) = forward_agent_channel(channel, &agent_socket).await
                 && !crate::is_benign_client_error(&err)
             {
-                eprintln!("ssh3-rust-client agent forwarding error: {err}");
+                eprintln!("ssh3 agent forwarding error: {err}");
             }
         });
         #[cfg(not(unix))]
@@ -194,7 +194,7 @@ impl IncomingChannels {
             // forward a connection to on the other platforms.
             let _ = agent_socket;
             eprintln!(
-                "ssh3-rust-client rejecting an agent connection: the agent forwarding is unix-only"
+                "ssh3 rejecting an agent connection: the agent forwarding is unix-only"
             );
             let _ = channel.close().await;
         }

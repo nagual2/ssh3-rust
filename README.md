@@ -63,7 +63,7 @@ The workspace produces two binaries:
 
 | Binary | Package | Purpose |
 | --- | --- | --- |
-| `ssh3-rust-client` | `ssh3-client` | SSH3 client: shell, exec, PTY, auth, forwarding. |
+| `ssh3` | `ssh3-client` | SSH3 client: shell, exec, PTY, auth, forwarding. |
 | `ssh3-rust-server` | `ssh3-server` | SSH3 server: sessions, PTY, auth, forwarding. |
 
 The package names stay `ssh3-client` / `ssh3-server` — they describe the

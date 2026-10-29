@@ -1029,10 +1029,10 @@ async fn start_reverse_forwards(
         )
         .await?;
         if bound_port == spec.bind_port {
-            eprintln!("ssh3-rust-client server bound -R {}", spec.spec_string());
+            eprintln!("ssh3 server bound -R {}", spec.spec_string());
         } else {
             eprintln!(
-                "ssh3-rust-client server bound -R {} on ephemeral port {bound_port}",
+                "ssh3 server bound -R {} on ephemeral port {bound_port}",
                 spec.spec_string()
             );
         }
@@ -1091,7 +1091,7 @@ async fn start_dynamic_forwards(
                 )
             });
         eprintln!(
-            "ssh3-rust-client dynamic port forwarding: SOCKS5 proxy listening on {listen_addr}"
+            "ssh3 dynamic port forwarding: SOCKS5 proxy listening on {listen_addr}"
         );
         client
             .forward_control_channels
@@ -1420,7 +1420,7 @@ fn activate_client(
                 .await
                 && !is_benign_route_error(&err)
             {
-                eprintln!("ssh3-rust-client incoming channel error: {err}");
+                eprintln!("ssh3 incoming channel error: {err}");
             }
         }
     });
@@ -1436,11 +1436,11 @@ fn activate_client(
                     Ok(()) => {}
                     Err(err) => {
                         if is_benign_datagram_dispatch_error(&err) {
-                            eprintln!("ssh3-rust-client dropping malformed datagram: {err}");
+                            eprintln!("ssh3 dropping malformed datagram: {err}");
                             continue;
                         }
                         if !is_benign_connection_dispatch_error(&err) {
-                            eprintln!("ssh3-rust-client incoming datagram error: {err}");
+                            eprintln!("ssh3 incoming datagram error: {err}");
                         }
                         return;
                     }
@@ -1696,7 +1696,7 @@ async fn run_sshfp_verification(
         .filter_map(|server| normalize_dns_server(server))
         .collect();
     if servers.is_empty() {
-        eprintln!("ssh3-rust-client: no DNS server found, the SSHFP lookup is skipped");
+        eprintln!("ssh3: no DNS server found, the SSHFP lookup is skipped");
         return Ok(());
     }
     let result = sshfp::check_sshfp(&host, certificate.as_ref(), algorithm, &servers).await;
@@ -1707,24 +1707,24 @@ async fn run_sshfp_verification(
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "record".to_string());
-            eprintln!("ssh3-rust-client: SSHFP verification of {host} succeeded ({matched})");
+            eprintln!("ssh3: SSHFP verification of {host} succeeded ({matched})");
         }
         sshfp::SshfpStatus::Mismatch => {
             eprintln!(
-                "ssh3-rust-client: the SSHFP records published for {} do not match the presented host key",
+                "ssh3: the SSHFP records published for {} do not match the presented host key",
                 result.query_name
             );
         }
         sshfp::SshfpStatus::LookupFailed => {
             eprintln!(
-                "ssh3-rust-client: could not look up the SSHFP records of {}: {}",
+                "ssh3: could not look up the SSHFP records of {}: {}",
                 result.query_name,
                 result.error.as_deref().unwrap_or("unknown error")
             );
         }
         sshfp::SshfpStatus::NoRecords => {
             eprintln!(
-                "ssh3-rust-client: no SSHFP record is published for {}",
+                "ssh3: no SSHFP record is published for {}",
                 result.query_name
             );
         }
@@ -1737,7 +1737,7 @@ async fn run_sshfp_verification(
         && trust.policy == Ssh3StrictHostKeyChecking::No
     {
         eprintln!(
-            "ssh3-rust-client: continuing because StrictHostKeyChecking=no explicitly allows the mismatch"
+            "ssh3: continuing because StrictHostKeyChecking=no explicitly allows the mismatch"
         );
         return Ok(());
     }
@@ -2113,7 +2113,7 @@ fn client_quinn_config(
                 KnownHosts::load(&trust.path).map_err(Ssh3ClientError::KnownHosts)?;
             for line in invalid_lines {
                 eprintln!(
-                    "ssh3-rust-client: invalid known host line {} of {}",
+                    "ssh3: invalid known host line {} of {}",
                     line + 1,
                     trust.path.display()
                 );
@@ -2331,7 +2331,7 @@ async fn run_stdio_on_client(
                             }
                             Ssh3EscapeAction::Suspend => {
                                 if let Err(err) = suspend_local_process(&raw_mode_guard) {
-                                    eprintln!("ssh3-rust-client escape suspend failed: {err}");
+                                    eprintln!("ssh3 escape suspend failed: {err}");
                                 }
                             }
                             Ssh3EscapeAction::None => {}

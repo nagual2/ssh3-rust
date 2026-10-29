@@ -211,7 +211,7 @@ impl ServerCertVerifier for KnownHostsVerifier {
             }
             HostKeyOutcome::Warn => {
                 if let Some(message) = decision.message.as_deref() {
-                    eprintln!("ssh3-rust-client: {message}");
+                    eprintln!("ssh3: {message}");
                 }
                 if decision.pin {
                     self.state.set_to_pin(end_entity.clone().into_owned());

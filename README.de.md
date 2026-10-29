@@ -64,7 +64,7 @@ Der Workspace erzeugt zwei Binaries:
 
 | Binary | Paket | Zweck |
 | --- | --- | --- |
-| `ssh3-rust-client` | `ssh3-client` | SSH3-Client: Shell, exec, PTY, Authentifizierung, Forwarding. |
+| `ssh3` | `ssh3-client` | SSH3-Client: Shell, exec, PTY, Authentifizierung, Forwarding. |
 | `ssh3-rust-server` | `ssh3-server` | SSH3-Server: Sitzungen, PTY, Authentifizierung, Forwarding. |
 
 Die Paketnamen bleiben `ssh3-client` / `ssh3-server` — sie beschreiben das

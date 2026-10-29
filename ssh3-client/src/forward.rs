@@ -287,7 +287,7 @@ pub(crate) async fn start_local_forward(
                         if let Err(err) = result
                             && !crate::is_benign_client_error(&err)
                         {
-                            eprintln!("ssh3-rust-client local TCP forwarding error: {err}");
+                            eprintln!("ssh3 local TCP forwarding error: {err}");
                         }
                     });
                 }
@@ -416,7 +416,7 @@ async fn forward_udp_socket(
                     Ok(channel) => channel,
                     Err(err) => {
                         eprintln!(
-                            "ssh3-rust-client could not open the UDP forwarding channel: {err}"
+                            "ssh3 could not open the UDP forwarding channel: {err}"
                         );
                         return;
                     }

@@ -19,7 +19,7 @@ use ssh3_client::{
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "ssh3-rust-client",
+    name = "ssh3",
     version = SSH3_CLIENT_VERSION_STRING,
     disable_version_flag = true,
     about = "Connects to an SSH3 server over QUIC/HTTP3. If COMMAND is omitted, requests a shell.",
@@ -537,7 +537,7 @@ fn load_user_ssh_config(path: Option<&Path>) -> SshConfig {
         Ok(configuration) => configuration,
         Err(err) => {
             eprintln!(
-                "ssh3-rust-client: could not open {}: {err}, ignoring config",
+                "ssh3: could not open {}: {err}, ignoring config",
                 path.display()
             );
             SshConfig::default()
@@ -1367,14 +1367,14 @@ async fn run_control_mode(plan: &ClientPlan) -> Option<ExitCode> {
         let client = match control::connect_shared(&plan.config).await {
             Ok(client) => client,
             Err(err) => {
-                eprintln!("ssh3-rust-client control master: {err}");
+                eprintln!("ssh3 control master: {err}");
                 return Some(ExitCode::from(255));
             }
         };
         let listener = match control::listen_control_master(&plan.control.path) {
             Ok(listener) => listener,
             Err(err) => {
-                eprintln!("ssh3-rust-client control master: {err}");
+                eprintln!("ssh3 control master: {err}");
                 return Some(ExitCode::from(255));
             }
         };
@@ -1388,7 +1388,7 @@ async fn run_control_mode(plan: &ClientPlan) -> Option<ExitCode> {
             {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
-                    eprintln!("ssh3-rust-client control master: {err}");
+                    eprintln!("ssh3 control master: {err}");
                     ExitCode::from(255)
                 }
             },
@@ -1405,7 +1405,7 @@ async fn run_control_mode(plan: &ClientPlan) -> Option<ExitCode> {
                 }
                 Ok(None) => ExitCode::SUCCESS,
                 Err(err) => {
-                    eprintln!("ssh3-rust-client control operation {op:?} failed: {err}");
+                    eprintln!("ssh3 control operation {op:?} failed: {err}");
                     ExitCode::from(255)
                 }
             },
@@ -1426,12 +1426,12 @@ async fn run_control_mode(plan: &ClientPlan) -> Option<ExitCode> {
         ControlMasterPolicy::Yes => {
             if !control::ping_master(&plan.control.path).await {
                 if let Err(err) = start_detached_master() {
-                    eprintln!("ssh3-rust-client: could not start the control master: {err}");
+                    eprintln!("ssh3: could not start the control master: {err}");
                     return None;
                 }
                 if !wait_for_master(&plan.control.path).await {
                     eprintln!(
-                        "ssh3-rust-client: the control master did not come up, connecting directly"
+                        "ssh3: the control master did not come up, connecting directly"
                     );
                     return None;
                 }
@@ -1478,7 +1478,7 @@ async fn run_slave(plan: &ClientPlan) -> ExitCode {
     {
         Ok(code) => ExitCode::from(code as u8),
         Err(err) => {
-            eprintln!("ssh3-rust-client control-master session: {err}");
+            eprintln!("ssh3 control-master session: {err}");
             ExitCode::from(255)
         }
     }
@@ -1554,7 +1554,7 @@ async fn main() -> ExitCode {
         return match run_file_transfer(&plan.config, &transfer).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("ssh3-rust-client: {err}");
+                eprintln!("ssh3: {err}");
                 // the Go implementation leaves the process with the code -1,
                 // which the shell sees as 255
                 ExitCode::from(255)
@@ -1574,7 +1574,7 @@ async fn main() -> ExitCode {
         return match run_forwards_only(&plan.config).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("ssh3-rust-client failed: {err}");
+                eprintln!("ssh3 failed: {err}");
                 ExitCode::FAILURE
             }
         };
@@ -1585,11 +1585,11 @@ async fn main() -> ExitCode {
         Err(Ssh3ClientError::ExitSignal(signal)) => {
             let name = String::from_utf8_lossy(&signal.signal_name_without_sig).to_string();
             let code = exit_code_for_exit_signal(name.strip_prefix("SIG").unwrap_or(&name));
-            eprintln!("ssh3-rust-client: the remote process exited with signal {name}");
+            eprintln!("ssh3: the remote process exited with signal {name}");
             ExitCode::from(code as u8)
         }
         Err(err) => {
-            eprintln!("ssh3-rust-client failed: {err}");
+            eprintln!("ssh3 failed: {err}");
             ExitCode::FAILURE
         }
     }
@@ -1606,7 +1606,7 @@ mod tests {
     use std::time::Duration;
 
     fn config_of(arguments: &[&str]) -> ssh3_client::Ssh3ClientConfig {
-        let mut argv = vec!["ssh3-rust-client"];
+        let mut argv = vec!["ssh3"];
         argv.extend_from_slice(arguments);
         argv.push("https://localhost:4433/ssh3-term");
         let cli = Cli::try_parse_from(argv).unwrap();
@@ -1615,7 +1615,7 @@ mod tests {
 
     /// The three values the command line parsing produces.
     fn parsed_of(arguments: &[&str]) -> (ssh3_client::Ssh3ClientConfig, bool) {
-        let mut argv = vec!["ssh3-rust-client"];
+        let mut argv = vec!["ssh3"];
         argv.extend_from_slice(arguments);
         argv.push("https://localhost:4433/ssh3-term");
         let cli = Cli::try_parse_from(argv).unwrap();
@@ -1665,7 +1665,7 @@ mod tests {
     #[test]
     fn the_mutually_exclusive_pty_flags_are_refused() {
         let err = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "-t",
             "-T",
             "https://localhost:4433/ssh3-term",
@@ -1677,7 +1677,7 @@ mod tests {
     #[test]
     fn an_invalid_request_tty_policy_is_refused() {
         let err = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "-o",
             "RequestTTY=maybe",
             "https://localhost:4433/ssh3-term",
@@ -1701,7 +1701,7 @@ mod tests {
     #[test]
     fn a_malformed_local_forward_is_refused() {
         let err = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "-L",
             "8080",
             "https://localhost:4433/ssh3-term",
@@ -1747,7 +1747,7 @@ mod tests {
     #[test]
     fn a_malformed_reverse_forward_is_refused() {
         let err = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "-R",
             "8080",
             "https://localhost:4433/ssh3-term",
@@ -1777,7 +1777,7 @@ mod tests {
     #[test]
     fn a_malformed_dynamic_forward_is_refused() {
         let err = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "-D",
             "::1:1080",
             "https://localhost:4433/ssh3-term",
@@ -1812,7 +1812,7 @@ mod tests {
     #[test]
     fn a_malformed_timeout_is_refused() {
         let err = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "--handshake-idle-timeout",
             "soon",
             "https://localhost:4433/ssh3-term",
@@ -1836,7 +1836,7 @@ mod tests {
         std::fs::write(&password_file, "secret-password\n").unwrap();
 
         let cli = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "--user",
             "alice",
             "--password-file",
@@ -1856,7 +1856,7 @@ mod tests {
         std::fs::write(&secret_file, "client-secret\r\n").unwrap();
 
         let cli = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "--use-oidc",
             "https://issuer.example",
             "--oidc-client-id",
@@ -1880,7 +1880,7 @@ mod tests {
     #[test]
     fn clap_rejects_multiple_auth_methods() {
         let err = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "--identity",
             "/tmp/id",
             "--bearer-token-file",
@@ -1949,7 +1949,7 @@ mod tests {
         std::fs::write(&path, "Host localhost\n  Port 1248\n").unwrap();
 
         let cli = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "--ssh-config",
             path.to_str().unwrap(),
             "https://localhost/ssh3-term",
@@ -1991,7 +1991,7 @@ mod tests {
     #[test]
     fn an_invalid_strict_host_key_checking_value_is_refused() {
         let err = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "-o",
             "StrictHostKeyChecking=maybe",
             "https://localhost:4433/ssh3-term",
@@ -2012,7 +2012,7 @@ mod tests {
     #[test]
     fn the_no_session_flag_refuses_a_remote_command() {
         let err = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "-N",
             "ls",
             "https://localhost:4433/ssh3-term",
@@ -2025,7 +2025,7 @@ mod tests {
     #[test]
     fn the_config_file_option_is_parsed() {
         let cli = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "-F",
             "/tmp/ssh_config",
             "https://localhost:4433/ssh3-term",
@@ -2074,7 +2074,7 @@ mod tests {
     #[test]
     fn a_malformed_forward_option_is_refused() {
         let err = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "-o",
             "LocalForward=8080",
             "https://localhost:4433/ssh3-term",
@@ -2093,7 +2093,7 @@ mod tests {
     #[test]
     fn a_malformed_proxy_jump_option_is_refused() {
         let err = Cli::try_parse_from([
-            "ssh3-rust-client",
+            "ssh3",
             "-o",
             "ProxyJump=jump one",
             "https://localhost:4433/ssh3-term",
@@ -2205,15 +2205,15 @@ mod tests {
 
     #[test]
     fn the_version_flag_is_parsed_without_a_url() {
-        let cli = Cli::try_parse_from(["ssh3-rust-client", "-V"]).unwrap();
+        let cli = Cli::try_parse_from(["ssh3", "-V"]).unwrap();
         assert!(cli.print_version);
-        let cli = Cli::try_parse_from(["ssh3-rust-client", "--version"]).unwrap();
+        let cli = Cli::try_parse_from(["ssh3", "--version"]).unwrap();
         assert!(cli.print_version);
     }
 
     #[test]
     fn the_url_is_required_without_the_version_flag() {
-        let err = Cli::try_parse_from(["ssh3-rust-client"]).unwrap_err();
+        let err = Cli::try_parse_from(["ssh3"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
     }
 
@@ -2237,7 +2237,7 @@ mod control_tests {
     use clap::{Parser, error::ErrorKind};
 
     fn plan_of(arguments: &[&str]) -> super::ClientPlan {
-        let mut argv = vec!["ssh3-rust-client"];
+        let mut argv = vec!["ssh3"];
         argv.extend_from_slice(arguments);
         argv.push("https://localhost:4433/ssh3-term");
         let cli = Cli::try_parse_from(argv).unwrap();
@@ -2245,7 +2245,7 @@ mod control_tests {
     }
 
     fn plan_error(arguments: &[&str]) -> ErrorKind {
-        let mut argv = vec!["ssh3-rust-client"];
+        let mut argv = vec!["ssh3"];
         argv.extend_from_slice(arguments);
         argv.push("https://localhost:4433/ssh3-term");
         let cli = Cli::try_parse_from(argv).unwrap();
@@ -2325,7 +2325,7 @@ mod sshfp_cli_tests {
     use ssh3_client::sshfp::VerifyHostKeyDnsMode;
 
     fn config_of(arguments: &[&str]) -> ssh3_client::Ssh3ClientConfig {
-        let mut argv = vec!["ssh3-rust-client"];
+        let mut argv = vec!["ssh3"];
         argv.extend_from_slice(arguments);
         argv.push("https://localhost:4433/ssh3-term");
         let cli = Cli::try_parse_from(argv).unwrap();
@@ -2355,7 +2355,7 @@ mod sshfp_cli_tests {
         assert!(config.verify_host_key_dns.is_none());
 
         // A broken value is refused before a packet is sent.
-        let mut argv = vec!["ssh3-rust-client".to_string()];
+        let mut argv = vec!["ssh3".to_string()];
         argv.push("-o".to_string());
         argv.push("VerifyHostKeyDNS=maybe".to_string());
         argv.push("https://localhost:4433/ssh3-term".to_string());
