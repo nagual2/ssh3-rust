@@ -760,13 +760,29 @@ fn build_config(cli: Cli) -> Result<ClientPlan, clap::Error> {
             "the following required arguments were not provided: <URL>",
         )
     })?;
+    // The operand of the reference rides the https prefix when the scheme
+    // is absent (`max@host/ssh3-term` -> `https://max@host/ssh3-term`),
+    // the way the Go client builds the URL from the ssh2-shaped operand.
+    let url = if url.starts_with("https://") || url.starts_with("http://") {
+        url
+    } else {
+        format!("https://{url}")
+    };
     let url = url.parse::<Uri>().map_err(|err| {
         cli_error(
             ErrorKind::ValueValidation,
             format!("invalid URL {url:?}: {err}"),
         )
     })?;
-    let (config, control) = build_connection_config(cli, url, None)?;
+    // The userinfo of the URL (`max@host`) is the session user of the
+    // operand, the spelling of the reference; the `--user` option wins
+    // over it.
+    let url_user = url
+        .authority()
+        .and_then(|authority| authority.as_str().split_once('@'))
+        .map(|(user, _)| user.to_string());
+    let user = cli.user.clone().or(url_user);
+    let (config, control) = build_connection_config(cli, url, user)?;
     let request = if command.is_empty() {
         Ssh3SessionRequest::Shell
     } else {
@@ -897,7 +913,7 @@ fn build_connection_config(
     let url_has_port = url.port_u16().is_some();
     let mut config = Ssh3ClientConfig::new(url);
     config.server_name = cli.server_name;
-    config.username = username.or(cli.user);
+    config.username = username;
     config.identity_file = cli.identity;
     config.agent = if cli.agent {
         Some(Ssh3AgentSelection::First)
@@ -1771,6 +1787,40 @@ mod tests {
             cli.identity.as_deref(),
             Some(std::path::Path::new("/tmp/id_ed25519"))
         );
+    }
+
+    /// The ssh2-shaped operand of the reference (`max@host/ssh3-term`)
+    /// rides the https prefix of the Go client, and the userinfo of the
+    /// operand is the session user.
+    #[test]
+    fn the_ssh2_shaped_operand_carries_the_user() {
+        let cli = Cli::try_parse_from(go_style_flags(
+            [
+                "ssh3",
+                "-privkey",
+                "/tmp/id_ed25519",
+                "max@example.org/ssh3-term",
+            ]
+            .map(String::from),
+        ))
+        .unwrap();
+        let plan = build_config(cli).unwrap();
+        assert_eq!(plan.config.username.as_deref(), Some("max"));
+        assert_eq!(
+            plan.config.target_url.host().map(str::to_string).as_deref(),
+            Some("example.org")
+        );
+    }
+
+    /// The `--user` option wins over the user of the operand.
+    #[test]
+    fn the_user_option_wins_over_the_operand_user() {
+        let cli = Cli::try_parse_from(go_style_flags(
+            ["ssh3", "--user", "admin", "max@example.org/ssh3-term"].map(String::from),
+        ))
+        .unwrap();
+        let plan = build_config(cli).unwrap();
+        assert_eq!(plan.config.username.as_deref(), Some("admin"));
     }
 
     /// The policy of the known_hosts check of a configuration.
