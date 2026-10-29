@@ -221,6 +221,22 @@ jobs:
             cmake \
             nasm \
             perl
+          # The GNU target spec of the compiler links `-lcrypt`, and the
+          # cross sysroot packages of the runner image stopped carrying
+          # libcrypt when the libxcrypt split reached them: the library of
+          # the arm64 port is unpacked into the cross sysroot by hand.
+          if ! test -e /usr/aarch64-linux-gnu/lib/libcrypt.so; then
+            pool="http://ports.ubuntu.com/pool/main/libx/libxcrypt"
+            package="$(curl -fsSL "$pool/" | grep -o 'libcrypt-dev_[^"]*arm64\.deb' | sort -u | tail -n1)"
+            curl -fsSL -o /tmp/libcrypt-dev-arm64.deb "$pool/$package"
+            unpack="$(mktemp -d)"
+            sudo dpkg-deb -x /tmp/libcrypt-dev-arm64.deb "$unpack"
+            for directory in lib lib/aarch64-linux-gnu; do
+              sudo mkdir -p "/usr/aarch64-linux-gnu/$directory"
+              sudo cp -a "$unpack/usr/lib/aarch64-linux-gnu/." "/usr/aarch64-linux-gnu/$directory/"
+            done
+            test -e /usr/aarch64-linux-gnu/lib/libcrypt.so
+          fi
 
       - name: Install the build prerequisites of the target
         if: matrix.target == 'x86_64-pc-windows-msvc'
@@ -351,12 +367,14 @@ jobs:
         with:
           path: stage/${{ matrix.target }}
           format: spdx-json
-          output-file: sbom-${{ matrix.target }}.spdx.json
+          # `file` is the input name of the current major of the action:
+          # the former `output-file` is silently ignored, and the checksum
+          # step of the target waits for the file.
+          file: sbom-${{ matrix.target }}.spdx.json
           artifact-name: sbom-${{ matrix.target }}
           # The SBOM is published inside the archive of the target, the
           # action does not have to upload it a second time.
           upload-artifact: false
-          output-reproducible: true
 
       - name: Install syft
         if: matrix.windows
