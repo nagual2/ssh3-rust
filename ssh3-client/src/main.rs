@@ -45,7 +45,13 @@ struct Cli {
     #[arg(long, value_name = "NAME")]
     user: Option<String>,
 
-    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    #[arg(
+        long,
+        short = 'i',
+        visible_alias = "privkey",
+        value_name = "PATH",
+        value_hint = ValueHint::FilePath
+    )]
     identity: Option<PathBuf>,
 
     #[arg(long, requires = "user", conflicts_with = "agent_key")]
@@ -53,6 +59,7 @@ struct Cli {
 
     #[arg(
         long,
+        visible_alias = "pubkey-for-agent",
         value_name = "PATH",
         value_hint = ValueHint::FilePath,
         requires = "user",
@@ -63,7 +70,7 @@ struct Cli {
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     agent_socket: Option<PathBuf>,
 
-    #[arg(long)]
+    #[arg(long, short = 'A')]
     forward_agent: bool,
 
     #[arg(
@@ -1515,9 +1522,83 @@ async fn wait_for_master(path: &Path) -> bool {
     true
 }
 
+/// The long flags the reference writes with a single dash.
+///
+/// The flag package of the reference accepts `-privkey` and `--privkey`
+/// alike, while this parser only accepts the double-dash spelling of the
+/// long names: the arguments of the reference spelling are rewritten
+/// before the parse, and the single-letter flags (`-i`, `-t`, ...) stay
+/// untouched.
+const GO_STYLE_LONG_FLAGS: &[&str] = &[
+    "agent",
+    "agent-key",
+    "agent-socket",
+    "bearer-token",
+    "bearer-token-file",
+    "ca-cert",
+    "checksum",
+    "continue",
+    "control-master",
+    "control-path",
+    "control-persist",
+    "forward-agent",
+    "identity",
+    "insecure",
+    "known-hosts",
+    "no-pkce",
+    "oidc-client-id",
+    "oidc-client-secret",
+    "oidc-client-secret-file",
+    "password",
+    "password-file",
+    "privkey",
+    "proxy-jump",
+    "server-name",
+    "ssh-config",
+    "strict-host-key-checking",
+    "transfer",
+    "url-path",
+    "use-oidc",
+    "user",
+    "version",
+];
+
+/// Rewrites the single-dash long flags of the reference spelling into the
+/// double-dash spelling the parser accepts. An argument the reference
+/// does not define rides through unchanged, so the unknown-argument
+/// error names it the way the user wrote it.
+fn go_style_flags<I>(arguments: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    arguments
+        .into_iter()
+        .map(|argument| {
+            let (name, value) = match argument.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (argument.as_str(), None),
+            };
+            if name.len() > 2
+                && name.starts_with('-')
+                && !name.starts_with("--")
+                && GO_STYLE_LONG_FLAGS.contains(&&name[1..])
+            {
+                match value {
+                    Some(value) => format!("--{}={value}", &name[1..]),
+                    None => format!("--{}", &name[1..]),
+                }
+            } else {
+                argument
+            }
+        })
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let cli = match Cli::try_parse_from(go_style_flags(
+        std::env::args_os().map(|argument| argument.to_string_lossy().into_owned()),
+    )) {
         Ok(cli) => cli,
         Err(err) => {
             let status = match err.kind() {
@@ -1595,7 +1676,7 @@ async fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, build_config};
+    use super::{Cli, build_config, go_style_flags};
     use clap::{Parser, error::ErrorKind};
     use ssh3_client::{
         SSH3_CLIENT_VERSION_STRING, Ssh3ForwardProtocol, Ssh3PtyPolicy, Ssh3ReverseForwardProtocol,
@@ -1619,6 +1700,77 @@ mod tests {
         let cli = Cli::try_parse_from(argv).unwrap();
         let plan = build_config(cli).unwrap();
         (plan.config, plan.no_session)
+    }
+
+    /// The reference writes its long flags with a single dash: the
+    /// arguments of that spelling parse as if they were written with the
+    /// double dash.
+    #[test]
+    fn the_reference_single_dash_flags_parse() {
+        let cli = Cli::try_parse_from(go_style_flags(
+            [
+                "ssh3",
+                "-privkey",
+                "/tmp/id_ed25519",
+                "-insecure",
+                "-o",
+                "ServerAliveInterval=30",
+                "https://localhost:4433/ssh3-term",
+            ]
+            .map(String::from),
+        ))
+        .unwrap();
+        assert_eq!(
+            cli.identity.as_deref(),
+            Some(std::path::Path::new("/tmp/id_ed25519"))
+        );
+        assert!(cli.insecure);
+        assert!(
+            cli.option
+                .iter()
+                .any(|value| value == "ServerAliveInterval=30")
+        );
+    }
+
+    /// The single-letter flags stay single-letter: the rewrite touches
+    /// only the long names of the reference list, and a glued short
+    /// group (`-tT`) rides through untouched.
+    #[test]
+    fn the_single_letter_flags_stay_single_letter() {
+        let cli = Cli::try_parse_from(go_style_flags(
+            [
+                "ssh3",
+                "-t",
+                "-N",
+                "-L",
+                "8080:example.org:80",
+                "https://localhost:4433/ssh3-term",
+            ]
+            .map(String::from),
+        ))
+        .unwrap();
+        assert!(cli.force_pty);
+        assert!(cli.no_session);
+        assert_eq!(cli.local_forward.len(), 1);
+    }
+
+    /// The inline value of a reference flag (`-privkey=path`) rides the
+    /// same rewrite.
+    #[test]
+    fn the_reference_flag_with_an_inline_value_parses() {
+        let cli = Cli::try_parse_from(go_style_flags(
+            [
+                "ssh3",
+                "-privkey=/tmp/id_ed25519",
+                "https://localhost:4433/ssh3-term",
+            ]
+            .map(String::from),
+        ))
+        .unwrap();
+        assert_eq!(
+            cli.identity.as_deref(),
+            Some(std::path::Path::new("/tmp/id_ed25519"))
+        );
     }
 
     /// The policy of the known_hosts check of a configuration.

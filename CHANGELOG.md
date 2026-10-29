@@ -20,6 +20,12 @@
 
 ## [Unreleased] / Не выпущено / Nicht veröffentlicht
 
+### Fixed / Исправлено / Behoben
+
+| English | Русский | Deutsch |
+|---------|---------|---------|
+| **The reference flag spelling parses.** The single-dash long flags of the Go reference (`-privkey`, `-insecure`, `-use-oidc`, `-transfer`, ...) are rewritten into their double-dash spelling before the parse, so the invocations written the reference way stop dying in the port option (`-privkey` was read as `-p rivkey`). The `--identity` option carries the `ssh2 -i` short name and the `-privkey` alias, the agent forwarding rides `ssh2 -A`, and the agent key accepts the reference `--pubkey-for-agent`. | **Шпаргалка флагов эталона парсится.** Многословные флаги эталона с одним дефисом (`-privkey`, `-insecure`, `-use-oidc`, `-transfer`, ...) переписываются в двухдефисную запись до разбора, так что вызовы, написанные в стиле эталона, больше не умирают в опции порта (`-privkey` читался как `-p rivkey`). Опция `--identity` несёт короткое имя `ssh2 -i` и алиас `-privkey`, проброс агента едет как `ssh2 -A`, а ключ агента принимает эталонный `--pubkey-for-agent`. | **Die Flaggen-Schreibweise der Referenz wird geparst.** Die einsilbigen Langflags der Go-Referenz (`-privkey`, `-insecure`, `-use-oidc`, `-transfer`, ...) werden vor dem Parsen in ihre Doppelsilben-Schreibweise umgeschrieben, sodass Aufrufe in der Schreibweise der Referenz nicht mehr in der Port-Option sterben (`-privkey` wurde als `-p rivkey` gelesen). Die Option `--identity` trägt den Kurznamen `ssh2 -i` und den Alias `-privkey`, die Agentenweiterleitung fährt als `ssh2 -A`, und der Agentenschlüssel nimmt den Referenznamen `--pubkey-for-agent` an. |
+
 ### Changed / Изменено / Geändert
 
 | English | Русский | Deutsch |
