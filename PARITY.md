@@ -24,17 +24,17 @@
 | 1 | Всего строк возможностей в таблице паритета | **110** |
 | 2 | Реализовано в Go | **109** |
 | 3 | Реализовано в Rust | **92** (90 полностью + 1 с расхождением + 1 частично) |
-| 4 | Полное совпадение (обе стороны, поведение эквивалентно) | **90** |
+| 4 | Полное совпадение (обе стороны, поведение эквивалентно) | **96** |
 | 5 | Расхождение по семантике при наличии в обеих | **1** (I4: парольный вход по умолчанию; Rust — в безопасную сторону) |
-| 6 | **Пробелов** (в Go есть, в Rust нет) | **17** |
+| 6 | **Пробелов** (в Go есть, в Rust нет) | **11** |
 | 7 | Пробелов по безопасности (High/Critical) | **0** (A10, I5, I8, I9, K1–K3 закрыты — волны T5, T8) |
-| 8 | Клиентских пробелов | **12** (A6, B10, B14, C5, F6, G11, G12, H1–H4, H9) |
+| 8 | Клиентских пробелов | **6** (B10, B14, C5, F6, G12, H9) |
 | 9 | Серверных пробелов | **5** (L3, L4, L9, M4, M5) |
 | 10 | Только в Rust (нет аналога в Go) | **1** (A7) |
 | 11 | Протокольных пробелов (сжатие тела канала) | **0** (N1–N6 закрыты, `wave/t9-compression`) |
-| 12 | Оценка закрытия разрыва | **≈ 8–10 человеко-дней** (дешёвый эшелон: H1–H4, H8, H9, A6, C5, G11) или **≈ 30** (полный паритет, включая ACME) |
+| 12 | Оценка закрытия разрыва | **≈ 5–7 человеко-дней** (дешёвый эшелон: H8, H9, C5, B14) или **≈ 30** (полный паритет, включая ACME) |
 
-Контроль суммы: 90 (совпадение) + 1 (расхождение) + 1 (частично) + 17 (пробел) + 1 (только Rust) = **110**.
+Контроль суммы: 96 (совпадение) + 1 (расхождение) + 1 (частично) + 11 (пробел) + 1 (только Rust) = **110**.
 
 Разбивка по подсистемам:
 
@@ -54,7 +54,7 @@
 | 12 | Сервер: функциональность | 9 | 6 | 0 | 0 | 3 | 0 |
 | 13 | Эксплуатация: упаковка, логи, exit-коды | 6 | 4 | 0 | 0 | 2 | 0 |
 | 14 | Протокол: сжатие тела канала (B8) | 6 | 6 | 0 | 0 | 0 | 0 |
-| | **Итого** | **110** | **90** | **1** | **1** | **17** | **1** |
+| | **Итого** | **110** | **96** | **1** | **1** | **11** | **1** |
 
 ---
 
@@ -69,7 +69,7 @@
 | A3 | Аутентификация | Password (HTTP Basic) | да | да | Go `cmd/ssh3.go:677` (`-use-password`), `auth/plugins/pubkey_authentication/client/privkey_auth.go:118`; Rust `ssh3-client/src/main.rs:72-82` (`--password`, `--password-file`) | — | — |
 | A4 | Аутентификация | OIDC: интерактивный браузерный flow | да | да | Go `cmd/ssh3.go:683` (`-use-oidc`), `auth/oidc/openid_connect.go`; Rust `ssh3-client/src/main.rs:103-128`, `ssh3-client/src/lib.rs:1250` (`authenticate_oidc_with_browser_opener`) | — | — |
 | A5 | Аутентификация | OIDC: PKCE | да | да | Go `cmd/ssh3.go:705` (`-no-pkce`); Rust `ssh3-client/src/main.rs:129` (`--no-pkce`) | — | — |
-| A6 | Аутентификация | OIDC: файл конфигурации IdP (`client_id`/`client_secret`) | да | нет | Go `cmd/ssh3.go:684` (`-oidc-config`); Rust — **не найдено** (есть только `--oidc-client-id`/`--oidc-issuer-url`/`--oidc-client-secret-file`, `ssh3-client/src/main.rs:103-128`) | S | A4 |
+| A6 | Аутентификация | OIDC: файл конфигурации IdP (`client_id`/`client_secret`) | да | да | Go `cmd/ssh3.go:684` (`-oidc-config`); Rust `--oidc-config` (`serde_json::Ssh3OidcConfigFile`, заполняет id/secret, BOM-толерантный читатель) — волна v0.2.6 | S | A4 |
 | A7 | Аутентификация | Bearer-токен из файла/argv (pre-computed) | нет | да | Go — CLI-флага нет, только внутренний `rawBearerTokenIdentity` (`client_auth.go:242`); Rust `ssh3-client/src/main.rs:92-101` (`--bearer-token`, `--bearer-token-file`) | — | — |
 | A8 | Аутентификация | `known_hosts` (чтение/проверка/дописывание) | да | да | Go `known_hosts.go:18` (`Knows`), `known_hosts.go:91` (`ParseKnownHosts`), `known_hosts.go:128` (`AppendKnownHost`); Rust `ssh3-client/src/known_hosts.rs` (`KnownHosts::parse`, `append_known_host`, `certificate_fingerprint`), `ssh3-client/src/host_key.rs` (сверка presented-сертификата) | — | — |
 | A9 | Аутентификация | `strict-host-key-checking` (yes / accept-new / no / ask) | да | да | Go `cmd/ssh3.go:679`, `strict_host_key.go:43` (`ParseStrictHostKeyChecking`), `strict_host_key.go:62` (`ResolveStrictHostKeyChecking`); Rust `ssh3-client/src/strict_host_key.rs` (`Ssh3StrictHostKeyChecking`, `resolve_strict_host_key_checking`, `decide_host_key`), `ssh3-client/src/main.rs` (`--strict-host-key-checking`, `-o StrictHostKeyChecking=`) | — | A8 |
@@ -154,17 +154,17 @@
 | G8 | Конфигурация | ssh_config: `EscapeChar` | да | да | Go `cmd/ssh3.go:1370`; Rust `ssh3-client/src/main.rs:470` (`ssh_config_values`, `escape_char`) | S | G3, B12 |
 | G9 | Конфигурация | ssh_config: `StrictHostKeyChecking` | да | да | Go `strict_host_key.go:62` (`ResolveStrictHostKeyChecking`); Rust `ssh3-client/src/ssh_config.rs` (`SshConfig::get_for_user`), `ssh3-client/src/main.rs:452` (`ssh_config_values`) | — | G3, A9 |
 | G10 | Конфигурация | ssh_config: `User`, `Port` | да | да | Go `cmd/ssh3.go:868` (`Port`), `cmd/ssh3.go:876` (`User`); Rust `ssh3-client/src/ssh_config.rs:295` (`User`), `ssh3-client/src/main.rs` (`Port` читается и применяется к URL без порта, приоритет URL > ключа) | S | G3 |
-| G11 | Конфигурация | ssh_config: `IdentityFile` | да | нет | Go `cmd/ssh3.go:943` (маршрутизация по ключу), `auth/plugins/pubkey_authentication/client/privkey_auth.go:57`; Rust — **не найдено** | S | G3, A1 |
+| G11 | Конфигурация | ssh_config: `IdentityFile` | да | да | Go `cmd/ssh3.go:943` (маршрутизация по ключу), `auth/plugins/pubkey_authentication/client/privkey_auth.go:57`; Rust `ssh_config_values.identity_files` (`values_for_user("IdentityFile")`, CLI wins) — волна v0.2.6 | S | G3, A1 |
 | G12 | Конфигурация | Переменные окружения `SSH3_*` (серверная политика) | да | нет | Go `cmd/ssh3-server.go:993-1083` (`SSH3_ENABLE_PASSWORD_LOGIN`, `SSH3_GATEWAY_PORTS`, `SSH3_MAX_*`, `SSH3_PERMIT_OPEN`, `SSH3_PERMIT_LISTEN`, `SSH3_SHUTDOWN_DRAIN`), `packaging/ssh3-server.env`; Rust — **не найдено** | M | — |
 
 ### 2.8. Клиент — прочие флаги и сервисы
 
 | № | Подсистема | Возможность | Go | Rust | Файлы (путь:строка) | Сложность | Зависимости |
 |---|-----------|-------------|----|------|----------------------|-----------|-------------|
-| H1 | Прочее | `-v` / `-q` — уровни логирования | да | нет | Go `cmd/ssh3.go:685-686`, `cmd/ssh3.go:667` (`zerolog.SetGlobalLevel`), `cmd/ssh3.go:1080-1084` (`util.ConfigureLogger`); Rust — **не найдено** (только `eprintln!` в `ssh3-client/src/main.rs:729`) | S | — |
-| H2 | Прочее | `-keylog` — файл ключей TLS | да | нет | Go `cmd/ssh3.go:676`; Rust — **не найдено** | S | — |
-| H3 | Прочее | `-4` / `-6` — только IPv4 / IPv6 | да | нет | Go `cmd/ssh3.go:728-729`, `cmd/ssh3.go:772` (взаимная исключительность); Rust — **не найдено** | S | — |
-| H4 | Прочее | `-p` — порт сервера | да | нет | Go `cmd/ssh3.go:702`; Rust — **не найдено** (порт только в URL) | S | — |
+| H1 | Прочее | `-v` / `-q` — уровни логирования | да | да | Go `cmd/ssh3.go:685-686`, `cmd/ssh3.go:667` (`zerolog.SetGlobalLevel`), `cmd/ssh3.go:1080-1084` (`util.ConfigureLogger`); Rust `ssh3-client/src/log.rs` (error/info/debug на AtomicU8), `main.rs` (`-q/-v`, conflicts) — волна v0.2.4 | S | — |
+| H2 | Прочее | `-keylog` — файл ключей TLS | да | да | Go `cmd/ssh3.go:676`; Rust `--keylog` (`ssh3-client/src/keylog.rs`, NSS-формат, append) — волна v0.2.6 | S | — |
+| H3 | Прочее | `-4` / `-6` — только IPv4 / IPv6 | да | да | Go `cmd/ssh3.go:728-729`, `cmd/ssh3.go:772` (взаимная исключительность); Rust `-4/-6` (conflicts) + фильтр семейств в `resolve_target` (`Ssh3IpFamily`) — волна v0.2.6 | S | — |
+| H4 | Прочее | `-p` — порт сервера | да | да | Go `cmd/ssh3.go:702`; Rust `-p` (wins over operand port и `Port` keyword, `url_with_port`) — волна v0.2.6 | S | — |
 | H5 | Прочее | `-insecure` — не проверять сертификат | да | да | Go `cmd/ssh3.go:678`; Rust `ssh3-client/src/main.rs:139` | — | — |
 | H6 | Прочее | `-version` / `-V` | да | да | Go `cmd/ssh3.go:688-689`; Rust `ssh3-client/src/main.rs:170` (`-V`/`--version`), `ssh3-client/src/lib.rs:95` (`SSH3_CLIENT_VERSION_STRING`) — печатается строка версии в формате Go (`SSH 3.0 ssh3-rust 0.1.0 experimental_spec_version=alpha-00`) | — | — |
 | H7 | Прочее | X11 forwarding | да (серверная заглушка) | да (заглушка как в Go) | Go `cmd/ssh3-server.go:564` (`newX11Req` — отказ «not implemented»), `client/session_pump.go:156` («not implemented» на клиенте); Rust — протокольный тип (`ssh3-proto/src/message.rs:330-331`), парсер (`ssh3-core/src/channel.rs:954`), сервер отклоняет запрос в stderr сессии | M | — |

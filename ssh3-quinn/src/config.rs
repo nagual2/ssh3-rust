@@ -94,11 +94,17 @@ pub fn server_config_with_single_cert(
     Ok(config)
 }
 
-pub fn client_config_with_roots(roots: RootCertStore) -> Result<ClientConfig, Ssh3ConfigError> {
+pub fn client_config_with_roots(
+    roots: RootCertStore,
+    key_log: Option<Arc<dyn rustls::KeyLog>>,
+) -> Result<ClientConfig, Ssh3ConfigError> {
     let mut client_crypto = rustls::ClientConfig::builder_with_provider(tls_provider())
         .with_safe_default_protocol_versions()?
         .with_root_certificates(roots)
         .with_no_client_auth();
+    if let Some(key_log) = key_log {
+        client_crypto.key_log = key_log;
+    }
     client_crypto.alpn_protocols = vec![H3_ALPN.to_vec()];
     Ok(ClientConfig::new(Arc::new(QuicClientConfig::try_from(
         client_crypto,
@@ -110,20 +116,27 @@ pub fn client_config_for_certificate(
 ) -> Result<ClientConfig, Ssh3ConfigError> {
     let mut roots = RootCertStore::empty();
     roots.add(server_certificate)?;
-    client_config_with_roots(roots)
+    client_config_with_roots(roots, None)
 }
 
-pub fn client_config_with_webpki_roots() -> Result<ClientConfig, Ssh3ConfigError> {
+pub fn client_config_with_webpki_roots(
+    key_log: Option<Arc<dyn rustls::KeyLog>>,
+) -> Result<ClientConfig, Ssh3ConfigError> {
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    client_config_with_roots(roots)
+    client_config_with_roots(roots, key_log)
 }
 
-pub fn client_config_insecure() -> Result<ClientConfig, Ssh3ConfigError> {
+pub fn client_config_insecure(
+    key_log: Option<Arc<dyn rustls::KeyLog>>,
+) -> Result<ClientConfig, Ssh3ConfigError> {
     let mut client_config = rustls::ClientConfig::builder_with_provider(tls_provider())
         .with_safe_default_protocol_versions()?
         .dangerous()
         .with_custom_certificate_verifier(SkipServerVerification::new())
         .with_no_client_auth();
+    if let Some(key_log) = key_log {
+        client_config.key_log = key_log;
+    }
     client_config.alpn_protocols = vec![H3_ALPN.to_vec()];
     Ok(ClientConfig::new(Arc::new(QuicClientConfig::try_from(
         client_config,

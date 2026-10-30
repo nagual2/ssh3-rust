@@ -20,6 +20,18 @@
 
 ## [Unreleased] / Не выпущено / Nicht veröffentlicht
 
+## [0.2.6] - 2026-10-30
+
+### Added / Добавлено / Hinzugefügt
+
+| English | Русский | Deutsch |
+|---------|---------|---------|
+| **The `-p` option of the ssh2 canon wins over the operand port and the `Port` keyword in the session mode too** (it rode the transfer only). | **Опция `-p` канона ssh2 перебивает порт операнда и ключ `Port` конфигурации и в сессионном режиме** (раньше ехал только в transfer). | **Die Option `-p` des ssh2-Kanons überschreibt den Port des Operanden und das `Port`-Schlüsselwort auch im Sitzungsmodus** (bisher nur im Transfer). |
+| **The `-4` / `-6` flags of the ssh2 canon** filter the address families of the dial (`Ssh3IpFamily` in `resolve_target`); the flags conflict with each other. | **Флаги `-4` / `-6` канона ssh2** фильтруют семейства адресов при дозвоне (`Ssh3IpFamily` в `resolve_target`); флаги взаимоисключающие. | **Die Flags `-4` / `-6` des ssh2-Kanons** filtern die Adressfamilien des Wählens (`Ssh3IpFamily` in `resolve_target`); die Flags schließen sich gegenseitig aus. |
+| **The `--keylog PATH` option** writes every negotiated TLS secret in the NSS keylog format (append) — a packet analyzer decrypts the session capture. | **Опция `--keylog PATH`** пишет все согласованные TLS-секреты в NSS-формате (append) — анализатор пакетов расшифрует захват сессии. | **Die Option `--keylog PATH`** schreibt alle ausgehandelten TLS-Geheimnisse im NSS-Format (append) — ein Paketanalysator entschlüsselt die Sitzungsaufzeichnung. |
+| **The `--oidc-config PATH` option** rides the reference json config of the OIDC flow (`client_id`/`client_secret` fill the options the command line did not name). | **Опция `--oidc-config PATH`** несёт эталонный json-конфиг OIDC-флоу (`client_id`/`client_secret` заполняют опции, не названные в командной строке). | **Die Option `--oidc-config PATH`** trägt die Referenz-JSON-Konfiguration des OIDC-Flows (`client_id`/`client_secret` füllen die Optionen, die die Kommandozeile nicht nannte). |
+| **The `IdentityFile` keyword of the ssh_config file** — the first candidate feeds the identity when the command line names none. | **Ключ `IdentityFile` файла ssh_config** — первый кандидат становится identity, когда командная строка не называет ни одного. | **Das `IdentityFile`-Schlüsselwort der ssh_config-Datei** — der erste Kandidat speist die Identität, wenn die Kommandozeile keine nennt. |
+
 ## [0.2.5] - 2026-10-30
 
 ### Fixed / Исправлено / Behoben

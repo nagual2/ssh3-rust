@@ -2239,7 +2239,7 @@ dependencies = [
 
 [[package]]
 name = "ssh3-auth"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "base64",
  "p256",
@@ -2256,7 +2256,7 @@ dependencies = [
 
 [[package]]
 name = "ssh3-client"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "base64",
  "clap",
@@ -2294,7 +2294,7 @@ dependencies = [
 
 [[package]]
 name = "ssh3-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "flate2",
@@ -2307,7 +2307,7 @@ dependencies = [
 
 [[package]]
 name = "ssh3-h3"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "bytes",
  "futures-util",
@@ -2322,11 +2322,11 @@ dependencies = [
 
 [[package]]
 name = "ssh3-proto"
-version = "0.2.5"
+version = "0.2.6"
 
 [[package]]
 name = "ssh3-quinn"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2341,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "ssh3-server"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "base64",
  "clap",

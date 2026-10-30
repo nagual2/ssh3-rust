@@ -304,6 +304,7 @@ pub(crate) fn known_hosts_roots(
 pub(crate) fn known_hosts_client_config(
     trust: &Ssh3KnownHostsTrust,
     state: Arc<HostKeyState>,
+    key_log: Option<Arc<dyn rustls::KeyLog>>,
 ) -> Result<quinn::ClientConfig, crate::Ssh3ClientError> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let roots = known_hosts_roots(&trust.authorities)?;
@@ -324,6 +325,9 @@ pub(crate) fn known_hosts_client_config(
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
+    if let Some(key_log) = key_log {
+        client_crypto.key_log = key_log;
+    }
     client_crypto.alpn_protocols = vec![H3_ALPN.to_vec()];
 
     let quic_config =

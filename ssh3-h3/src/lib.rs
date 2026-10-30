@@ -25,7 +25,7 @@ pub const SSH3_USER_HEADER: &str = "x-ssh3-user";
 /// mask of the channel body compression). The field is optional on the wire:
 /// a peer without it simply never sends compressed frames.
 pub const SSH3_VERSION_STRING: &str =
-    "SSH 3.0 ssh3-rust 0.2.5 experimental_spec_version=alpha-00 compress=zstd,deflate,lz4";
+    "SSH 3.0 ssh3-rust 0.2.6 experimental_spec_version=alpha-00 compress=zstd,deflate,lz4";
 /// The maximum size of the HEADERS field section an endpoint accepts.
 ///
 /// The HTTP/3 layer buffers the whole compressed field section of a HEADERS

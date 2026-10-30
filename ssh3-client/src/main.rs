@@ -7,15 +7,23 @@ use http::Uri;
 use ssh3_client::{
     DEFAULT_HANDSHAKE_IDLE_TIMEOUT, DEFAULT_MAX_IDLE_TIMEOUT, DEFAULT_TRANSFER_PORT,
     DEFAULT_TRANSFER_URL_PATH, SSH3_CLIENT_VERSION_STRING, Ssh3AgentSelection, Ssh3ClientConfig,
-    Ssh3ClientError, Ssh3DynamicForwardSpec, Ssh3KnownHostsTrust, Ssh3LocalForwardSpec,
-    Ssh3OidcConfig, Ssh3PtyPolicy, Ssh3ReverseForwardSpec, Ssh3SessionRequest,
-    Ssh3StrictHostKeyChecking, Ssh3TransferOptions, Ssh3TransferPlan, Ssh3TrustStrategy, SshConfig,
-    default_known_hosts_path, default_ssh_config_path, diag_error, diag_info,
-    exit_code_for_exit_signal, is_remote_transfer_spec, load_certificates, load_ssh_config,
-    parse_duration, parse_dynamic_forward_spec, parse_escape_char, parse_local_forward_spec,
-    parse_remote_transfer_spec, parse_reverse_forward_spec, read_config_text,
-    resolve_strict_host_key_checking, run_file_transfer, run_forwards_only, run_session_stdio,
+    Ssh3ClientError, Ssh3DynamicForwardSpec, Ssh3IpFamily, Ssh3KnownHostsTrust,
+    Ssh3LocalForwardSpec, Ssh3OidcConfig, Ssh3PtyPolicy, Ssh3ReverseForwardSpec,
+    Ssh3SessionRequest, Ssh3StrictHostKeyChecking, Ssh3TransferOptions, Ssh3TransferPlan,
+    Ssh3TrustStrategy, SshConfig, default_known_hosts_path, default_ssh_config_path, diag_error,
+    diag_info, exit_code_for_exit_signal, is_remote_transfer_spec, load_certificates,
+    load_ssh_config, parse_duration, parse_dynamic_forward_spec, parse_escape_char,
+    parse_local_forward_spec, parse_remote_transfer_spec, parse_reverse_forward_spec,
+    read_config_text, resolve_strict_host_key_checking, run_file_transfer, run_forwards_only,
+    run_session_stdio,
 };
+
+/// The body of the reference `--oidc-config` json file.
+#[derive(serde::Deserialize)]
+struct Ssh3OidcConfigFile {
+    client_id: String,
+    client_secret: String,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -136,6 +144,33 @@ struct Cli {
 
     #[arg(long)]
     no_pkce: bool,
+
+    /// OpenID Connect json config file containing the client_id and the
+    /// client_secret fields needed by the OIDC flow (the reference file
+    /// name: ~/.ssh3/oidc_config.json).
+    #[arg(
+        long = "oidc-config",
+        value_name = "PATH",
+        value_hint = ValueHint::FilePath
+    )]
+    oidc_config: Option<PathBuf>,
+
+    /// Use IPv4 addresses only (ssh2 -4).
+    #[arg(short = '4', long, conflicts_with = "ipv6_only")]
+    ipv4_only: bool,
+
+    /// Use IPv6 addresses only (ssh2 -6).
+    #[arg(short = '6', long, conflicts_with = "ipv4_only")]
+    ipv6_only: bool,
+
+    /// Write the QUIC TLS secrets in the NSS keylog format into the given
+    /// file: only for debugging with a packet analyzer.
+    #[arg(
+        long = "keylog",
+        value_name = "PATH",
+        value_hint = ValueHint::FilePath
+    )]
+    keylog: Option<PathBuf>,
 
     #[arg(
         long,
@@ -538,6 +573,7 @@ struct SshConfigValues {
     control_persist: Option<String>,
     verify_host_key_dns: Option<String>,
     port: Option<u16>,
+    identity_files: Vec<String>,
 }
 
 /// Loads the ssh_config file of the user.
@@ -587,6 +623,7 @@ fn ssh_config_values(
         control_persist: None,
         verify_host_key_dns: None,
         port: None,
+        identity_files: Vec::new(),
     };
     let Some(host) = host else {
         return Ok(values);
@@ -668,6 +705,13 @@ fn ssh_config_values(
             )
         })?);
     }
+    // The IdentityFile keyword: every occurrence is a candidate, the first
+    // one wins (the reference reads them in order).
+    values.identity_files = configuration
+        .values_for_user(host, user, "IdentityFile")
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect();
     Ok(values)
 }
 
@@ -919,6 +963,33 @@ fn build_connection_config(
     url: Uri,
     username: Option<String>,
 ) -> Result<(Ssh3ClientConfig, ControlSettings), clap::Error> {
+    // The reference config file of the OIDC flow: the json fields fill the
+    // options the command line did not name (the file without the issuer
+    // URL stays dormant, like in the Go implementation).
+    let oidc_config_file: Option<Ssh3OidcConfigFile> = cli
+        .oidc_config
+        .as_ref()
+        .map(|path| {
+            let text = read_config_text(path).map_err(|err| {
+                cli_error(ErrorKind::Io, format!("failed to read oidc config: {err}"))
+            })?;
+            serde_json::from_str(&text).map_err(|err| {
+                cli_error(
+                    ErrorKind::ValueValidation,
+                    format!("invalid oidc config {}: {err}", path.display()),
+                )
+            })
+        })
+        .transpose()?;
+    let mut cli = cli;
+    if let Some(file) = &oidc_config_file {
+        if cli.oidc_client_id.is_none() {
+            cli.oidc_client_id = Some(file.client_id.clone());
+        }
+        if cli.oidc_client_secret.is_none() && cli.oidc_client_secret_file.is_none() {
+            cli.oidc_client_secret = Some(file.client_secret.clone());
+        }
+    }
     // The url fields move into the config: the control settings resolve
     // from the copies taken here.
     // The session user rides the URL query (`?user=max`), the way the Go
@@ -964,6 +1035,16 @@ fn build_connection_config(
     };
     config.agent_socket = cli.agent_socket;
     config.forward_agent = cli.forward_agent;
+    // The `-4`/`-6` flags of the ssh2 canon filter the families of the
+    // dial; the `-keylog` file rides the TLS layer of the connection.
+    config.ip_family = if cli.ipv4_only {
+        Ssh3IpFamily::Ipv4Only
+    } else if cli.ipv6_only {
+        Ssh3IpFamily::Ipv6Only
+    } else {
+        Ssh3IpFamily::Any
+    };
+    config.keylog = cli.keylog;
     config.password = match (cli.password, cli.password_file) {
         (Some(password), None) => Some(password),
         (None, Some(path)) => Some(read_secret_file(&path, "password file")?),
@@ -1023,6 +1104,12 @@ fn build_connection_config(
         config.username.as_deref(),
     )?;
 
+    // The IdentityFile keyword of the ssh_config file: the CLI wins over
+    // the first candidate of the file (the reference reads them in order).
+    if config.identity_file.is_none() {
+        config.identity_file = ssh_config_values.identity_files.first().map(PathBuf::from);
+    }
+
     // The `Port` keyword of the ssh_config file applies when the URL did
     // not name a port, like the Go implementation does (`cmd/ssh3.go:868`):
     // the keyword of the file is the last source of the connection port.
@@ -1033,6 +1120,13 @@ fn build_connection_config(
                 format!("invalid ssh_config Port: {err}"),
             )
         })?;
+    }
+
+    // The `-p` option of the ssh2 canon wins over the operand port and the
+    // `Port` keyword (the transfer rides the same flag).
+    if let Some(port) = cli.port {
+        config.target_url = url_with_port(&config.target_url, port)
+            .map_err(|err| cli_error(ErrorKind::ValueValidation, format!("invalid port: {err}")))?;
     }
 
     // The certificate authorities the server chain may be verified against.

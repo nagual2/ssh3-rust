@@ -55,6 +55,7 @@ mod forward;
 mod forwarding_wire;
 mod host_key;
 mod incoming;
+pub mod keylog;
 mod known_hosts;
 pub mod log;
 mod proxy_jump;
@@ -224,6 +225,22 @@ pub struct Ssh3ClientConfig {
     ///
     /// `None` and the `No` mode never run the check.
     pub verify_host_key_dns: Option<sshfp::VerifyHostKeyDns>,
+    /// The address family filter of the dial (`-4` / `-6`).
+    pub ip_family: Ssh3IpFamily,
+    /// The NSS keylog file of the `-keylog` option.
+    pub keylog: Option<PathBuf>,
+}
+
+/// The address family filter of the dial (`-4` / `-6` of the ssh2 canon).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Ssh3IpFamily {
+    /// Both families, in the order of the resolver.
+    #[default]
+    Any,
+    /// IPv4 only.
+    Ipv4Only,
+    /// IPv6 only.
+    Ipv6Only,
 }
 
 impl Ssh3ClientConfig {
@@ -254,6 +271,8 @@ impl Ssh3ClientConfig {
             dynamic_forwards: Vec::new(),
             proxy_jump: None,
             verify_host_key_dns: None,
+            ip_family: Ssh3IpFamily::Any,
+            keylog: None,
         }
     }
 }
@@ -1928,7 +1947,11 @@ async fn connect_direct_with_browser_opener(
     // holding the whole invocation until the handshake timeout.
     let remote_addrs = match remote_override {
         Some(remote) => vec![remote],
-        None => resolve_target(&config.target_url).await?.remote_addrs,
+        None => {
+            resolve_target(&config.target_url, config.ip_family)
+                .await?
+                .remote_addrs
+        }
     };
     let runtime = quinn::default_runtime()
         .ok_or_else(|| Ssh3ClientError::Io(io::Error::other("no async runtime found for quinn")))?;
@@ -1957,8 +1980,9 @@ async fn connect_direct_with_browser_opener(
         crate::diag_debug!("ssh3 dialing {remote_addr}");
         let bind_addr = client_bind_addr(*remote_addr);
         let socket = std::net::UdpSocket::bind(bind_addr).map_err(Ssh3ClientError::Io)?;
-        let mut endpoint = quinn::Endpoint::new(endpoint_config.clone(), None, socket, runtime.clone())
-            .map_err(Ssh3ClientError::Io)?;
+        let mut endpoint =
+            quinn::Endpoint::new(endpoint_config.clone(), None, socket, runtime.clone())
+                .map_err(Ssh3ClientError::Io)?;
         endpoint.set_default_client_config(quinn_config.clone());
         let established = match tokio::time::timeout(
             config.handshake_idle_timeout,
@@ -2114,13 +2138,22 @@ async fn connect_direct_with_browser_opener(
     ))
 }
 
+/// The keylog writer of the `-keylog` option, shaped for the rustls
+/// client configuration of every trust strategy.
+fn key_log_for(config: &Ssh3ClientConfig) -> Option<Arc<dyn rustls::KeyLog>> {
+    config
+        .keylog
+        .as_ref()
+        .map(|path| Arc::new(keylog::FileKeyLog::new(path.clone())) as _)
+}
+
 fn client_quinn_config(
     config: &Ssh3ClientConfig,
     tunneled_packet_size: Option<u16>,
 ) -> Result<(quinn::ClientConfig, Option<Arc<host_key::HostKeyState>>), Ssh3ClientError> {
     let (mut client_config, host_key_state) = match &config.trust {
         Ssh3TrustStrategy::WebPkiRoots => (
-            client_config_with_webpki_roots().map_err(Ssh3ClientError::from)?,
+            client_config_with_webpki_roots(key_log_for(config)).map_err(Ssh3ClientError::from)?,
             None,
         ),
         Ssh3TrustStrategy::Certificates(certificates) => {
@@ -2130,12 +2163,13 @@ fn client_quinn_config(
                 return Err(Ssh3ClientError::InvalidCertificateBundle);
             }
             (
-                client_config_with_roots(roots).map_err(Ssh3ClientError::from)?,
+                client_config_with_roots(roots, key_log_for(config))
+                    .map_err(Ssh3ClientError::from)?,
                 None,
             )
         }
         Ssh3TrustStrategy::Insecure => (
-            client_config_insecure().map_err(Ssh3ClientError::from)?,
+            client_config_insecure(key_log_for(config)).map_err(Ssh3ClientError::from)?,
             None,
         ),
         Ssh3TrustStrategy::KnownHosts(trust) => {
@@ -2155,7 +2189,8 @@ fn client_quinn_config(
                 trust.path.clone(),
                 known_hosts,
             ));
-            let client_config = host_key::known_hosts_client_config(trust, state.clone())?;
+            let client_config =
+                host_key::known_hosts_client_config(trust, state.clone(), key_log_for(config))?;
             (client_config, Some(state))
         }
     };
@@ -2193,7 +2228,10 @@ fn client_quinn_config(
     Ok((client_config, host_key_state))
 }
 
-async fn resolve_target(uri: &Uri) -> Result<ResolvedTarget, Ssh3ClientError> {
+async fn resolve_target(
+    uri: &Uri,
+    ip_family: Ssh3IpFamily,
+) -> Result<ResolvedTarget, Ssh3ClientError> {
     let host = uri.host().ok_or(Ssh3ClientError::MissingHost)?;
     crate::diag_debug!(
         "ssh3 resolving {}:{} (the user of the session: {:?})",
@@ -2205,16 +2243,26 @@ async fn resolve_target(uri: &Uri) -> Result<ResolvedTarget, Ssh3ClientError> {
     );
     // The addresses ride in the order of the resolver (the RFC 6724
     // spelling): the dial tries them one by one, because the first
-    // address of a dual answer is not always the reachable one.
-    let remote_addrs: Vec<SocketAddr> =
+    // address of a dual answer is not always the reachable one. The
+    // `-4`/`-6` flags of the ssh2 canon filter the families.
+    let mut remote_addrs: Vec<SocketAddr> =
         tokio::net::lookup_host((host, uri.port_u16().unwrap_or(443)))
             .await
             .map_err(Ssh3ClientError::Resolve)?
             .collect();
+    match ip_family {
+        Ssh3IpFamily::Any => (),
+        Ssh3IpFamily::Ipv4Only => remote_addrs.retain(|address| address.is_ipv4()),
+        Ssh3IpFamily::Ipv6Only => remote_addrs.retain(|address| address.is_ipv6()),
+    }
     if remote_addrs.is_empty() {
         return Err(Ssh3ClientError::Resolve(io::Error::new(
             io::ErrorKind::AddrNotAvailable,
-            "target host did not resolve to an address",
+            match ip_family {
+                Ssh3IpFamily::Ipv4Only => "target host did not resolve to an IPv4 address",
+                Ssh3IpFamily::Ipv6Only => "target host did not resolve to an IPv6 address",
+                Ssh3IpFamily::Any => "target host did not resolve to an address",
+            },
         )));
     }
 
@@ -2757,7 +2805,7 @@ mod tests {
         config: &Ssh3ClientConfig,
         authorization_builder: impl FnOnce(&[u8; 32]) -> String,
     ) -> Result<super::ActiveClient, Ssh3ClientError> {
-        let resolved = resolve_target(&config.target_url).await?;
+        let resolved = resolve_target(&config.target_url, config.ip_family).await?;
         let remote_addr = *resolved
             .remote_addrs
             .first()
