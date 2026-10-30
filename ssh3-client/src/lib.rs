@@ -697,7 +697,7 @@ impl From<http::header::InvalidHeaderValue> for Ssh3ClientError {
 }
 
 struct ResolvedTarget {
-    remote_addr: SocketAddr,
+    remote_addrs: Vec<SocketAddr>,
 }
 
 /// The exit code of a session whose remote process died by a signal.
@@ -1921,11 +1921,15 @@ async fn connect_direct_with_browser_opener(
     tunneled_packet_size: Option<u16>,
 ) -> Result<ActiveClient, Ssh3ClientError> {
     let precomputed_authorization = precomputed_authorization_header(config).await?;
-    let remote_addr = match remote_override {
-        Some(remote) => remote,
-        None => resolve_target(&config.target_url).await?.remote_addr,
+    // The dial tries the addresses of the target one by one: the first
+    // address of a dual A+AAAA answer is not always the reachable one
+    // (a global IPv6 the local network does not route, for example), so
+    // an unreachable address falls through to the next one instead of
+    // holding the whole invocation until the handshake timeout.
+    let remote_addrs = match remote_override {
+        Some(remote) => vec![remote],
+        None => resolve_target(&config.target_url).await?.remote_addrs,
     };
-    let bind_addr = client_bind_addr(remote_addr);
     let runtime = quinn::default_runtime()
         .ok_or_else(|| Ssh3ClientError::Io(io::Error::other("no async runtime found for quinn")))?;
     let mut endpoint_config = quinn::EndpointConfig::default();
@@ -1939,40 +1943,69 @@ async fn connect_direct_with_browser_opener(
             .max_udp_payload_size(size)
             .map_err(|error| Ssh3ClientError::Io(io::Error::other(error)))?;
     }
-    let socket = std::net::UdpSocket::bind(bind_addr).map_err(Ssh3ClientError::Io)?;
-    let mut endpoint = quinn::Endpoint::new(endpoint_config, None, socket, runtime)
-        .map_err(Ssh3ClientError::Io)?;
     let (quinn_config, host_key_state) = client_quinn_config(config, tunneled_packet_size)?;
-    endpoint.set_default_client_config(quinn_config);
 
     let server_name = config
         .server_name
         .clone()
         .or_else(|| config.target_url.host().map(str::to_string))
         .unwrap_or_default();
-    let connection = match tokio::time::timeout(
-        config.handshake_idle_timeout,
-        endpoint
-            .connect(remote_addr, &server_name)
-            .map_err(Ssh3ClientError::Connect)?,
-    )
-    .await
-    {
-        Ok(Ok(connection)) => connection,
-        Ok(Err(err)) => {
-            // The known_hosts check refuses the certificate during the
-            // handshake: the reason of the refusal is more precise than the
-            // transport error of the handshake.
-            if let Some(message) = host_key_state.as_ref().and_then(|state| state.refusal()) {
-                return Err(Ssh3ClientError::HostKeyRejected(message));
+    let mut last_error: Option<Ssh3ClientError> = None;
+    let mut connection = None;
+    let mut active_endpoint = None;
+    for remote_addr in &remote_addrs {
+        crate::diag_debug!("ssh3 dialing {remote_addr}");
+        let bind_addr = client_bind_addr(*remote_addr);
+        let socket = std::net::UdpSocket::bind(bind_addr).map_err(Ssh3ClientError::Io)?;
+        let mut endpoint = quinn::Endpoint::new(endpoint_config.clone(), None, socket, runtime.clone())
+            .map_err(Ssh3ClientError::Io)?;
+        endpoint.set_default_client_config(quinn_config.clone());
+        let established = match tokio::time::timeout(
+            config.handshake_idle_timeout,
+            endpoint
+                .connect(*remote_addr, &server_name)
+                .map_err(Ssh3ClientError::Connect)?,
+        )
+        .await
+        {
+            Ok(Ok(connection)) => Some(connection),
+            Ok(Err(err)) => {
+                // The known_hosts check refuses the certificate during the
+                // handshake: the reason of the refusal is more precise than the
+                // transport error of the handshake, and no other address of
+                // the same host answers it differently.
+                if let Some(message) = host_key_state.as_ref().and_then(|state| state.refusal()) {
+                    return Err(Ssh3ClientError::HostKeyRejected(message));
+                }
+                last_error = Some(Ssh3ClientError::Connection(err));
+                None
             }
-            return Err(Ssh3ClientError::Connection(err));
+            Err(_) => {
+                crate::diag_info!(
+                    "ssh3: the address {remote_addr} did not complete the handshake in {}s, trying the next address",
+                    config.handshake_idle_timeout.as_secs()
+                );
+                last_error = Some(Ssh3ClientError::HandshakeTimeout(
+                    config.handshake_idle_timeout,
+                ));
+                None
+            }
+        };
+        if let Some(established) = established {
+            connection = Some(established);
+            active_endpoint = Some(endpoint);
+            break;
         }
-        Err(_) => {
-            return Err(Ssh3ClientError::HandshakeTimeout(
-                config.handshake_idle_timeout,
-            ));
-        }
+    }
+    let Some(connection) = connection else {
+        return Err(last_error.ok_or_else(|| {
+            Ssh3ClientError::Io(io::Error::other("the target resolved to no address"))
+        })?);
+    };
+    let Some(endpoint) = active_endpoint else {
+        return Err(Ssh3ClientError::Io(io::Error::other(
+            "the connection arrived without its endpoint",
+        )));
     };
 
     // The certificate the handshake accepted is pinned once the connection is
@@ -2170,18 +2203,22 @@ async fn resolve_target(uri: &Uri) -> Result<ResolvedTarget, Ssh3ClientError> {
             .split_once('?')
             .and_then(|(_, query)| query.split('&').find_map(|pair| pair.strip_prefix("user=")))
     );
-    let remote_addr = tokio::net::lookup_host((host, uri.port_u16().unwrap_or(443)))
-        .await
-        .map_err(Ssh3ClientError::Resolve)?
-        .next()
-        .ok_or_else(|| {
-            Ssh3ClientError::Resolve(io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "target host did not resolve to an address",
-            ))
-        })?;
+    // The addresses ride in the order of the resolver (the RFC 6724
+    // spelling): the dial tries them one by one, because the first
+    // address of a dual answer is not always the reachable one.
+    let remote_addrs: Vec<SocketAddr> =
+        tokio::net::lookup_host((host, uri.port_u16().unwrap_or(443)))
+            .await
+            .map_err(Ssh3ClientError::Resolve)?
+            .collect();
+    if remote_addrs.is_empty() {
+        return Err(Ssh3ClientError::Resolve(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "target host did not resolve to an address",
+        )));
+    }
 
-    Ok(ResolvedTarget { remote_addr })
+    Ok(ResolvedTarget { remote_addrs })
 }
 
 fn client_bind_addr(remote_addr: SocketAddr) -> SocketAddr {
@@ -2721,7 +2758,11 @@ mod tests {
         authorization_builder: impl FnOnce(&[u8; 32]) -> String,
     ) -> Result<super::ActiveClient, Ssh3ClientError> {
         let resolved = resolve_target(&config.target_url).await?;
-        let bind_addr = client_bind_addr(resolved.remote_addr);
+        let remote_addr = *resolved
+            .remote_addrs
+            .first()
+            .expect("the resolver returned an address");
+        let bind_addr = client_bind_addr(remote_addr);
         let mut endpoint = Endpoint::client(bind_addr).map_err(Ssh3ClientError::Endpoint)?;
         endpoint.set_default_client_config(client_quinn_config(config, None)?.0);
 
@@ -2731,7 +2772,7 @@ mod tests {
             .or_else(|| config.target_url.host().map(str::to_string))
             .unwrap_or_default();
         let connection = endpoint
-            .connect(resolved.remote_addr, &server_name)
+            .connect(remote_addr, &server_name)
             .map_err(Ssh3ClientError::Connect)?
             .await
             .map_err(Ssh3ClientError::Connection)?;

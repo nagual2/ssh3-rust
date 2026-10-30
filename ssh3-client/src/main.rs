@@ -921,6 +921,35 @@ fn build_connection_config(
 ) -> Result<(Ssh3ClientConfig, ControlSettings), clap::Error> {
     // The url fields move into the config: the control settings resolve
     // from the copies taken here.
+    // The session user rides the URL query (`?user=max`), the way the Go
+    // client sends the CONNECT request: the reference server resolves the
+    // user from the query, and the `x-ssh3-user` header alone is not read
+    // by every implementation.
+    let url = match &username {
+        Some(user) => {
+            let parsed = url::Url::parse(&url.to_string()).map_err(|err| {
+                cli_error(
+                    ErrorKind::ValueValidation,
+                    format!("invalid URL {url}: {err}"),
+                )
+            })?;
+            let already = parsed.query_pairs().any(|(key, _)| key == "user");
+            let mut parsed = parsed;
+            if !already {
+                let mut pairs = parsed.query_pairs_mut();
+                pairs.append_pair("user", user);
+            }
+            // The userinfo of the ssh2-shaped operand stays out of the wire.
+            let _ = parsed.set_username("");
+            parsed.as_str().parse::<Uri>().map_err(|err| {
+                cli_error(
+                    ErrorKind::ValueValidation,
+                    format!("invalid URL {parsed}: {err}"),
+                )
+            })?
+        }
+        None => url,
+    };
     let url_host = url.host().map(str::to_string);
     let url_port = url.port_u16().unwrap_or(443);
     let url_has_port = url.port_u16().is_some();
@@ -1019,9 +1048,11 @@ fn build_connection_config(
 
     // The StrictHostKeyChecking policy is resolved like OpenSSH does: the
     // flag wins over the `-o` option, which wins over the keyword of the
-    // ssh_config file. The known_hosts check only runs when one of the
-    // sources sets the policy, so that the default behaviour of the client
-    // stays the one it had before.
+    // ssh_config file. The known_hosts layer of the reference is always in
+    // the game: the pinned certificate of a host accepts the self-signed
+    // release, the public chains keep riding the webpki roots, and the
+    // policy decides what happens to an unpinned self-signed one (the
+    // default is ask, like in the reference).
     let policy = resolve_strict_host_key_checking(
         cli.strict_host_key_checking.as_deref(),
         overrides.strict_host_key_checking.as_deref(),
@@ -1034,7 +1065,9 @@ fn build_connection_config(
 
     config.trust = if cli.insecure {
         Ssh3TrustStrategy::Insecure
-    } else if policy_is_set {
+    } else if !authorities.is_empty() && !policy_is_set {
+        Ssh3TrustStrategy::Certificates(authorities)
+    } else {
         Ssh3TrustStrategy::KnownHosts(Ssh3KnownHostsTrust {
             policy,
             path: cli
@@ -1044,10 +1077,6 @@ fn build_connection_config(
                 .unwrap_or_else(|| PathBuf::from(".ssh3").join("known_hosts")),
             authorities,
         })
-    } else if !authorities.is_empty() {
-        Ssh3TrustStrategy::Certificates(authorities)
-    } else {
-        Ssh3TrustStrategy::WebPkiRoots
     };
 
     // The RequestTTY precedence follows OpenSSH: the `-T` and `-t` flags are
@@ -1829,6 +1858,9 @@ mod tests {
             plan.config.target_url.host().map(str::to_string).as_deref(),
             Some("example.org")
         );
+        // The session user rides the query of the CONNECT request: the
+        // reference server resolves the user from it.
+        assert_eq!(plan.config.target_url.query(), Some("user=max"));
     }
 
     /// The `--user` option wins over the user of the operand.
@@ -2110,10 +2142,16 @@ mod tests {
     }
 
     #[test]
-    fn the_known_hosts_check_is_off_until_a_policy_is_set() {
+    fn the_known_hosts_layer_is_always_in_the_game() {
         let config = config_of(&[]);
-        assert!(matches!(config.trust, Ssh3TrustStrategy::WebPkiRoots));
-        assert_eq!(policy_of(&config), None);
+        assert!(matches!(config.trust, Ssh3TrustStrategy::KnownHosts(_)));
+        // The default policy of the reference is ask: the pinned
+        // certificates accept the connection, the public chains keep
+        // riding the webpki roots, and an unpinned self-signed one asks.
+        assert!(matches!(
+            policy_of(&config),
+            Some(Ssh3StrictHostKeyChecking::Ask)
+        ));
     }
 
     #[test]

@@ -173,6 +173,12 @@ impl ServerCertVerifier for KnownHostsVerifier {
     ) -> Result<ServerCertVerified, RustlsError> {
         let fingerprint = certificate_fingerprint(end_entity);
         let status = self.state.check_certificate(end_entity);
+        crate::diag_debug!(
+            "ssh3 known_hosts: the presented fingerprint of {} is {}, the pin status is {status:?}, the pinned fingerprints are {:?}",
+            self.state.host(),
+            fingerprint,
+            self.state.fingerprints()
+        );
 
         if status == HostCertificateStatus::Matches {
             // The presented certificate is the pinned one: it is the trust

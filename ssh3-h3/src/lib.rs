@@ -25,7 +25,7 @@ pub const SSH3_USER_HEADER: &str = "x-ssh3-user";
 /// mask of the channel body compression). The field is optional on the wire:
 /// a peer without it simply never sends compressed frames.
 pub const SSH3_VERSION_STRING: &str =
-    "SSH 3.0 ssh3-rust 0.2.4 experimental_spec_version=alpha-00 compress=zstd,deflate,lz4";
+    "SSH 3.0 ssh3-rust 0.2.5 experimental_spec_version=alpha-00 compress=zstd,deflate,lz4";
 /// The maximum size of the HEADERS field section an endpoint accepts.
 ///
 /// The HTTP/3 layer buffers the whole compressed field section of a HEADERS
@@ -369,6 +369,11 @@ pub fn configure_client_builder(builder: &mut h3::client::Builder) -> &mut h3::c
         .enable_extended_connect(true)
         .enable_datagram(false)
         .max_field_section_size(MAX_FIELD_SECTION_SIZE)
+        // The reserved greasing uni streams of RFC 9114 §7.2.8 stay off:
+        // minimal strict H3 servers count the peer uni streams and finish
+        // the connection on the fourth one before reading its type, and
+        // the greasing of the client is a SHOULD, not a MUST.
+        .send_grease(false)
 }
 
 /// Configures the HTTP/3 layer of the server.
