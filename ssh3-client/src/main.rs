@@ -1629,7 +1629,7 @@ async fn run_slave(plan: &ClientPlan) -> ExitCode {
         pty,
         plan.config.forward_agent,
         terminal,
-        tokio::io::stdin(),
+        ssh3_client::stdin_stream(),
         tokio::io::stdout(),
         tokio::io::stderr(),
     )

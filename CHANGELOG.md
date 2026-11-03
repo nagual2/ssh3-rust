@@ -20,6 +20,12 @@
 
 ## [Unreleased] / Не выпущено / Nicht veröffentlicht
 
+### Fixed / Исправлено / Behoben
+
+| English | Русский | Deutsch |
+|---------|---------|---------|
+| **The client exits when the interactive session ends** — the console read of the stdin pump ran on the blocking pool of the runtime (`tokio::io::stdin`), and the read of an interactive console cannot be cancelled: the shutdown of the runtime waited for the parked read until a key was pressed, so the console window stayed open after `exit` on Windows (and on every platform with a tty stdin). The pump now reads through a dedicated process thread (`stdin_stream`) that hands the chunks to the async side over a bounded channel; a thread parked in a console read holds nothing of the runtime. The control-master slave reads through the same stream. | **Клиент завершается по окончании интерактивной сессии** — чтение консоли в пампе stdin ехало через блокирующий пул рантайма (`tokio::io::stdin`), и чтение интерактивной консоли неотменяемо: шатдаун рантайма ждал запаркованное чтение, пока пользователь нажмёт клавишу, поэтому после `exit` окно консоли не закрывалось на Windows (и на любой платформе с tty-stdin). Памп теперь читает через выделенный поток процесса (`stdin_stream`), который передаёт чанки в async-сторону через ограниченный канал; поток, запаркованный в чтении консоли, не держит ничего от рантайма. Control-master slave читает через тот же поток. | **Der Client beendet sich, wenn die interaktive Sitzung endet** — die Konsolenlesung der stdin-Pumpe lief über den Blocking-Pool der Laufzeit (`tokio::io::stdin`), und die Lesung einer interaktiven Konsole ist nicht abbrechbar: das Herunterfahren der Laufzeit wartete auf die geparkte Lesung, bis eine Taste gedrückt wurde, deshalb blieb das Konsolenfenster nach `exit` unter Windows offen (und auf jeder Plattform mit tty-stdin). Die Pumpe liest nun über einen eigenen Prozess-Thread (`stdin_stream`), der die Chunks über einen begrenzten Kanal an die async-Seite übergibt; ein in einer Konsolenlesung geparkter Thread hält nichts von der Laufzeit. Der Control-master-Slave liest über denselben Strom. |
+
 ## [0.2.6] - 2026-10-30
 
 ### Added / Добавлено / Hinzugefügt

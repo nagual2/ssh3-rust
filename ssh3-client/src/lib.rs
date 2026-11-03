@@ -63,6 +63,7 @@ mod reverse;
 mod sftp_stream;
 mod ssh_config;
 pub mod sshfp;
+mod stdin;
 mod strict_host_key;
 mod transfer;
 #[cfg(test)]
@@ -75,6 +76,7 @@ use console::{
     RawModeGuardHandle, enable_console_modes, enable_raw_mode, spawn_resize_forwarder,
     spawn_signal_forwarders, suspend_local_process,
 };
+pub use stdin::{StdinStream, stream as stdin_stream};
 // The console events of a control-master slave relay to the master; the
 // control module (and with it the whole relay) is unix only.
 #[cfg(unix)]
@@ -2386,7 +2388,7 @@ async fn run_stdio_on_client(
         let action_tx = action_tx.clone();
         let raw_mode_guard = session_runtime.raw_mode_guard.clone();
         async move {
-            let mut stdin = tokio::io::stdin();
+            let mut stdin = stdin_stream();
             let mut buf = vec![
                 0;
                 usize::try_from(channel.max_packet_size())
