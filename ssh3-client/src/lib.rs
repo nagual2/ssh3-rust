@@ -55,13 +55,13 @@ mod forward;
 mod forwarding_wire;
 mod host_key;
 mod incoming;
+mod interactive_sftp;
 pub mod keylog;
 mod known_hosts;
 pub mod log;
 mod proxy_jump;
 mod reverse;
 mod sftp_stream;
-mod interactive_sftp;
 mod ssh_config;
 pub mod sshfp;
 mod stdin;
@@ -77,8 +77,8 @@ use console::{
     RawModeGuardHandle, enable_console_modes, enable_raw_mode, spawn_resize_forwarder,
     spawn_signal_forwarders, suspend_local_process,
 };
-pub use stdin::{StdinStream, stream as stdin_stream};
 pub use interactive_sftp::run as run_interactive_sftp;
+pub use stdin::{StdinStream, stream as stdin_stream};
 // The console events of a control-master slave relay to the master; the
 // control module (and with it the whole relay) is unix only.
 #[cfg(unix)]

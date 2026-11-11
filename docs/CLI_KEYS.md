@@ -50,7 +50,7 @@ Legend for the platform columns: `yes` = implemented, `-` = not implemented / N/
 | - | `--known-hosts` | path | none | - | - | yes | Rust only |
 | - | `--keylog` | path | "" | yes | - | yes | Go + Rust |
 | `-l` | - | login name (C) / `--log-level` hint | none | - | yes | - | C only (Go `--log-level`? no) |
-| - | `--local-forward` | spec | none | - (see `-L`) | - (see `-L`) | yes (`-L` alias) | all three (short `-L`) |
+| - | `--local-forward` | spec | none | - (see `-L`) | - (see `-L`) | - (`-L` only) | all three (short `-L`) |
 | - | `--max-idle-timeout` | duration | none | - | - | yes | Rust only |
 | `-M` | - | flag | false | yes | yes | yes (unix) | all three |
 | `-n` | - | flag | false | - | yes | - | C only (no stdin) |
@@ -61,7 +61,7 @@ Legend for the platform columns: `yes` = implemented, `-` = not implemented / N/
 | - | `--oidc-config` | path | "" | yes (`--oidc-config`) | - | yes | Go + Rust |
 | - | `--oidc-issuer` (C) / `--use-oidc` (Go/Rust) | issuer | "" | yes (`--use-oidc`) | yes (`--oidc-issuer`) | yes (`--use-oidc`) | all three (name differs) |
 | - | `--oidc-token` / `--oidc-audience` | - | none | - | yes (C) | - | C only (Go/Rust use -o / --use-oidc) |
-| - | `--option` | KEY=VALUE | none | - (see `-o`) | - (see `-o`) | yes (`-o` alias) | all three |
+| - | `--option` | KEY=VALUE | none | - (see `-o`) | - (see `-o`) | - (`-o` only) | all three (short `-o`) |
 | `-p` | - | int (port) | 0 | yes | yes | yes | all three |
 | - | `--packet-size` | int | 1200 | yes | - | - | Go only |
 | - | `--password` / `--password-file` | string/path | "" | yes (`--password`) | yes (`--password`) | yes | all three |
@@ -75,8 +75,9 @@ Legend for the platform columns: `yes` = implemented, `-` = not implemented / N/
 | - | `--strict-host-key-checking` | value | "" | yes | yes (`-strict-host-key-checking`) | yes | all three |
 | `-t` | - | flag | false | yes | yes | yes | all three |
 | - | `--transfer` | flag | false | yes | - (--sftp replaces) | yes | Go + Rust |
+| - | `--sftp` | flag + spec (scp canon: `local :remote`, `:remote local`, `put|get:...`) | false | yes | yes | - | Go + C; missing in Rust — alias of `--transfer` (хвост UD1/UD4) |
 | - | `--url` | URL | required | - (positional) | - (positional) | yes | Rust only |
-| - | `--url-path` | path | none | - (see `-U`) | - (see `-U`) | yes (`-U`) | all three |
+| - | `--url-path` | path | `/ssh3-term` | - (see `-U`) | - (see `-U`) | yes (`-U`) | all three |
 | - | `--use-password` | flag | false | yes | - | - | Go only |
 | - | `--use-oidc` | issuer | "" | yes | - (see `--oidc-issuer`) | yes | Go + Rust (+ C alias) |
 | `-v` | - | flag/count | false | yes | yes | yes | all three |

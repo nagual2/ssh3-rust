@@ -19,13 +19,9 @@ use crate::sftp_stream::ChannelStream;
 const COPY_BUFFER: usize = 64 * 1024;
 
 /// Runs the interactive SFTP client over an established connection.
-pub async fn run(
-    config: &crate::Ssh3ClientConfig,
-) -> Result<i32, Ssh3ClientError> {
+pub async fn run(config: &crate::Ssh3ClientConfig) -> Result<i32, Ssh3ClientError> {
     let client = connect_client(config).await?;
-    let channel = client
-        .open_sftp_channel()
-        .await?;
+    let channel = client.open_sftp_channel().await?;
     let stream = ChannelStream::new(channel);
     let sftp = SftpSession::new(stream)
         .await
@@ -198,8 +194,7 @@ pub(crate) fn join_path(cwd: &str, requested: Option<&str>) -> String {
     match requested {
         None | Some(".") | Some("") => cwd.to_string(),
         Some(path) if path.starts_with('/') => path.to_string(),
-        Some(path) => format!("{}/{}", cwd.trim_end_matches('/'), path)
-            .replace("//", "/"),
+        Some(path) => format!("{}/{}", cwd.trim_end_matches('/'), path).replace("//", "/"),
     }
 }
 
@@ -264,10 +259,7 @@ mod tests {
 
     #[test]
     fn split_fields_handles_quotes_with_spaces() {
-        assert_eq!(
-            split_fields("\"a b c\" d"),
-            vec!["a b c", "d"]
-        );
+        assert_eq!(split_fields("\"a b c\" d"), vec!["a b c", "d"]);
     }
 
     #[test]
@@ -278,7 +270,10 @@ mod tests {
 
     #[test]
     fn join_path_relative() {
-        assert_eq!(join_path("/home/user", Some("docs/file.txt")), "/home/user/docs/file.txt");
+        assert_eq!(
+            join_path("/home/user", Some("docs/file.txt")),
+            "/home/user/docs/file.txt"
+        );
     }
 
     #[test]

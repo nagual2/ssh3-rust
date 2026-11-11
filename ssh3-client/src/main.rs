@@ -297,13 +297,15 @@ struct Cli {
 
     /// Connect through the jump hosts of the chain, every destination in the
     /// `[user@]host[:port]` form separated by commas (-J). Each hop must run
-    /// an SSH3 server.
-    #[arg(short = 'J', long = "jump", value_name = "DESTINATION")]
+    /// an SSH3 server. The `--proxy-jump` spelling is the deprecated alias
+    /// the Go implementation writes.
+    #[arg(
+        short = 'J',
+        long = "jump",
+        visible_alias = "proxy-jump",
+        value_name = "DESTINATION"
+    )]
     jump: Option<String>,
-
-    /// The deprecated alias of `-J`.
-    #[arg(long = "proxy-jump", value_name = "DESTINATION")]
-    proxy_jump: Option<String>,
 
     /// Quiet mode: suppress the diagnostic messages, the errors stay
     /// (ssh2 -q).
@@ -1256,14 +1258,11 @@ fn build_connection_config(
     {
         config.keep_alive_interval = Some(interval);
     }
-    // The proxy jump chain comes from the `-J` flag first, from its
-    // deprecated `-proxy-jump` alias next, from the `-o` option after that
-    // and from the keyword of the ssh_config file last.
-    let jump_flag = cli
-        .jump
-        .as_deref()
-        .or(cli.proxy_jump.as_deref())
-        .map(str::to_string);
+    // The proxy jump chain comes from the `-J` flag first (the deprecated
+    // `--proxy-jump` spelling rides the same argument as its visible
+    // alias), from the `-o` option next and from the keyword of the
+    // ssh_config file last.
+    let jump_flag = cli.jump.clone();
     if let Some(chain) = jump_flag {
         validate_proxy_jump(&chain).map_err(|err| cli_error(ErrorKind::ValueValidation, err))?;
         config.proxy_jump = Some(chain);
@@ -1738,14 +1737,17 @@ const GO_STYLE_LONG_FLAGS: &[&str] = &[
     "forward-agent",
     "identity",
     "insecure",
+    "keylog",
     "known-hosts",
     "no-pkce",
+    "oidc-config",
     "oidc-client-id",
     "oidc-client-secret",
     "oidc-client-secret-file",
     "password",
     "password-file",
     "privkey",
+    "pubkey-for-agent",
     "proxy-jump",
     "server-name",
     "ssh-config",
@@ -1889,7 +1891,7 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{Cli, build_config, build_transfer_config, go_style_flags};
-    use clap::{Parser, error::ErrorKind};
+    use clap::{CommandFactory, Parser, error::ErrorKind};
     use ssh3_client::{
         SSH3_CLIENT_VERSION_STRING, Ssh3ForwardProtocol, Ssh3PtyPolicy, Ssh3ReverseForwardProtocol,
         Ssh3SessionRequest, Ssh3StrictHostKeyChecking, Ssh3TrustStrategy,
@@ -1941,6 +1943,37 @@ mod tests {
             cli.option
                 .iter()
                 .any(|value| value == "ServerAliveInterval=30")
+        );
+
+        // The agent key of the Go plugin, the keylog file and the OIDC
+        // config file ride the same rewrite; the agent key needs the user.
+        let cli = Cli::try_parse_from(go_style_flags(
+            [
+                "ssh3",
+                "-pubkey-for-agent",
+                "/tmp/id_ed25519.pub",
+                "-keylog",
+                "/tmp/keys.log",
+                "-oidc-config",
+                "/tmp/oidc.json",
+                "--user",
+                "alice",
+                "https://localhost:4433/ssh3-term",
+            ]
+            .map(String::from),
+        ))
+        .unwrap();
+        assert_eq!(
+            cli.agent_key.as_deref(),
+            Some(std::path::Path::new("/tmp/id_ed25519.pub"))
+        );
+        assert_eq!(
+            cli.keylog.as_deref(),
+            Some(std::path::Path::new("/tmp/keys.log"))
+        );
+        assert_eq!(
+            cli.oidc_config.as_deref(),
+            Some(std::path::Path::new("/tmp/oidc.json"))
         );
     }
 
@@ -2660,6 +2693,151 @@ mod tests {
         assert_eq!(fields[2], "ssh3-rust");
         assert!(fields[3].starts_with("0."));
         assert_eq!(fields[4], "experimental_spec_version=alpha-00");
+    }
+
+    /// The path of the golden usage snapshot of this platform: the unix
+    /// build carries the control master flags, so every platform pins its
+    /// own file.
+    #[cfg(unix)]
+    fn usage_snapshot_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/usage_snapshot.txt")
+    }
+
+    #[cfg(not(unix))]
+    fn usage_snapshot_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/usage_snapshot.windows.txt")
+    }
+
+    /// The rendered usage is pinned by a checked-in golden file: a flag that
+    /// drifts from the key registry (docs/CLI_KEYS.md) or changes its help
+    /// breaks the test. Regenerate the snapshot deliberately with
+    /// `UPDATE_SNAPSHOT=1 cargo test -p ssh3-client`.
+    #[test]
+    fn the_help_output_matches_the_usage_snapshot() {
+        let rendered = Cli::command().render_help().to_string();
+        let snapshot = usage_snapshot_path();
+        if std::env::var("UPDATE_SNAPSHOT").as_deref() == Ok("1") {
+            std::fs::write(&snapshot, &rendered).unwrap();
+        }
+        let golden = std::fs::read_to_string(&snapshot).unwrap_or_else(|err| {
+            panic!(
+                "the usage snapshot {} is missing: {err} (regenerate with UPDATE_SNAPSHOT=1)",
+                snapshot.display()
+            )
+        });
+        assert_eq!(
+            rendered, golden,
+            "the rendered usage drifted from the golden file: regenerate with UPDATE_SNAPSHOT=1 only for a deliberate change of the flags"
+        );
+    }
+
+    /// Whether the parser accepts a flag token of the matrix: a
+    /// two-character token is a short flag, the rest is a long name — the
+    /// reference single-dash spelling (`-privkey`) rides the rewrite into
+    /// the double-dash name.
+    fn parser_accepts(
+        token: &str,
+        shorts: &std::collections::HashSet<char>,
+        longs: &std::collections::HashSet<&str>,
+    ) -> bool {
+        if token.len() == 2 {
+            let short = token.chars().nth(1).unwrap();
+            shorts.contains(&short)
+        } else {
+            let long = token.trim_start_matches('-');
+            longs.contains(long)
+        }
+    }
+
+    /// The dash-prefixed flag tokens of a matrix cell: the backticks and
+    /// the parenthesized platform notes ride out.
+    fn dash_tokens(cell: &str) -> Vec<&str> {
+        cell.split([' ', '/', '(', ')', ','])
+            .map(|token| token.trim_matches('`').trim())
+            .filter(|token| token.len() >= 2 && token.starts_with('-'))
+            .collect()
+    }
+
+    /// The cells of a data row of the markdown matrix: `None` for the
+    /// heading, the separator and the prose lines. The columns are the
+    /// short flag, the long name, the argument, the default, the Go cell,
+    /// the C cell, the Rust cell and the status.
+    fn matrix_cells(line: &str) -> Option<Vec<&str>> {
+        if !line.trim_start().starts_with('|') {
+            return None;
+        }
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        // The leading and the trailing cell of the row are empty.
+        if cells.len() < 10 {
+            return None;
+        }
+        Some(cells[1..9].to_vec())
+    }
+
+    /// The rows of the key registry (docs/CLI_KEYS.md) marked "all three"
+    /// name the flags this parser must accept: every short flag of the row
+    /// and every long name the Rust column claims is checked against the
+    /// clap definitions, so the matrix and the code cannot drift apart.
+    #[test]
+    fn the_cli_keys_matrix_rows_are_accepted_by_the_parser() {
+        let matrix_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/CLI_KEYS.md");
+        let matrix = std::fs::read_to_string(&matrix_path).unwrap_or_else(|err| {
+            panic!(
+                "the key registry {} is missing: {err}",
+                matrix_path.display()
+            )
+        });
+
+        let command = Cli::command();
+        let arguments: Vec<_> = command.get_arguments().collect();
+        let longs: std::collections::HashSet<&str> = arguments
+            .iter()
+            .flat_map(|argument| {
+                argument
+                    .get_long()
+                    .into_iter()
+                    .chain(argument.get_all_aliases().into_iter().flatten())
+            })
+            .collect();
+        let shorts: std::collections::HashSet<char> = arguments
+            .iter()
+            .filter_map(|argument| argument.get_short())
+            .collect();
+
+        for line in matrix.lines() {
+            let Some(cells) = matrix_cells(line) else {
+                continue;
+            };
+            let status = cells[7];
+            if !status.starts_with("all three") {
+                continue;
+            }
+            let rust_column = cells[6];
+            // The control master flags are unix-only arguments: a build of
+            // another platform carries nothing the row describes.
+            if rust_column.contains("unix") && !cfg!(unix) {
+                continue;
+            }
+            for token in dash_tokens(cells[0]) {
+                assert!(
+                    parser_accepts(token, &shorts, &longs),
+                    "the matrix row {status:?} claims {token:?} for every implementation, the parser does not accept it: {line:?}"
+                );
+            }
+            // A Rust column that rides a dash ("-" or "- (see `-L`)") claims
+            // no long name; the long column then only describes the
+            // references.
+            if rust_column.trim_start().starts_with('-') {
+                continue;
+            }
+            for token in dash_tokens(cells[1]) {
+                assert!(
+                    parser_accepts(token, &shorts, &longs),
+                    "the matrix row {status:?} claims {token:?} for the Rust client, the parser does not accept it: {line:?}"
+                );
+            }
+        }
     }
 }
 

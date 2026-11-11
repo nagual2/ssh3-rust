@@ -1,0 +1,113 @@
+Connects to an SSH3 server over QUIC/HTTP3. If COMMAND is omitted, requests a shell.
+
+Usage: ssh3 [OPTIONS] [URL] [COMMAND]...
+
+Arguments:
+  [URL]         The URL of the server, or the first operand of a transfer
+  [COMMAND]...  
+
+Options:
+      --server-name <NAME>
+          
+      --user <NAME>
+          
+  -i, --identity <PATH>
+          [alias: --privkey]
+      --agent
+          
+      --agent-key <PATH>
+          [alias: --pubkey-for-agent]
+      --agent-socket <PATH>
+          
+  -A, --forward-agent
+          
+      --password <PASS>
+          Password for basic authentication. Prefer --password-file to avoid exposing secrets in argv.
+      --password-file <PATH>
+          Read the basic-auth password from a file.
+      --bearer-token <TOKEN>
+          Bearer token to send in Authorization. Prefer --bearer-token-file to avoid exposing secrets in argv.
+      --bearer-token-file <PATH>
+          Read the bearer token from a file.
+      --use-oidc <ISSUER>
+          [alias: --oidc-issuer]
+      --oidc-client-id <ID>
+          
+      --oidc-client-secret <SECRET>
+          OIDC client secret. Prefer --oidc-client-secret-file to avoid exposing secrets in argv.
+      --oidc-client-secret-file <PATH>
+          Read the OIDC client secret from a file.
+      --no-pkce
+          
+      --oidc-config <PATH>
+          OpenID Connect json config file containing the client_id and the client_secret fields needed by the OIDC flow (the reference file name: ~/.ssh3/oidc_config.json)
+  -4, --ipv4-only
+          Use IPv4 addresses only (ssh2 -4)
+  -6, --ipv6-only
+          Use IPv6 addresses only (ssh2 -6)
+      --keylog <PATH>
+          Write the QUIC TLS secrets in the NSS keylog format into the given file: only for debugging with a packet analyzer
+      --ca-cert <PATH>
+          
+      --insecure
+          
+      --transfer
+          Move files between the local machine and the server over SFTP
+  -r, --recursive
+          Transfer the directories recursively (transfer mode)
+      --continue
+          Resume an interrupted transfer instead of overwriting it (transfer mode)
+      --checksum
+          Verify the transfer with a SHA-256 re-read of the remote file (transfer mode)
+  -p, --port <PORT>
+          The port of the server (transfer mode)
+  -U, --url-path <PATH>
+          The URL path of the server (transfer mode)
+  -t
+          Force the allocation of a pseudo-terminal
+  -T
+          Never allocate a pseudo-terminal
+  -o <KEY=VALUE>
+          Set an option: RequestTTY=auto|yes|no|force, Term=<type>, EscapeChar=<char>, StrictHostKeyChecking=ask|yes|accept-new|no, LocalForward=<spec>, RemoteForward=<spec>, DynamicForward=<spec>, ProxyJump=<chain>, ServerAliveInterval=<seconds>
+  -N
+          Do not execute a remote command or session; hold the connection open for the forwards
+  -M
+          Run as the control master: share one authenticated connection across the invocations through the control socket (-M)
+  -S <PATH>
+          The control master unix socket path (-S)
+  -O <OP>
+          Run one control operation against the master (-O): check, stop or exit. check prints the status line on the standard output
+      --control-master <VALUE>
+          The control master policy: no, yes or auto (-control-master)
+      --control-path <PATH>
+          The control master unix socket path (-control-path)
+      --control-persist <VALUE>
+          How long an idle master persists: no, yes or a number of seconds (-control-persist)
+  -J, --jump <DESTINATION>
+          Connect through the jump hosts of the chain, every destination in the `[user@]host[:port]` form separated by commas (-J). Each hop must run an SSH3 server. The `--proxy-jump` spelling is the deprecated alias the Go implementation writes [alias: --proxy-jump]
+  -q, --quiet
+          Quiet mode: suppress the diagnostic messages, the errors stay (ssh2 -q)
+  -v, --verbose
+          Verbose mode: add the details of the connection to the diagnostics (ssh2 -v)
+  -V, --version
+          Print the version string of the client and exit
+      --strict-host-key-checking <VALUE>
+          The policy of the known_hosts check: ask, yes, accept-new or no
+      --known-hosts <PATH>
+          The known_hosts file that pins the certificates of the servers
+  -F, --ssh-config <PATH>
+          The ssh_config file of the user
+  -L <SPEC>
+          Forward a local port to the remote host: [bind_address:]port:host:hostport
+  -R <SPEC>
+          Ask the server to bind a port and forward it to a local target: [bind_address:]bind_port[/udp]:target_host:target_port
+  -D <SPEC>
+          Forward a local SOCKS5 proxy to the remote host: [bind_address:]port
+      --handshake-idle-timeout <DURATION>
+          The timeout of the QUIC handshake
+      --max-idle-timeout <DURATION>
+          The timeout of an idle QUIC connection
+  -s, --subsystem <NAME>
+          The subsystem to request on the session channel instead of a shell. `sftp` launches the built-in interactive SFTP client; any other name is forwarded to the server as-is
+  -h, --help
+          Print help (see more with '--help')
