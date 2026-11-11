@@ -187,6 +187,11 @@ Go-Implementierung aus:
 SSH 3.0 ssh3-rust 0.1.0 experimental_spec_version=alpha-00
 ```
 
+Der Schalter `-s`/`--subsystem` fordert ein benanntes Subsystem auf dem
+Session-Kanal statt einer Shell an. `ssh3 -s sftp` startet den interaktiven
+SFTP-Client (das OpenSSH-artige `sftp`-Subsystem); ein anderer Name wird
+wie angegeben an den Server weitergereicht.
+
 ### Port-Weiterleitung
 
 Der Client leitet Ports in den drei Richtungen des ssh(1)-Kanons weiter:

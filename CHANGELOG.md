@@ -20,6 +20,13 @@
 
 ## [Unreleased] / Не выпущено / Nicht veröffentlicht
 
+### Added / Добавлено / Hinzugefügt
+
+| English | Русский | Deutsch |
+|---------|---------|---------|
+| **The `-s`/`--subsystem` flag and the built-in interactive SFTP client** — `ssh3 -s sftp` opens the streaming interactive SFTP client (an OpenSSH-style command set over the `sftp` subsystem of the server); any other name rides the session channel as a subsystem request. The flag refuses a remote command, `--transfer` and `-M` (the control master relays shell and command sessions only). | **Флаг `-s`/`--subsystem` и встроенный интерактивный SFTP-клиент** — `ssh3 -s sftp` открывает стриминговый интерактивный SFTP-клиент (набор команд в духе OpenSSH поверх подсистемы `sftp` сервера); любое другое имя едет в сессионный канал как запрос подсистемы. Флаг отказывает команду, `--transfer` и `-M` (контроль-мастер релеит только shell и командные сессии). | **Das Flag `-s`/`--subsystem` und der eingebaute interaktive SFTP-Client** — `ssh3 -s sftp` öffnet den Streaming-SFTP-Client (ein OpenSSH-artiger Befehlssatz über die `sftp`-Subsystem des Servers); jeder andere Name fährt als Subsystem-Anfrage über den Sitzungskanal. Das Flag lehnt einen Remote-Befehl, `--transfer` und `-M` ab (der Control-Master leitet nur Shell- und Befehlssitzungen). |
+| **The flag spellings of the references** — `--continue` gained the `resume` alias, `--use-oidc` the `oidc-issuer` visible alias (the C spelling). | **Написания флагов эталонов** — `--continue` получил алиас `resume`, `--use-oidc` — видимый алиас `oidc-issuer` (написание C). | **Die Flag-Schreibweisen der Referenzen** — `--continue` erhielt den Alias `resume`, `--use-oidc` den sichtbaren Alias `oidc-issuer` (die C-Schreibweise). |
+
 ### Fixed / Исправлено / Behoben
 
 | English | Русский | Deutsch |

@@ -117,7 +117,12 @@ struct Cli {
     )]
     bearer_token_file: Option<PathBuf>,
 
-    #[arg(long = "use-oidc", value_name = "ISSUER", requires = "oidc_client_id")]
+    #[arg(
+        long = "use-oidc",
+        visible_alias = "oidc-issuer",
+        value_name = "ISSUER",
+        requires = "oidc_client_id"
+    )]
     oidc_issuer_url: Option<String>,
 
     #[arg(long, value_name = "ID", requires = "oidc_issuer_url")]
@@ -208,7 +213,7 @@ struct Cli {
     /// The destination is compared with the source by size and modification
     /// time; a file whose size matches but whose modification time does not
     /// is transferred again.
-    #[arg(long = "continue")]
+    #[arg(long = "continue", alias = "resume")]
     resume: bool,
 
     /// Verify the transfer with a SHA-256 re-read of the remote file (transfer
@@ -360,6 +365,12 @@ struct Cli {
     /// The timeout of an idle QUIC connection.
     #[arg(long, value_name = "DURATION")]
     max_idle_timeout: Option<String>,
+
+    /// The subsystem to request on the session channel instead of a shell.
+    /// `sftp` launches the built-in interactive SFTP client; any other
+    /// name is forwarded to the server as-is.
+    #[arg(short = 's', long = "subsystem", value_name = "NAME")]
+    subsystem: Option<String>,
 
     #[arg(value_name = "COMMAND", trailing_var_arg = true, num_args = 0..)]
     command: Vec<String>,
@@ -839,11 +850,31 @@ fn build_config(cli: Cli) -> Result<ClientPlan, clap::Error> {
         .and_then(|authority| authority.as_str().split_once('@'))
         .map(|(user, _)| user.to_string());
     let user = cli.user.clone().or(url_user);
+    let subsystem = cli.subsystem.clone();
+    if subsystem.is_some() {
+        if !command.is_empty() {
+            return Err(cli_error(
+                ErrorKind::ArgumentConflict,
+                "-s cannot be combined with a remote command",
+            ));
+        }
+        // The subsystem requests do not ride the control master: it
+        // relays shell and command sessions only.
+        #[cfg(unix)]
+        if cli.master_mode {
+            return Err(cli_error(
+                ErrorKind::ArgumentConflict,
+                "-s cannot be combined with -M",
+            ));
+        }
+    }
     let (config, control) = build_connection_config(cli, url, user)?;
-    let request = if command.is_empty() {
-        Ssh3SessionRequest::Shell
-    } else {
-        Ssh3SessionRequest::Exec(command.join(" "))
+    // The `sftp` name opens the built-in interactive client; the other
+    // names ride the session channel as the subsystem request.
+    let request = match subsystem.as_deref() {
+        Some(name) if name != "sftp" => Ssh3SessionRequest::Subsystem(name.to_string()),
+        _ if command.is_empty() => Ssh3SessionRequest::Shell,
+        _ => Ssh3SessionRequest::Exec(command.join(" ")),
     };
     Ok(ClientPlan {
         config,
@@ -864,6 +895,12 @@ fn build_transfer_config(cli: Cli) -> Result<ClientPlan, clap::Error> {
         return Err(cli_error(
             ErrorKind::ArgumentConflict,
             "-N cannot be combined with --transfer",
+        ));
+    }
+    if cli.subsystem.is_some() {
+        return Err(cli_error(
+            ErrorKind::ArgumentConflict,
+            "-s cannot be combined with --transfer",
         ));
     }
     let first = cli.url.clone().ok_or_else(|| {
@@ -1609,6 +1646,9 @@ async fn run_slave(plan: &ClientPlan) -> ExitCode {
     let (command, wants_pty) = match &plan.request {
         Ssh3SessionRequest::Shell => (Vec::new(), true),
         Ssh3SessionRequest::Exec(command) => (vec![command.clone()], false),
+        // the subsystem requests do not ride the control master; the arm
+        // exists for the exhaustiveness of the match
+        Ssh3SessionRequest::Subsystem(_) => (Vec::new(), false),
     };
     // A pty session drives the local console: the raw mode of the slave
     // matches the direct session, and the console events (a resize, the
@@ -1817,6 +1857,20 @@ async fn main() -> ExitCode {
         };
     }
 
+    // The `sftp` subsystem opens the built-in interactive client; the
+    // other subsystem names ride the session channel stdio bridge.
+    if let Ssh3SessionRequest::Subsystem(name) = &plan.request {
+        if name == "sftp" {
+            return match ssh3_client::run_interactive_sftp(&plan.config).await {
+                Ok(code) => ExitCode::from(code as u8),
+                Err(err) => {
+                    crate::diag_error!("ssh3: {err}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    }
+
     match run_session_stdio(&plan.config, plan.request).await {
         Ok(status) => ExitCode::from(status as u8),
         Err(Ssh3ClientError::ExitSignal(signal)) => {
@@ -1834,11 +1888,11 @@ async fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, build_config, go_style_flags};
+    use super::{Cli, build_config, build_transfer_config, go_style_flags};
     use clap::{Parser, error::ErrorKind};
     use ssh3_client::{
         SSH3_CLIENT_VERSION_STRING, Ssh3ForwardProtocol, Ssh3PtyPolicy, Ssh3ReverseForwardProtocol,
-        Ssh3StrictHostKeyChecking, Ssh3TrustStrategy,
+        Ssh3SessionRequest, Ssh3StrictHostKeyChecking, Ssh3TrustStrategy,
     };
     use std::time::Duration;
 
@@ -2364,6 +2418,40 @@ mod tests {
             Cli::try_parse_from(["ssh3", "-N", "ls", "https://localhost:4433/ssh3-term"]).unwrap();
         let err = build_config(err).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn the_subsystem_flag_refuses_a_remote_command() {
+        let cli = Cli::try_parse_from(["ssh3", "-s", "webserver", "host", "cmd"]).unwrap();
+        let err = build_config(cli).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn the_subsystem_flag_refuses_the_transfer_mode() {
+        let cli = Cli::try_parse_from([
+            "ssh3",
+            "--transfer",
+            "-s",
+            "sftp",
+            "host:/tmp/remote-file",
+            "/tmp/local-file",
+        ])
+        .unwrap();
+        let err = build_transfer_config(cli).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn the_subsystem_name_rides_the_session_request() {
+        let cli =
+            Cli::try_parse_from(["ssh3", "-s", "netconf", "https://localhost:4433/ssh3-term"])
+                .unwrap();
+        let plan = build_config(cli).unwrap();
+        assert_eq!(
+            plan.request,
+            Ssh3SessionRequest::Subsystem("netconf".to_string())
+        );
     }
 
     #[test]

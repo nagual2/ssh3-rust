@@ -188,6 +188,11 @@ Go implementation:
 SSH 3.0 ssh3-rust 0.1.0 experimental_spec_version=alpha-00
 ```
 
+The `-s`/`--subsystem` flag requests a named subsystem on the session
+channel instead of a shell. `ssh3 -s sftp` starts the interactive SFTP
+client (the OpenSSH-style `sftp` subsystem); a name other than `sftp` is
+forwarded to the server as-is for other supported subsystems.
+
 ### Port forwarding
 
 The client forwards ports in the three directions of the ssh(1) canon:

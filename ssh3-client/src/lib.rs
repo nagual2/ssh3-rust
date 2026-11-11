@@ -31,7 +31,7 @@ use ssh3_h3::{
 use ssh3_proto::{
     SSH_EXTENDED_DATA_NONE, SSH_EXTENDED_DATA_STDERR, Ssh3ChannelRequest,
     Ssh3ChannelRequestMessage, Ssh3ExecRequest, Ssh3ExitSignalRequest, Ssh3Message, Ssh3PtyRequest,
-    Ssh3SignalRequest, Ssh3WindowChangeRequest,
+    Ssh3SignalRequest, Ssh3SubsystemRequest, Ssh3WindowChangeRequest,
 };
 use ssh3_quinn::{
     Ssh3AcceptChannelError, Ssh3ConfigError as QuinnConfigError, Ssh3IncomingChannelRouter,
@@ -61,6 +61,7 @@ pub mod log;
 mod proxy_jump;
 mod reverse;
 mod sftp_stream;
+mod interactive_sftp;
 mod ssh_config;
 pub mod sshfp;
 mod stdin;
@@ -77,6 +78,7 @@ use console::{
     spawn_signal_forwarders, suspend_local_process,
 };
 pub use stdin::{StdinStream, stream as stdin_stream};
+pub use interactive_sftp::run as run_interactive_sftp;
 // The console events of a control-master slave relay to the master; the
 // control module (and with it the whole relay) is unix only.
 #[cfg(unix)]
@@ -309,10 +311,13 @@ impl Ssh3PtyPolicy {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ssh3SessionRequest {
     Shell,
     Exec(String),
+    /// The named subsystem of the session channel: `sftp` opens the
+    /// built-in interactive client, the other names ride the stdio bridge.
+    Subsystem(String),
 }
 
 #[derive(Default)]
@@ -881,6 +886,12 @@ pub(crate) async fn send_initial_session_requests(
             want_reply: true,
             request: Ssh3ChannelRequest::Exec(Ssh3ExecRequest {
                 command: command.as_bytes().to_vec(),
+            }),
+        },
+        Ssh3SessionRequest::Subsystem(name) => Ssh3ChannelRequestMessage {
+            want_reply: true,
+            request: Ssh3ChannelRequest::Subsystem(Ssh3SubsystemRequest {
+                subsystem_name: name.as_bytes().to_vec(),
             }),
         },
     };
