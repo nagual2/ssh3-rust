@@ -920,23 +920,15 @@ async fn send_pty_request(channel: &Ssh3Channel, pty: &PtySpec) -> Result<(), Ss
 
 /// Forwards the SSH agent of the client to the server.
 ///
-/// The agent socket is a unix domain socket: the Windows client has no
-/// agent to forward, so the request is refused with a clear error instead
-/// of a session that cannot work.
+/// The request only tells the server that the session carries agent
+/// connections: the agent is dialed per connection, so a missing local
+/// agent is reported per connection and not here.
 async fn send_forward_agent_request(channel: &Ssh3Channel) -> Result<(), Ssh3ClientError> {
-    #[cfg(unix)]
-    {
-        channel
-            .write_data(b"forward-agent", SSH_EXTENDED_DATA_NONE)
-            .await
-            .map(|_| ())
-            .map_err(Ssh3ClientError::from)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = channel;
-        Err(Ssh3ClientError::AgentUnavailable)
-    }
+    channel
+        .write_data(b"forward-agent", SSH_EXTENDED_DATA_NONE)
+        .await
+        .map(|_| ())
+        .map_err(Ssh3ClientError::from)
 }
 
 pub(crate) async fn send_window_change_request(
@@ -1006,12 +998,15 @@ fn build_session_runtime(
 
     if config.forward_agent {
         // The agent connections are served by the dispatcher of the
-        // server-initiated channels; the socket is resolved here so that a
-        // missing agent is reported before the session starts.
-        #[cfg(unix)]
+        // server-initiated channels; the endpoint is resolved here so that
+        // a missing agent configuration is reported before the session
+        // starts. The default pipe of Windows always resolves: a missing
+        // agent there is only reported when the server opens an agent
+        // connection.
+        #[cfg(any(unix, windows))]
         let _ = resolve_agent_socket_path(config)?;
 
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         return Err(Ssh3ClientError::AgentUnavailable);
     }
 
@@ -4142,35 +4137,38 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SSH_AGENT_FAILURE: u8 = 5;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SSH_AGENT_RSA_SHA2_256: u32 = 2;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     struct MockAgent {
+        /// The tempdir of the unix socket, dropped with the agent.
+        #[cfg(unix)]
         _tempdir: TempDir,
+        /// The unix socket path or the Windows pipe name of the agent.
         socket_path: PathBuf,
         sign_flags: Arc<Mutex<Vec<u32>>>,
         task: Option<tokio::task::JoinHandle<()>>,
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl MockAgent {
         fn sign_flags(&self) -> Vec<u32> {
             self.sign_flags.lock().unwrap().clone()
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl Drop for MockAgent {
         fn drop(&mut self) {
             if let Some(task) = self.task.take() {
@@ -4242,8 +4240,93 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    async fn read_agent_message(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
+    /// Spawns a mock agent that listens on a unique named pipe of the
+    /// process: the pipe server keeps a fresh listening instance ready, the
+    /// way the OpenSSH agent service does.
+    #[cfg(windows)]
+    async fn spawn_mock_agent(private_key: ssh_key::PrivateKey) -> MockAgent {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        static PIPE_COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let pipe_name = format!(
+            r"\\.\pipe\ssh3-rust-mock-agent-{}-{}",
+            std::process::id(),
+            PIPE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        // The first instance listens before the accept loop is polled: a
+        // client that connects immediately is still served.
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .unwrap();
+        let private_key = Arc::new(private_key);
+        let sign_flags = Arc::new(Mutex::new(Vec::new()));
+        let sign_flags_task = sign_flags.clone();
+        let pipe_name_task = pipe_name.clone();
+
+        let task = tokio::spawn(async move {
+            loop {
+                server.connect().await.unwrap();
+                let connected = server;
+                server = ServerOptions::new().create(&pipe_name_task).unwrap();
+                let private_key = private_key.clone();
+                let sign_flags = sign_flags_task.clone();
+
+                tokio::spawn(async move {
+                    let mut stream = connected;
+                    loop {
+                        let request = match read_agent_message(&mut stream).await {
+                            Ok(Some(request)) => request,
+                            Ok(None) => break,
+                            Err(err)
+                                if matches!(
+                                    err.kind(),
+                                    io::ErrorKind::BrokenPipe
+                                        | io::ErrorKind::ConnectionAborted
+                                        | io::ErrorKind::ConnectionReset
+                                        | io::ErrorKind::UnexpectedEof
+                                ) =>
+                            {
+                                break;
+                            }
+                            Err(err) => panic!("mock agent read failed: {err}"),
+                        };
+                        let response =
+                            handle_agent_request(&private_key, &sign_flags, request.as_slice())
+                                .unwrap();
+                        if let Err(err) =
+                            write_agent_message(&mut stream, response.as_slice()).await
+                        {
+                            if matches!(
+                                err.kind(),
+                                io::ErrorKind::BrokenPipe
+                                    | io::ErrorKind::ConnectionAborted
+                                    | io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::UnexpectedEof
+                            ) {
+                                break;
+                            }
+                            panic!("mock agent write failed: {err}");
+                        }
+                    }
+                });
+            }
+        });
+
+        MockAgent {
+            socket_path: PathBuf::from(pipe_name),
+            sign_flags,
+            task: Some(task),
+        }
+    }
+
+    /// Reads one length-prefixed message of the agent protocol: `None` at
+    /// the end of the stream.
+    #[cfg(any(unix, windows))]
+    async fn read_agent_message<S: tokio::io::AsyncRead + Unpin>(
+        stream: &mut S,
+    ) -> io::Result<Option<Vec<u8>>> {
         let mut len = [0u8; 4];
         match stream.read_exact(&mut len).await {
             Ok(_) => {}
@@ -4256,8 +4339,11 @@ mod tests {
         Ok(Some(payload))
     }
 
-    #[cfg(unix)]
-    async fn write_agent_message(stream: &mut UnixStream, payload: &[u8]) -> io::Result<()> {
+    #[cfg(any(unix, windows))]
+    async fn write_agent_message<S: tokio::io::AsyncWrite + Unpin>(
+        stream: &mut S,
+        payload: &[u8],
+    ) -> io::Result<()> {
         let len = u32::try_from(payload.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -4268,7 +4354,7 @@ mod tests {
         stream.write_all(payload).await
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn handle_agent_request(
         private_key: &ssh_key::PrivateKey,
         sign_flags: &Arc<Mutex<Vec<u32>>>,
@@ -4325,7 +4411,7 @@ mod tests {
         Ok(message)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn mock_agent_signature(
         private_key: &ssh_key::PrivateKey,
         signing_input: &[u8],
@@ -4372,7 +4458,7 @@ mod tests {
         Vec::<u8>::try_from(signature).map_err(mock_agent_ssh_key_error)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn take_agent_byte(cursor: &mut &[u8]) -> io::Result<u8> {
         let Some((&byte, rest)) = cursor.split_first() else {
             return Err(io::Error::new(
@@ -4384,7 +4470,7 @@ mod tests {
         Ok(byte)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn take_agent_u32(cursor: &mut &[u8]) -> io::Result<u32> {
         if cursor.len() < 4 {
             return Err(io::Error::new(
@@ -4397,7 +4483,7 @@ mod tests {
         Ok(u32::from_be_bytes(prefix.try_into().unwrap()))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn take_agent_string(cursor: &mut &[u8]) -> io::Result<Vec<u8>> {
         let len = take_agent_u32(cursor)? as usize;
         if cursor.len() < len {
@@ -4411,18 +4497,18 @@ mod tests {
         Ok(value.to_vec())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn append_agent_string(buf: &mut Vec<u8>, bytes: &[u8]) {
         buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
         buf.extend_from_slice(bytes);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn mock_agent_ssh_key_error(err: ssh_key::Error) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, err)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn mock_agent_rsa_private_key(keypair: &RsaKeypair) -> io::Result<JwtRsaPrivateKey> {
         let private_key = JwtRsaPrivateKey::from_components(
             mock_agent_rsa_biguint(keypair.public.n.as_positive_bytes())?,
@@ -4440,7 +4526,7 @@ mod tests {
         Ok(private_key)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn mock_agent_rsa_biguint(bytes: Option<&[u8]>) -> io::Result<RsaBigUint> {
         let bytes = bytes.ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "invalid RSA key component")
@@ -7330,6 +7416,36 @@ mod tests {
             stdout.contains("SSH3_AGENT_PROBE_OK 1 ssh-ed25519"),
             "{stdout}"
         );
+        assert_eq!(agent.sign_flags(), vec![0]);
+    }
+
+    /// Signs a bearer token with an agent that listens on the Windows named
+    /// pipe transport: the whole dialog of the agent protocol rides a
+    /// `\\.\pipe\` client opened like the dial of the Go reference.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_agent_bearer_token_signs_with_a_mock_pipe_agent() {
+        let agent = spawn_mock_agent(auth_private_key(AuthKeyAlgorithm::Ed25519)).await;
+        let mut config = Ssh3ClientConfig::new("https://localhost/ssh3-term".parse().unwrap());
+        config.agent = Some(super::Ssh3AgentSelection::First);
+        config.agent_socket = Some(agent.socket_path.clone());
+        let username = "pipe-agent-user".to_string();
+
+        // The production call runs the blocking agent protocol in the
+        // blocking pool: the scenario mirrors it.
+        let token = tokio::task::spawn_blocking(move || {
+            super::build_agent_bearer_token(
+                &config,
+                &super::Ssh3AgentSelection::First,
+                &username,
+                &[7u8; 32],
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert!(!token.is_empty());
         assert_eq!(agent.sign_flags(), vec![0]);
     }
 

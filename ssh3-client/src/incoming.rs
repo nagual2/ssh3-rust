@@ -43,7 +43,7 @@ pub(crate) struct IncomingChannels {
     /// Only the targets of these forwards may be bridged: a peer that asks
     /// for another endpoint is refused.
     reverse_forwards: Arc<RwLock<Vec<Ssh3ResolvedReverseForward>>>,
-    /// The socket of the SSH agent, when the agent forwarding is on.
+    /// The socket or pipe of the SSH agent, when the agent forwarding is on.
     agent_socket: Option<PathBuf>,
     /// The number of forwarded channels that are bridged at the same time.
     open_forwarded_channels: Arc<AtomicUsize>,
@@ -178,7 +178,7 @@ impl IncomingChannels {
             return;
         };
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         tokio::spawn(async move {
             if let Err(err) = forward_agent_channel(channel, &agent_socket).await
                 && !crate::is_benign_client_error(&err)
@@ -186,12 +186,13 @@ impl IncomingChannels {
                 eprintln!("ssh3 agent forwarding error: {err}");
             }
         });
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
-            // The local SSH agent is a Unix socket, so there is nothing to
-            // forward a connection to on the other platforms.
+            // The local SSH agent has no transport on the other platforms.
             let _ = agent_socket;
-            eprintln!("ssh3 rejecting an agent connection: the agent forwarding is unix-only");
+            eprintln!(
+                "ssh3 rejecting an agent connection: the agent forwarding is unsupported here"
+            );
             let _ = channel.close().await;
         }
     }
@@ -240,17 +241,19 @@ impl Drop for ForwardedChannelGuard {
 }
 
 /// Forwards an agent connection to the local SSH agent.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) async fn forward_agent_channel(
     channel: Arc<Ssh3Channel>,
     agent_socket: &std::path::Path,
 ) -> Result<(), crate::Ssh3ClientError> {
     use ssh3_proto::{SSH_EXTENDED_DATA_NONE, Ssh3Message};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixStream;
 
-    let stream = UnixStream::connect(agent_socket).await?;
-    let (mut reader, mut writer) = stream.into_split();
+    #[cfg(unix)]
+    let stream = tokio::net::UnixStream::connect(agent_socket).await?;
+    #[cfg(windows)]
+    let stream = connect_agent_pipe(agent_socket).await?;
+    let (mut reader, mut writer) = tokio::io::split(stream);
 
     let mut to_agent = tokio::spawn({
         let channel = channel.clone();
@@ -301,6 +304,38 @@ pub(crate) async fn forward_agent_channel(
             to_agent.abort();
             let _ = channel.close().await;
             result.map_err(|err| crate::Ssh3ClientError::Io(std::io::Error::other(err.to_string())))?
+        }
+    }
+}
+
+/// Connects a client of the local Windows agent pipe.
+///
+/// A busy pipe waits for a free instance the way the dial of the Go
+/// reference does: a retry every 10 ms within a 2 s deadline.
+#[cfg(windows)]
+async fn connect_agent_pipe(
+    pipe_path: &std::path::Path,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, crate::Ssh3ClientError> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    let pipe_name = pipe_path.to_str().ok_or_else(|| {
+        crate::Ssh3ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the SSH agent pipe name is not valid Unicode",
+        ))
+    })?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match ClientOptions::new().open(pipe_name) {
+            Ok(client) => return Ok(client),
+            Err(err)
+                if err.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32)
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(err) => return Err(err.into()),
         }
     }
 }

@@ -2289,6 +2289,7 @@ dependencies = [
  "tokio",
  "url",
  "webpki-roots",
+ "windows-sys 0.61.2",
  "x509-parser",
 ]
 
