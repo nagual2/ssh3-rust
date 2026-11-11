@@ -6,7 +6,7 @@ use std::time::Duration;
 use clap::{Parser, ValueHint, error::ErrorKind};
 use ssh3_server::{
     ForwardPolicy, GatewayPortsPolicy, InternalSftpOptions, SftpJailMode, Ssh3ServerConfig,
-    parse_duration, run_internal_sftp_server, run_with_self_signed,
+    parse_duration, run_internal_sftp_server, run_with_self_signed, shutdown_drain_period,
 };
 
 /// The environment variables the server options can be set with.
@@ -28,6 +28,7 @@ const ENV_PASSWORD_LOCKOUT_ALIAS: &str = "SSH3_MAX_PASSWORD_FAILOUT_SECONDS";
 const ENV_ENABLE_PASSWORD_LOGIN: &str = "SSH3_ENABLE_PASSWORD_LOGIN";
 const ENV_SFTP_JAIL: &str = "SSH3_SFTP_JAIL";
 const ENV_MAX_SFTP_SESSIONS: &str = "SSH3_MAX_SFTP_SESSIONS_PER_USER";
+const ENV_SHUTDOWN_DRAIN: &str = "SSH3_SHUTDOWN_DRAIN";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -438,6 +439,12 @@ fn build_config(cli: Cli) -> Result<Ssh3ServerConfig, clap::Error> {
     {
         config.max_sftp_sessions_per_user = max;
     }
+
+    // the drain window of the graceful shutdown: a plain number of seconds,
+    // parsed like the Go reference parses it (there is no command-line flag
+    // for it, like there is none in the Go implementation)
+    config.shutdown_drain =
+        shutdown_drain_period(std::env::var(ENV_SHUTDOWN_DRAIN).ok().as_deref());
 
     Ok(config)
 }

@@ -42,8 +42,11 @@ use tokio::time::{sleep, timeout};
 
 use crate::config::{Ssh3ServerConfig, current_username, parse_duration};
 use crate::forwarding::ForwardPolicy;
-use crate::runtime::{serve_connection, serve_endpoint};
+use crate::runtime::{serve_connection, serve_endpoint, serve_endpoint_until_shutdown};
 use crate::session::{effective_shell, lookup_session_user};
+use crate::shutdown::{
+    SHUTDOWN_ERROR_CODE, SHUTDOWN_REASON, ShutdownSignal, shutdown_drain_period,
+};
 
 pub(crate) struct TestHarness {
     pub(crate) client_endpoint: quinn::Endpoint,
@@ -1656,4 +1659,201 @@ async fn the_forwarded_agent_socket_outlives_the_session_channel() {
         !std::path::Path::new(&socket_path).exists(),
         "the agent socket {socket_path} outlived the conversation"
     );
+}
+
+/// A server that a shutdown signal drives, with a client conversation on it.
+///
+/// The graceful-shutdown tests build it to trigger the signal and watch what
+/// happens to the conversations: the drain never waits for a real `kill` of a
+/// server process, the signal is triggered in place.
+struct ShutdownFixture {
+    server_addr: SocketAddr,
+    /// The client configuration a second client needs to talk to the server.
+    second_client_config: quinn::ClientConfig,
+    client_endpoint: quinn::Endpoint,
+    client_connection: quinn::Connection,
+    conversation: Arc<Ssh3Conversation>,
+    _control_stream: Ssh3ClientControlStream,
+    _send_request: Ssh3SendRequest,
+    driver_task: tokio::task::JoinHandle<()>,
+    server_task: tokio::task::JoinHandle<Result<(), crate::error::Ssh3ServerError>>,
+    shutdown: ShutdownSignal,
+}
+
+async fn setup_shutdown_fixture(shutdown_drain: Duration) -> ShutdownFixture {
+    let shutdown = ShutdownSignal::new();
+    let config = Ssh3ServerConfig {
+        shutdown_drain,
+        ..Default::default()
+    };
+    let (server_tls, server_certificate) =
+        self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+    let server_endpoint = quinn::Endpoint::server(
+        server_tls,
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+    )
+    .unwrap();
+    let server_addr = server_endpoint.local_addr().unwrap();
+    let server_task = tokio::spawn(serve_endpoint_until_shutdown(
+        server_endpoint,
+        config,
+        shutdown.clone(),
+    ));
+
+    let mut client_endpoint =
+        quinn::Endpoint::client(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+    client_endpoint.set_default_client_config(
+        client_config_for_certificate(server_certificate.clone()).unwrap(),
+    );
+    let client_connection = timeout(
+        Duration::from_secs(5),
+        client_endpoint.connect(server_addr, "localhost").unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let (mut driver, mut send_request) = new_client(client_connection.clone()).await.unwrap();
+    let driver_task = tokio::spawn(async move {
+        let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+    let request = build_connect_request(
+        "https://localhost/ssh3-term".parse().unwrap(),
+        SSH3_VERSION_STRING,
+    )
+    .unwrap();
+    let established = timeout(
+        Duration::from_secs(5),
+        establish_client_conversation(
+            &mut send_request,
+            client_connection.clone(),
+            request,
+            30_000,
+            10,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    ShutdownFixture {
+        server_addr,
+        second_client_config: client_config_for_certificate(server_certificate).unwrap(),
+        client_endpoint,
+        client_connection,
+        conversation: established.conversation,
+        _control_stream: established.control_stream,
+        _send_request: send_request,
+        driver_task,
+        server_task,
+        shutdown,
+    }
+}
+
+#[test]
+fn the_shutdown_drain_period_follows_the_go_reference() {
+    // an absent or empty variable silently keeps the 5s default
+    assert_eq!(shutdown_drain_period(None), Duration::from_secs(5));
+    assert_eq!(shutdown_drain_period(Some("")), Duration::from_secs(5));
+    // a plain number of seconds
+    assert_eq!(shutdown_drain_period(Some("0")), Duration::ZERO);
+    assert_eq!(shutdown_drain_period(Some("30")), Duration::from_secs(30));
+    // a negative or unparsable value falls back to the default
+    assert_eq!(shutdown_drain_period(Some("-1")), Duration::from_secs(5));
+    assert_eq!(shutdown_drain_period(Some("abc")), Duration::from_secs(5));
+    // the unit suffix and the padding that the strconv.Atoi of the Go
+    // reference rejects
+    assert_eq!(shutdown_drain_period(Some("5s")), Duration::from_secs(5));
+    assert_eq!(shutdown_drain_period(Some(" 5")), Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn a_shutdown_serves_the_running_conversations_and_refuses_the_new_ones() {
+    let fixture = setup_shutdown_fixture(Duration::from_secs(30)).await;
+
+    // the operator signals the shutdown: the conversation that is being
+    // served keeps running while the drain window lasts
+    fixture.shutdown.trigger();
+
+    // a client that arrives during the drain is refused instead of served
+    let mut second_endpoint =
+        quinn::Endpoint::client(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+    second_endpoint.set_default_client_config(fixture.second_client_config.clone());
+    let refused = timeout(
+        Duration::from_secs(5),
+        second_endpoint
+            .connect(fixture.server_addr, "localhost")
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        refused.is_err(),
+        "a connection that arrives during the drain must be refused"
+    );
+
+    // the running conversation survives the signal: a session opened after
+    // the shutdown still runs to completion
+    let channel = open_channel(
+        fixture.conversation.as_ref(),
+        &fixture.client_connection,
+        b"session".to_vec(),
+        1024,
+        10,
+    )
+    .await
+    .unwrap();
+    channel
+        .send_request(Ssh3ChannelRequestMessage {
+            want_reply: true,
+            request: Ssh3ChannelRequest::Exec(Ssh3ExecRequest {
+                command: b"printf 'still serving\\n'".to_vec(),
+            }),
+        })
+        .await
+        .unwrap();
+    let output = collect_session_output(channel).await;
+    assert_eq!(output.stdout, b"still serving\n".to_vec());
+    assert_eq!(output.exit_status, 0);
+
+    // the client goes away and the drain ends when the conversation ends:
+    // the server finishes long before the 30s window expires
+    fixture.client_connection.close(0u32.into(), b"done");
+    let _ = timeout(Duration::from_secs(5), fixture.driver_task)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), fixture.server_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    fixture.client_endpoint.wait_idle().await;
+}
+
+#[tokio::test]
+async fn the_shutdown_drain_deadline_closes_the_connections_still_served() {
+    // a conversation that keeps running: nothing ends it before the window
+    let fixture = setup_shutdown_fixture(Duration::from_millis(500)).await;
+
+    fixture.shutdown.trigger();
+
+    // the window expires with the conversation still served: the server
+    // closes it with the shutdown error of the Go reference
+    let closed = timeout(Duration::from_secs(5), fixture.client_connection.closed())
+        .await
+        .unwrap();
+    match closed {
+        quinn::ConnectionError::ApplicationClosed(closed) => {
+            assert_eq!(u64::from(closed.error_code), u64::from(SHUTDOWN_ERROR_CODE));
+            assert_eq!(closed.reason.as_ref(), SHUTDOWN_REASON);
+        }
+        closed => panic!(
+            "the drain deadline must close the connection with the shutdown error, got {closed:?}"
+        ),
+    }
+
+    timeout(Duration::from_secs(5), fixture.server_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }

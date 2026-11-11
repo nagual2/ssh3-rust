@@ -203,6 +203,13 @@ pub struct Ssh3ServerConfig {
     pub max_idle_timeout: Duration,
     /// How long the server waits for a connection to complete its handshake.
     pub handshake_idle_timeout: Duration,
+    /// How long the conversations being served may drain after a shutdown
+    /// signal, the `SSH3_SHUTDOWN_DRAIN` of the Go reference.
+    ///
+    /// On a shutdown the server stops accepting new connections and closes
+    /// the conversations it still serves when the window expires;
+    /// `Duration::ZERO` closes them immediately.
+    pub shutdown_drain: Duration,
     /// Maximum number of concurrent QUIC connections the server serves.
     ///
     /// An incoming connection over the cap is refused right after the QUIC
@@ -285,6 +292,7 @@ impl fmt::Debug for Ssh3ServerConfig {
             .field("password_lockout", &self.password_lockout)
             .field("max_idle_timeout", &self.max_idle_timeout)
             .field("handshake_idle_timeout", &self.handshake_idle_timeout)
+            .field("shutdown_drain", &self.shutdown_drain)
             .field("max_connections", &self.max_connections)
             .field(
                 "max_channels_per_conversation",
@@ -328,6 +336,7 @@ impl Default for Ssh3ServerConfig {
             password_lockout: DEFAULT_PASSWORD_LOCKOUT,
             max_idle_timeout: DEFAULT_MAX_IDLE_TIMEOUT,
             handshake_idle_timeout: DEFAULT_HANDSHAKE_IDLE_TIMEOUT,
+            shutdown_drain: DEFAULT_SHUTDOWN_DRAIN,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_channels_per_conversation: DEFAULT_MAX_CHANNELS_PER_CONVERSATION,
             max_incoming_streams: DEFAULT_MAX_INCOMING_STREAMS,
@@ -358,6 +367,10 @@ pub const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60)
 
 /// The default handshake timeout of a connection (the ssh2 `LoginGraceTime` scale).
 pub const DEFAULT_HANDSHAKE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The default drain window of a graceful shutdown: 5 seconds, the
+/// `SSH3_SHUTDOWN_DRAIN` default of the Go implementation.
+pub const DEFAULT_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 /// The default cap of concurrent connections: `0`, the unbounded Go default.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 0;

@@ -11,7 +11,8 @@ use ssh3_quinn::self_signed_server_config;
 
 use crate::config::{Ssh3ServerConfig, validate_server_config};
 use crate::error::Ssh3ServerError;
-use crate::runtime::serve_endpoint;
+use crate::runtime::serve_endpoint_until_shutdown;
+use crate::shutdown::{ShutdownSignal, shutdown_signal};
 
 /// Applies the configured QUIC transport limits to a server configuration.
 ///
@@ -47,15 +48,28 @@ pub fn apply_transport_limits(server_config: &mut ServerConfig, config: &Ssh3Ser
 ///
 /// A certificate is created for `config.cert_subject_alt_names`, the QUIC
 /// endpoint is bound to `config.bind_addr` and connections are accepted until
-/// the endpoint stops yielding incoming connections.
+/// the endpoint stops yielding incoming connections. On a shutdown signal
+/// (`SIGINT`/`SIGTERM` on Unix, Ctrl-C on Windows) the endpoint stops
+/// accepting new connections and the conversations being served drain up to
+/// the `shutdown_drain` window of the configuration before the call returns.
 ///
 /// Use [`serve_endpoint`](crate::serve_endpoint) instead when the caller
-/// provides its own certificate or key.
+/// provides its own certificate or key, and
+/// [`serve_endpoint_until_shutdown`](crate::serve_endpoint_until_shutdown)
+/// when the caller owns the shutdown signal as well.
 pub async fn run_with_self_signed(config: Ssh3ServerConfig) -> Result<(), Ssh3ServerError> {
     validate_server_config(&config)?;
     let (mut server_config, _certificate) =
         self_signed_server_config(config.cert_subject_alt_names.clone())?;
     apply_transport_limits(&mut server_config, &config);
     let endpoint = Endpoint::server(server_config, config.bind_addr)?;
-    serve_endpoint(endpoint, config).await
+    // the graceful shutdown of the Go reference: the operator's signal asks
+    // the runtime to stop accepting and to drain the conversations
+    let shutdown = ShutdownSignal::new();
+    let signal_task = shutdown.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        signal_task.trigger();
+    });
+    serve_endpoint_until_shutdown(endpoint, config, shutdown).await
 }

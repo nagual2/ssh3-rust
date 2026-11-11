@@ -3,9 +3,12 @@
 //! The runtime turns a QUIC connection into an SSH3 conversation: it accepts
 //! the HTTP/3 CONNECT request, authorizes it, and then dispatches every
 //! channel the client opens to the matching handler (session, TCP forwarding
-//! or UDP forwarding).
+//! or UDP forwarding). On a shutdown signal it stops accepting and drains the
+//! conversations it serves up to the drain window, the stage 3 of the Go
+//! reference; the signal request and its window live in [`crate::shutdown`].
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use http::{Response, StatusCode};
@@ -17,7 +20,7 @@ use ssh3_h3::{
     response_with_server_header, route_registered_datagram,
 };
 use ssh3_quinn::Ssh3IncomingChannelRouter;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::auth::{
     AuthOutcome, UnauthenticatedSlot, authorize_request, parse_request_authorization,
@@ -37,6 +40,7 @@ use crate::session::{
     AgentForwardingSlot, SessionUser, handle_plain_channel, resolve_session_user,
 };
 use crate::sftp::{CHANNEL_TYPE_SFTP, handle_sftp_channel};
+use crate::shutdown::{SHUTDOWN_ERROR_CODE, SHUTDOWN_REASON, ShutdownSignal};
 
 /// Converts a resource cap into the number of semaphore permits.
 ///
@@ -57,9 +61,29 @@ fn cap_permits(cap: usize) -> usize {
 /// peer never blocks the others. The `max_connections` configuration bounds
 /// the number of tasks: an incoming connection over the cap is refused right
 /// after the QUIC accept, without a handshake.
+///
+/// This runtime never shuts down gracefully on its own: use
+/// [`serve_endpoint_until_shutdown`] with a shutdown signal to make it do.
 pub async fn serve_endpoint(
     endpoint: Endpoint,
     config: Ssh3ServerConfig,
+) -> Result<(), Ssh3ServerError> {
+    serve_endpoint_until_shutdown(endpoint, config, ShutdownSignal::new()).await
+}
+
+/// Serves an endpoint until it stops accepting connections or a shutdown is
+/// requested.
+///
+/// The serving is the same as [`serve_endpoint`]. When the shutdown signal
+/// fires, the endpoint stops serving new connections and the connections it
+/// holds drain up to the `shutdown_drain` window of the configuration: the
+/// conversations keep running while the window lasts, a connection that
+/// arrives during the drain is refused, and whatever is still served when the
+/// window expires is closed with the shutdown error of the Go reference.
+pub async fn serve_endpoint_until_shutdown(
+    endpoint: Endpoint,
+    config: Ssh3ServerConfig,
+    shutdown: ShutdownSignal,
 ) -> Result<(), Ssh3ServerError> {
     validate_server_config(&config)?;
     let handshake_idle_timeout = config.handshake_idle_timeout;
@@ -67,45 +91,222 @@ pub async fn serve_endpoint(
     // owned by its task below and is given back whatever the connection dies
     // of, the pre-auth timeout included
     let connection_slots = Arc::new(Semaphore::new(cap_permits(config.max_connections)));
-    while let Some(incoming) = endpoint.accept().await {
-        let config = config.clone();
-        let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
-            eprintln!(
-                "ssh3-rust-server too many connections ({} active), refusing the incoming connection",
-                config.max_connections
-            );
-            incoming.refuse();
-            continue;
-        };
-        tokio::spawn(async move {
-            // the permit of the connection cap is owned by the task, so the
-            // slot is held for the whole life of the connection
-            let _connection_permit = permit;
-            // the handshake timeout: a peer that opens a connection and
-            // never finishes the handshake must not hold a slot forever
-            match tokio::time::timeout(handshake_idle_timeout, incoming).await {
-                Ok(Ok(connection)) => {
-                    if let Err(err) = serve_connection(connection, config).await {
-                        if !is_benign_server_error(&err) {
-                            eprintln!("ssh3-rust-server connection error: {err}");
+    let tracker = Arc::new(ConnectionTracker::new());
+    let mut shutdown_requested = false;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.wait(), if !shutdown_requested => {
+                shutdown_requested = true;
+                eprintln!("ssh3-rust-server shutdown signal received: no longer accepting new connections");
+                if config.shutdown_drain == Duration::ZERO {
+                    // a drain of zero closes every connection immediately,
+                    // like the Go reference skips its drain and lets the
+                    // process exit
+                    endpoint.close(SHUTDOWN_ERROR_CODE.into(), SHUTDOWN_REASON);
+                }
+                break;
+            }
+            maybe_incoming = endpoint.accept() => {
+                let Some(incoming) = maybe_incoming else {
+                    // the endpoint was closed by its owner: it stops yielding
+                    // connections, the tasks it spawned end on their own
+                    break;
+                };
+                // the live signal is checked and not only the mirror taken in
+                // the arm above, so a connection that raced with the shutdown
+                // signal is refused instead of served
+                if shutdown.is_triggered() {
+                    incoming.refuse();
+                    continue;
+                }
+                let config = config.clone();
+                let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
+                    eprintln!(
+                        "ssh3-rust-server too many connections ({} active), refusing the incoming connection",
+                        config.max_connections
+                    );
+                    incoming.refuse();
+                    continue;
+                };
+                // the slot of the graceful shutdown is taken before the task
+                // is spawned, so a connection that is still being established
+                // holds the drain open as well (the Go reference adds its
+                // connections to the active set before it spawns their tasks)
+                let mut slot = tracker.track();
+                tokio::spawn(async move {
+                    // the permit of the connection cap is owned by the task, so the
+                    // slot is held for the whole life of the connection
+                    let _connection_permit = permit;
+                    // the handshake timeout: a peer that opens a connection and
+                    // never finishes the handshake must not hold a slot forever
+                    match tokio::time::timeout(handshake_idle_timeout, incoming).await {
+                        Ok(Ok(connection)) => {
+                            slot.establish(&connection);
+                            if let Err(err) = serve_connection(connection, config).await {
+                                if !is_benign_server_error(&err) {
+                                    eprintln!("ssh3-rust-server connection error: {err}");
+                                }
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            if !is_benign_connection_error(&err) {
+                                eprintln!("ssh3-rust-server accept error: {err}");
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "ssh3-rust-server handshake timed out after {}s",
+                                handshake_idle_timeout.as_secs()
+                            );
                         }
                     }
+                });
+            }
+        }
+    }
+
+    if !shutdown_requested {
+        // the endpoint died without a shutdown request: there is no drain to
+        // drive, the conversations are ending one way or another
+        return Ok(());
+    }
+
+    if config.shutdown_drain > Duration::ZERO {
+        eprintln!(
+            "ssh3-rust-server shutdown: draining active connections up to {:?}",
+            config.shutdown_drain
+        );
+        // the deadline starts here, with the shutdown already requested: a
+        // sleep created earlier would count a head start into the window
+        let deadline = tokio::time::sleep(config.shutdown_drain);
+        tokio::pin!(deadline);
+        let mut drained = false;
+        loop {
+            tokio::select! {
+                _ = tracker.wait_idle() => {
+                    drained = true;
+                    break;
                 }
-                Ok(Err(err)) => {
-                    if !is_benign_connection_error(&err) {
-                        eprintln!("ssh3-rust-server accept error: {err}");
-                    }
+                _ = &mut deadline => {
+                    break;
                 }
-                Err(_) => {
-                    eprintln!(
-                        "ssh3-rust-server handshake timed out after {}s",
-                        handshake_idle_timeout.as_secs()
-                    );
+                maybe_incoming = endpoint.accept() => {
+                    let Some(incoming) = maybe_incoming else {
+                        // the endpoint was closed underneath the drain
+                        break;
+                    };
+                    // the drain is running: a connection that arrives now is
+                    // refused instead of served, so its peer fails fast (the
+                    // Go reference closes its listener and the handshakes fail
+                    // on its closed socket)
+                    incoming.refuse();
                 }
             }
-        });
+        }
+        if drained {
+            eprintln!("ssh3-rust-server shutdown: all connections finished");
+        } else {
+            let remaining = tracker.close_remaining();
+            eprintln!(
+                "ssh3-rust-server shutdown: drain timeout, closing {remaining} remaining connections"
+            );
+        }
     }
+
+    eprintln!("ssh3-rust-server shutdown complete");
     Ok(())
+}
+
+/// The connections the runtime is serving: the graceful-shutdown analog of the
+/// `activeConns` map and the `conns.WaitGroup` of the Go reference.
+///
+/// A slot is taken before the handshake of an incoming connection is awaited
+/// and released when its serving task ends, so the drain of a shutdown never
+/// announces the end of the conversations while a connection is still being
+/// established or served.
+struct ConnectionTracker {
+    /// The established connections still being served, keyed by their QUIC
+    /// stable id: the drain closes them when its window expires.
+    connections: Mutex<HashMap<usize, Connection>>,
+    /// The number of taken slots: the connections being established and the
+    /// ones being served included. The watch channel carries the count, so a
+    /// slot released between two polls of the drain can never be missed.
+    slots_sender: watch::Sender<usize>,
+    slots: watch::Receiver<usize>,
+}
+
+impl ConnectionTracker {
+    fn new() -> Self {
+        let (slots_sender, slots) = watch::channel(0);
+        Self {
+            connections: Mutex::new(HashMap::new()),
+            slots_sender,
+            slots,
+        }
+    }
+
+    /// Takes a slot for a connection that is being established or served.
+    fn track(self: &Arc<Self>) -> ConnectionSlot {
+        self.slots_sender.send_modify(|slots| *slots += 1);
+        ConnectionSlot {
+            tracker: self.clone(),
+            id: 0,
+            established: false,
+        }
+    }
+
+    /// Resolves when every slot is released and no connection is being
+    /// established or served anymore: the `conns.Wait()` of the Go reference.
+    async fn wait_idle(&self) {
+        let mut slots = self.slots.clone();
+        let _ = slots.wait_for(|slots| *slots == 0).await;
+    }
+
+    /// Closes the established connections still being served and returns how
+    /// many were left: the end of the drain window of the Go reference.
+    fn close_remaining(&self) -> usize {
+        let connections = self.connections.lock().unwrap();
+        let remaining = connections.len();
+        for connection in connections.values() {
+            connection.close(SHUTDOWN_ERROR_CODE.into(), SHUTDOWN_REASON);
+        }
+        remaining
+    }
+}
+
+/// The slot one connection holds while it is being established and served.
+///
+/// The slot is released whatever the way the serving ends, a panic included.
+struct ConnectionSlot {
+    tracker: Arc<ConnectionTracker>,
+    /// The stable id of the established connection, meaningful once
+    /// [`establish`](ConnectionSlot::establish) ran.
+    id: usize,
+    established: bool,
+}
+
+impl ConnectionSlot {
+    /// Registers the established connection into the tracker, so the drain
+    /// can close it when its window expires.
+    fn establish(&mut self, connection: &Connection) {
+        self.id = connection.stable_id();
+        self.tracker
+            .connections
+            .lock()
+            .unwrap()
+            .insert(self.id, connection.clone());
+        self.established = true;
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        if self.established {
+            self.tracker.connections.lock().unwrap().remove(&self.id);
+        }
+        self.tracker.slots_sender.send_modify(|slots| *slots -= 1);
+    }
 }
 
 /// Serves a single accepted QUIC connection.

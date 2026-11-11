@@ -7,9 +7,13 @@
 //! * [`Ssh3ServerConfig`] — how the server binds, which identities it trusts and
 //!   which user sessions run as.
 //! * [`run_with_self_signed`] — convenience entry point that generates a
-//!   self-signed certificate and serves until the endpoint dies.
+//!   self-signed certificate, serves until the endpoint dies and drains the
+//!   conversations on a shutdown signal.
 //! * [`serve_endpoint`] / [`serve_connection`] — building blocks for callers
 //!   that own the TLS configuration or the QUIC endpoint themselves.
+//! * [`serve_endpoint_until_shutdown`] / [`ShutdownSignal`] — the graceful
+//!   shutdown: stop accepting on the signal, drain the conversations up to
+//!   the `shutdown_drain` window.
 //! * [`Ssh3ServerError`] — the error type returned by all of the above.
 //!
 //! Internally the crate is split into focused modules:
@@ -29,6 +33,7 @@
 //! | `sftp_stream` | the byte streams of the SFTP subsystem |
 //! | `tls` | self-signed TLS entry point |
 //! | `runtime` | endpoint/connection acceptance and channel routing |
+//! | `shutdown` | the graceful shutdown: the signal request, the OS signals and the drain window |
 //! | `error` | [`Ssh3ServerError`] and benign-error classification |
 
 mod auth;
@@ -44,6 +49,7 @@ mod session;
 mod sftp;
 mod sftp_child;
 mod sftp_stream;
+mod shutdown;
 mod tls;
 
 #[cfg(test)]
@@ -60,7 +66,8 @@ pub use config::{
 pub use error::Ssh3ServerError;
 pub use forwarding::{ForwardPolicy, check_listen_target};
 pub use forwarding_wire::Ssh3ForwardingWireError;
-pub use runtime::{serve_connection, serve_endpoint};
+pub use runtime::{serve_connection, serve_endpoint, serve_endpoint_until_shutdown};
 pub use sftp::SftpSessionBudget;
 pub use sftp_child::{InternalSftpOptions, run_internal_sftp_server};
+pub use shutdown::{ShutdownSignal, shutdown_drain_period, shutdown_signal};
 pub use tls::{apply_transport_limits, run_with_self_signed};
