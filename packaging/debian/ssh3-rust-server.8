@@ -1,0 +1,217 @@
+.Dd November 12, 2026
+.Dt SSH3-RUST-SERVER 8
+.Os ssh3-rust
+.Sh NAME
+.Nm ssh3-rust-server
+.Nd SSH3 server: user sessions and forwards over HTTP/3 (QUIC)
+.Sh SYNOPSIS
+.Nm
+.Op Fl -bind Ar addr:port
+.Op Fl -hostname Ar name
+.Op Fl -url-path Ar path
+.Op Fl -user Ar name
+.Op Fl -shell Ar path
+.Op Fl -authorized-identity Ar path
+.Op Fl -enable-password-login
+.Op Fl -gateway-ports Cm no | yes | clientspecified
+.Op Fl -permit-open Ar spec
+.Op Fl -permit-listen Ar spec
+.Op Fl -max-reverse-forwards Ar n
+.Op Fl -max-unauth-conversations Ar n
+.Op Fl -max-connections Ar n
+.Op Fl -max-channels-per-conversation Ar n
+.Op Fl -max-incoming-streams Ar n
+.Op Fl -max-incoming-uni-streams Ar n
+.Op Fl -initial-packet-size Ar bytes
+.Op Fl -max-password-failures Ar n
+.Op Fl -password-lockout Ar duration
+.Op Fl -sftp-jail Cm chroot | lexical
+.Op Fl -max-sftp-sessions-per-user Ar n
+.Op Fl -handshake-idle-timeout Ar duration
+.Op Fl -max-idle-timeout Ar duration
+.Op Fl -server-header Ar text
+.Op Fl -require-auth
+.Op Fl V
+.Sh DESCRIPTION
+.Nm
+speaks the SSH3 protocol: one QUIC
+.Pq UDP
+listener carries an HTTP/3 extended CONNECT
+.Rs
+.%T RFC 9220
+.%D October 2022
+.Re
+to the secret route
+.Pq Fl -url-path ,
+default
+.Li /ssh3-term ,
+and every subsequent bidirectional stream is an SSH3 channel.
+Shell and exec sessions, direct-tcp and direct-udp forwards, the
+dynamic SOCKS forwarding and the in-process SFTP bridge ride those
+channels. The client CLI is
+.Xr ssh3 1 .
+.Pp
+The daemon runs as root and, after the CONNECT authentication, drops
+every session onto the account of the requested username (initgroups,
+setgid, setuid, the home chdir) before any spawn. Public keys
+authenticate out of the box: the
+.Pa ~/.ssh3/authorized_identities
+file or the
+.Pa ~/.ssh/authorized_keys
+file of the target account, or the files of the
+.Fl -authorized-identity
+options. Password authentication is off by default: the Basic step
+verifies against the unix accounts only when
+.Fl -enable-password-login
+or
+.Ev SSH3_ENABLE_PASSWORD_LOGIN=1
+turns it on, the brute force stays bounded by the per-account lockout
+.Pq Fl -max-password-failures , Fl -password-lockout-seconds
+and the unauthenticated conversation cap, and the root account never
+authenticates by password.
+.Pp
+The QUIC handshake needs a certificate: on the first start the server
+generates a self-signed pair in memory, and the
+.Fl -hostname
+options (repeated for every name, the addresses included) carry the
+subject alternative names the clients validate the certificate
+against.
+.Pp
+Every option below has an
+.Ev SSH3_*
+environment counterpart (the same name upper-cased, dashes
+underscored), read from the conffile
+.Pa /etc/ssh3/ssh3-rust-server.env
+through the systemd
+.Cm EnvironmentFile ;
+the command line wins over the environment. The long options are also
+accepted with a single dash, the
+.Xr flag 1
+shape of the Go reference, so its command lines move over unchanged.
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl -bind Ar addr:port
+The QUIC listen address
+.Pq default Li 127.0.0.1:4433 ; the Debian unit passes Li [::]:443 .
+.It Fl -hostname Ar name
+The subject alternative name of the generated certificate, repeatable
+.Pq default Cm localhost .
+.It Fl -url-path Ar path
+The secret HTTP/3 CONNECT route
+.Pq default Li /ssh3-term .
+.It Fl -user Ar name
+The user sessions run as when the client does not request one.
+.It Fl -shell Ar path
+The shell of the sessions; the default is the login shell of the
+account.
+.It Fl -authorized-identity Ar path
+A file with authorized identities (SSH public keys or OIDC entries),
+repeatable; without it the per-account defaults are read.
+.It Fl -enable-password-login
+The password authentication against the unix accounts; off by default,
+the safe side of the reference.
+.It Fl -require-auth
+Reject the requests that carry no valid credentials.
+.It Fl -gateway-ports Cm no | yes | clientspecified
+The GatewayPorts policy of the reverse (Fl R) listeners, the
+sshd_config semantics
+.Pq default Cm no :
+force loopback binds, allow any bind, or let the client ask.
+.It Fl -permit-open Ar spec , Fl -permit-listen Ar spec
+The allowed host:port targets of the client-side forwards and the
+allowed binds of the reverse listeners
+.Pq comma/space separated, Cm * wildcards the host, Cm ! negates an entry; empty: unrestricted .
+.It Fl -max-reverse-forwards Ar n
+The reverse listeners one user may hold
+.Pq default 10 .
+.It Fl -max-unauth-conversations Ar n
+Conversations sitting unauthenticated before refusals
+.Pq default 100 .
+.It Fl -max-connections Ar n
+Concurrent QUIC connections
+.Pq default 0: no limit .
+.It Fl -max-channels-per-conversation Ar n
+Open channels one conversation may keep
+.Pq default 64 , Cm 0: no limit .
+.It Fl -max-incoming-streams Ar n , Fl -max-incoming-uni-streams Ar n
+QUIC transport limits for the peer-initiated streams
+.Pq default 100 .
+.It Fl -initial-packet-size Ar bytes
+The initial QUIC packet size; the transport floors the value at the
+QUIC minimum of 1200
+.Pq default 1200 .
+.It Fl -max-password-failures Ar n , Fl -password-lockout Ar duration
+The password brute-force lockout: the failures per account
+.Pq default 10
+and the lockout duration
+.Pq default 60s .
+.It Fl -sftp-jail Cm chroot | lexical
+The SFTP path isolation: the per-session child chroots into the home
+of the user
+.Pq Cm chroot , the sshd model , the default on unix
+or the in-process lexical jail
+.Pq Cm lexical ; a chroot without a unix platform falls back to Cm lexical .
+.It Fl -max-sftp-sessions-per-user Ar n
+The concurrent SFTP sessions one user may hold
+.Pq default 16 , Cm 0: no limit .
+.It Fl -handshake-idle-timeout Ar duration , Fl -max-idle-timeout Ar duration
+The QUIC handshake and idle timeouts, the sshd canon
+.Pq defaults 120s and 24h : a bare number reads as seconds, the Cm 120s , Cm 2m , Cm 24h shapes ride.
+.It Fl -server-header Ar text
+The value of the server header of the CONNECT response
+.Pq default: the version string .
+.It Fl V
+Print the version string and exit.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev SSH3_ENABLE_PASSWORD_LOGIN
+1/true/yes/on: the password authentication switch; every other value
+keeps it off
+.Pq default off .
+.It Ev SSH3_URL_PATH , Ev SSH3_PERMIT_OPEN , Ev SSH3_PERMIT_LISTEN , Ev SSH3_GATEWAY_PORTS
+The counterparts of the options of the same names.
+.It Ev SSH3_MAX_REVERSE_FORWARDS , Ev SSH3_MAX_UNAUTH_CONVERSATIONS , Ev SSH3_MAX_CONNECTIONS , Ev SSH3_MAX_CHANNELS_PER_CONVERSATION , Ev SSH3_MAX_INCOMING_STREAMS , Ev SSH3_MAX_INCOMING_UNI_STREAMS , Ev SSH3_MAX_SFTP_SESSIONS_PER_USER
+The numeric caps of the options of the same names; a value that does
+not parse is ignored with a warning and the default stands.
+.It Ev SSH3_MAX_PASSWORD_FAILURES , Ev SSH3_PASSWORD_LOCKOUT_SECONDS
+The brute-force lockout; the
+.Ev SSH3_MAX_PASSWORD_FAILOUT_SECONDS
+spelling is the accepted alias of the lockout duration.
+.It Ev SSH3_HANDSHAKE_IDLE_TIMEOUT , Ev SSH3_MAX_IDLE_TIMEOUT
+The QUIC timeouts of the options of the same names, the durations
+.Pq a bare number reads as seconds .
+.It Ev SSH3_SFTP_JAIL , Ev SSH3_SHUTDOWN_DRAIN
+The jail mode and the seconds to drain the active conversations on
+SIGTERM before the close grace
+.Pq default 5 , Cm 0: close immediately .
+.It Ev SSH3_LOG_LEVEL , Ev SSH3_LOG_FILE
+The log level
+.Pq Cm trace | debug | info | warning | error , case-insensitive, default Cm warn
+and the log file. The file is opened in the append mode
+.Pq Cm 0644 ;
+an unset or empty value keeps the standard error when the run is under
+systemd
+.Pq the Ev INVOCATION_ID variable, the journal captures it
+and falls back to
+.Pa /var/log/ssh3.log
+otherwise, the shape of the Go reference. The records are one-line
+JSON objects
+.Pq Li {"level":"info","time":...,"message":"..."} .
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa /etc/ssh3/ssh3-rust-server.env
+The conffile read through the unit's
+.Cm EnvironmentFile ;
+every commented variable is shipped in it.
+.It Pa /usr/lib/systemd/system/ssh3-rust-server.service
+The systemd unit; the daemon is enabled but not started at install
+time.
+.It Pa ~/.ssh3/authorized_identities , Pa ~/.ssh/authorized_keys
+The per-account public key chains, the native and the sshd
+compatibility forms.
+.El
+.Sh SEE ALSO
+.Xr ssh3 1 ,
+.Xr sshd 8

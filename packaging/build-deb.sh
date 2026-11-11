@@ -126,6 +126,17 @@ install -m 0644 "$repo_root/LICENSE" "$pkg_root/usr/share/doc/ssh3-rust-server/L
 install -m 0644 "$repo_root/NOTICE" "$pkg_root/usr/share/doc/ssh3-rust-server/NOTICE"
 install -m 0644 "$repo_root/README.md" "$pkg_root/usr/share/doc/ssh3-rust-server/README.md"
 
+# The man pages, gzipped the way Debian ships them (`-n`: the reproducible
+# build stamps the tree itself). The client page rides in the server
+# package while the pipeline builds this one package; the names follow the
+# binaries: `ssh3` and `ssh3-rust-server`.
+install -d -m 0755 "$pkg_root/usr/share/man/man1"
+install -d -m 0755 "$pkg_root/usr/share/man/man8"
+gzip -n -9 -c "$repo_root/packaging/debian/ssh3.1" \
+  >"$pkg_root/usr/share/man/man1/ssh3.1.gz"
+gzip -n -9 -c "$repo_root/packaging/debian/ssh3-rust-server.8" \
+  >"$pkg_root/usr/share/man/man8/ssh3-rust-server.8.gz"
+
 # The Debian changelog of the package.
 changelog_date=$(date -u -d "@$source_date_epoch" "+%a, %d %b %Y %H:%M:%S +0000")
 cat >"$pkg_root/usr/share/doc/ssh3-rust-server/changelog.Debian" <<EOF

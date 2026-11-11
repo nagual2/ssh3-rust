@@ -1,0 +1,215 @@
+.Dd November 12, 2026
+.Dt SSH3 1
+.Os ssh3-rust
+.Sh NAME
+.Nm ssh3
+.Nd SSH3 client: sessions, forwards and file transfers over HTTP/3
+.Sh SYNOPSIS
+.Nm
+.Op Fl 46AfMNqTvVtT
+.Op Fl i Ar identity_file
+.Op Fl p Ar port
+.Op Fl U Ar url_path
+.Op Fl L Ar [bind_address:]port:host:hostport
+.Op Fl R Ar [bind_address:]bind_port Ns Op /udp Ns :target_host:target_port
+.Op Fl D Ar [bind_address:]port
+.Op Fl J Ar destination
+.Op Fl o Ar key=value
+.Op Fl S Ar ctl_path
+.Op Fl O Ar op
+.Op Fl F Ar ssh_config
+.Op Fl s Ar subsystem
+.Ar [user@]host Ns Op :port
+.Op Ar command ...
+.Sh DESCRIPTION
+.Nm
+connects to an
+.Xr ssh3-rust-server 8
+endpoint: one QUIC
+.Pq UDP
+connection carries an HTTP/3 extended CONNECT
+.Rs
+.%T RFC 9220
+.%D October 2022
+.Re
+to the secret server route
+.Pq the Fl U Ar url_path ,
+default
+.Li /ssh3-term ,
+and every subsequent bidirectional stream is an SSH3 channel for
+sessions, forwards and file transfers.
+The launch flags follow the
+.Xr ssh 1
+canon, and the
+.Fl o
+keywords accept the OpenSSH shapes; the precedence is the CLI flag, then
+the
+.Fl o
+keyword, then
+.Pa ~/.ssh/config .
+.Pp
+Authentication: the public keys of the identity files
+.Pq Fl i
+and of the authentication plugins, the agent
+.Pq Fl -agent ,
+the OIDC flow
+.Pq Fl -use-oidc ,
+a bearer token
+.Pq Fl -bearer-token-file ,
+or the Basic password step
+.Pq Fl -password-file .
+The first connection pins the server certificate in
+.Pa ~/.ssh3/known_hosts
+(trust on first use); the
+.Fl -strict-host-key-checking
+policy
+.Pq and the StrictHostKeyChecking -o keyword ,
+.Cm ask
+by default, governs the pin/ask/refuse decision afterwards.
+.Pp
+The transfer mode
+.Pq Fl -transfer
+is the scp analog: exactly one operand is a local path, the other is
+.Ar user@host:remote_path
+.Ns — the remote side decides the direction, the explicit form
+.Ar user@host:port/url_path:remote_path
+carries the server addressing as well.
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl 4 , Fl 6
+Force the IPv4/IPv6 address family for the QUIC dial.
+.It Fl i Ar identity_file
+The private key file for public key authentication; the
+.Fl -privkey
+spelling is the deprecated alias of the reference.
+.It Fl -server-name Ar name
+The TLS server name the certificate is validated against, when it
+differs from the host of the URL.
+.It Fl -user Ar name
+The user the session requests; the
+.Fl o Cm User
+keyword and
+.Ev USER
+carry the same value.
+.It Fl -agent , Fl -agent-key Ar path , Fl -agent-socket Ar path
+Authenticate through the OpenSSH agent: the whole agent, one of its
+keys, or the agent at the given socket
+.Pq the Ev SSH_AUTH_SOCK default .
+.It Fl A , Fl -forward-agent
+Forward the ssh agent to the remote host.
+.It Fl -password Ar pass , Fl -password-file Ar path
+The Basic authentication password; the file form keeps the secret out
+of the argument list.
+.It Fl -bearer-token Ar token , Fl -bearer-token-file Ar path
+The bearer token sent in the Authorization header.
+.It Fl -use-oidc Ar issuer , Fl -oidc-client-id Ar id , Fl -oidc-client-secret Ar secret , Fl -oidc-client-secret-file Ar path , Fl -oidc-config Ar path , Fl -no-pkce
+The OIDC flow: the issuer URL, the client credentials and their JSON
+config file
+.Pq the reference name Pa ~/.ssh3/oidc_config.json ,
+the PKCE switch.
+.It Fl -keylog Ar file
+Write the QUIC TLS secrets in the NSS keylog format; only for
+debugging with a packet analyzer.
+.It Fl -ca-cert Ar path , Fl -insecure
+The extra root certificates; the insecure switch turns the
+certificate verification off.
+.It Fl -strict-host-key-checking Cm ask | yes | accept-new | no
+The policy of the known_hosts check
+.Pq default Cm ask .
+.It Fl -known-hosts Ar path
+The known_hosts file that pins the server certificates
+.Pq default Pa ~/.ssh3/known_hosts .
+.It Fl -transfer , Fl r , Fl -continue , Fl -checksum
+The file transfer mode and its modifiers: the recursive trees, the
+resumption of an interrupted transfer, and the SHA-256 verification
+(automatic over 32 MiB).
+.It Fl p Ar port , Fl U Ar url_path
+The port and the secret route of the server.
+.It Fl t , Fl T
+Force, never allocate a pseudo-terminal; the
+.Fl o Cm RequestTTY
+keyword carries the
+.Cm auto | yes | no | force
+shapes.
+.It Fl o Ar key=value
+Configuration option, repeatable: Cm RequestTTY, Term, EscapeChar,
+StrictHostKeyChecking, LocalForward, RemoteForward, DynamicForward,
+ProxyJump, ServerAliveInterval .
+.It Fl L Ar [bind_address:]port:host:hostport
+Local forwarding towards the remote host; the
+.Fl -forward-tcp
+and
+.Fl -forward-udp
+spellings are the deprecated aliases of the reference.
+.It Fl R Ar [bind_address:]bind_port Ns Op /udp Ns :target_host:target_port
+Reverse forwarding: the server binds and forwards to the local target.
+.It Fl D Ar [bind_address:]port
+Dynamic (SOCKS5) forwarding.
+.It Fl J Ar destination
+Proxy jump: a comma-separated chain of SSH3 hops, tunneled hop by hop;
+the
+.Fl -proxy-jump
+spelling is the deprecated alias.
+.It Fl N
+No remote command or session: hold the connection open for the
+forwards.
+.It Fl f
+Go to background after the startup checks: the session detaches from
+the terminal and keeps running.
+.It Fl M , Fl S Ar ctl_path , Fl O Cm check | stop | exit , Fl -control-master Cm no | yes | auto , Fl -control-path Ar path , Fl -control-persist Cm no | yes | Ns Ar seconds
+The control master: share one authenticated connection across the
+invocations through the unix socket
+.Ar ctl_path ,
+its operations and the idle persistence.
+.It Fl F Ar ssh_config
+The ssh_config file to read instead of
+.Pa ~/.ssh/config .
+.It Fl s Ar subsystem
+Request the subsystem on the session channel instead of a shell;
+.Cm sftp
+launches the built-in interactive SFTP client.
+.It Fl -handshake-idle-timeout Ar duration , Fl -max-idle-timeout Ar duration , Fl -packet-size Ar bytes
+The QUIC tuning: the handshake and idle timeouts, the initial packet
+size.
+.It Fl q , Fl v
+Quiet / verbose diagnostics; the
+.Ev SSH3_LOG_LEVEL
+of the reference folds onto the same ladder.
+.It Fl V
+Print the version string and exit.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev SSH3_LOG_LEVEL
+The diagnostic level of the reference
+.Pq Cm trace | debug | info | warning | error .
+The names fold onto the client levels by severity: error and warning
+quiet the client, info carries the ordinary level, debug and trace add
+the details. The exact lowercase
+.Cm trace
+spelling beats the
+.Fl q
+and
+.Fl v
+flags, every other name yields to them; an unknown name keeps the
+ordinary default.
+.It Ev SSH_AUTH_SOCK
+The socket of the OpenSSH agent, the default of
+.Fl -agent-socket .
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa ~/.ssh3/known_hosts
+The TOFU pin store of the server certificates.
+.It Pa ~/.ssh/config
+The OpenSSH configuration, consulted by default for the implemented
+keywords;
+.Fl F
+reads another file.
+.It Pa ~/.ssh3/oidc_config.json
+The reference name of the OIDC JSON client config.
+.El
+.Sh SEE ALSO
+.Xr ssh3-rust-server 8 ,
+.Xr ssh 1 ,
+.Xr ssh_config 5
