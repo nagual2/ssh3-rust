@@ -52,7 +52,7 @@ Options:
       --insecure
           
       --transfer
-          Move files between the local machine and the server over SFTP
+          Move files between the local machine and the server over SFTP [alias: --sftp]
   -r, --recursive
           Transfer the directories recursively (transfer mode)
       --continue
@@ -87,6 +87,10 @@ Options:
           The ssh_config file of the user
   -L <SPEC>
           Forward a local port to the remote host: [bind_address:]port:host:hostport
+      --forward-tcp <SPEC>
+          Forward a local port towards a remote IP: localport/remoteip@remoteport
+      --forward-udp <SPEC>
+          Forward a local port towards a remote IP: localport/remoteip@remoteport
   -R <SPEC>
           Ask the server to bind a port and forward it to a local target: [bind_address:]bind_port[/udp]:target_host:target_port
   -D <SPEC>
@@ -95,6 +99,8 @@ Options:
           The timeout of the QUIC handshake
       --max-idle-timeout <DURATION>
           The timeout of an idle QUIC connection
+      --packet-size <BYTES>
+          The initial QUIC packet size in bytes: the QUIC minimum is 1200, and the path MTU discovery grows it when the path allows (-packet-size)
   -s, --subsystem <NAME>
           The subsystem to request on the session channel instead of a shell. `sftp` launches the built-in interactive SFTP client; any other name is forwarded to the server as-is
   -h, --help

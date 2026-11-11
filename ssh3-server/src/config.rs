@@ -210,6 +210,13 @@ pub struct Ssh3ServerConfig {
     /// the conversations it still serves when the window expires;
     /// `Duration::ZERO` closes them immediately.
     pub shutdown_drain: Duration,
+    /// Initial QUIC packet size in bytes, the `-initial-packet-size` of the
+    /// Go reference.
+    ///
+    /// The transport floors the value at the QUIC minimum of 1200; the path
+    /// MTU discovery of the server stays disabled, so the packets keep this
+    /// size.
+    pub initial_packet_size: u16,
     /// Maximum number of concurrent QUIC connections the server serves.
     ///
     /// An incoming connection over the cap is refused right after the QUIC
@@ -293,6 +300,7 @@ impl fmt::Debug for Ssh3ServerConfig {
             .field("max_idle_timeout", &self.max_idle_timeout)
             .field("handshake_idle_timeout", &self.handshake_idle_timeout)
             .field("shutdown_drain", &self.shutdown_drain)
+            .field("initial_packet_size", &self.initial_packet_size)
             .field("max_connections", &self.max_connections)
             .field(
                 "max_channels_per_conversation",
@@ -337,6 +345,7 @@ impl Default for Ssh3ServerConfig {
             max_idle_timeout: DEFAULT_MAX_IDLE_TIMEOUT,
             handshake_idle_timeout: DEFAULT_HANDSHAKE_IDLE_TIMEOUT,
             shutdown_drain: DEFAULT_SHUTDOWN_DRAIN,
+            initial_packet_size: DEFAULT_INITIAL_PACKET_SIZE,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_channels_per_conversation: DEFAULT_MAX_CHANNELS_PER_CONVERSATION,
             max_incoming_streams: DEFAULT_MAX_INCOMING_STREAMS,
@@ -371,6 +380,10 @@ pub const DEFAULT_HANDSHAKE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// The default drain window of a graceful shutdown: 5 seconds, the
 /// `SSH3_SHUTDOWN_DRAIN` default of the Go implementation.
 pub const DEFAULT_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
+/// The default initial QUIC packet size in bytes: the QUIC minimum, the
+/// `-initial-packet-size` default of the Go implementation.
+pub const DEFAULT_INITIAL_PACKET_SIZE: u16 = 1200;
 
 /// The default cap of concurrent connections: `0`, the unbounded Go default.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 0;

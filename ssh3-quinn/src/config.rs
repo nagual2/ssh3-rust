@@ -167,6 +167,78 @@ pub fn self_signed_server_config(
     Ok((server_config, certificate))
 }
 
+/// Applies the initial QUIC packet size of the reference `-packet-size` flag
+/// to a transport configuration.
+///
+/// The transport clamps the value to the QUIC minimum (RFC 9000, section 14):
+/// a value below 1200 rides the 1200-byte default, the way the reference
+/// ignores an initial packet size below the minimum (`cmd/ssh3.go`,
+/// `minQUICPacketSize`). The path MTU discovery keeps growing the packets
+/// past the initial size unless it is disabled separately, like in the
+/// reference, where a direct connection lets the discovery run.
+pub fn apply_initial_packet_size(
+    transport: &mut quinn::TransportConfig,
+    packet_size: u16,
+) -> &mut quinn::TransportConfig {
+    transport.initial_mtu(packet_size)
+}
+
+/// Disables the path MTU discovery of a transport: the packets keep the
+/// initial size instead of growing towards the path MTU.
+///
+/// The reference turns the discovery off for the whole server
+/// (`cmd/ssh3-server.go`, `DisablePathMTUDiscovery: true`) and for every
+/// tunneled connection of a proxy jump chain (`cmd/ssh3.go`): the packets of
+/// a tunneled level travel as datagrams of the outer connection, and the
+/// discovery would push them past the datagram budget of that connection.
+pub fn disable_path_mtu_discovery(
+    transport: &mut quinn::TransportConfig,
+) -> &mut quinn::TransportConfig {
+    transport.mtu_discovery_config(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_initial_packet_size, disable_path_mtu_discovery};
+
+    /// The `-packet-size` value of the reference reaches the transport
+    /// builder: the rendering of the configuration names the initial MTU,
+    /// and a value below the QUIC minimum rides the 1200-byte default.
+    #[test]
+    fn the_initial_packet_size_reaches_the_transport_builder() {
+        let mut transport = quinn::TransportConfig::default();
+        apply_initial_packet_size(&mut transport, 1400);
+        assert!(
+            format!("{transport:?}").contains("initial_mtu: 1400"),
+            "{transport:?}"
+        );
+
+        // Below the QUIC minimum the transport clamps to the 1200 default.
+        let mut transport = quinn::TransportConfig::default();
+        apply_initial_packet_size(&mut transport, 900);
+        assert!(
+            format!("{transport:?}").contains("initial_mtu: 1200"),
+            "{transport:?}"
+        );
+    }
+
+    /// The disabled discovery of the reference shows in the transport
+    /// configuration: quinn leaves it enabled by default.
+    #[test]
+    fn the_path_mtu_discovery_switch_reaches_the_transport_builder() {
+        let mut transport = quinn::TransportConfig::default();
+        assert!(
+            format!("{transport:?}").contains("mtu_discovery_config: Some"),
+            "{transport:?}"
+        );
+        disable_path_mtu_discovery(&mut transport);
+        assert!(
+            format!("{transport:?}").contains("mtu_discovery_config: None"),
+            "{transport:?}"
+        );
+    }
+}
+
 #[derive(Debug)]
 struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
 

@@ -135,6 +135,11 @@ struct Cli {
     #[arg(long = "max-incoming-uni-streams", value_name = "COUNT")]
     max_incoming_uni_streams: Option<u32>,
 
+    /// Initial QUIC packet size in bytes; the transport floors the value at
+    /// the QUIC minimum of 1200, like in the reference.
+    #[arg(long = "initial-packet-size", value_name = "BYTES")]
+    initial_packet_size: Option<u16>,
+
     /// Number of failed password attempts that locks an account out.
     #[arg(long = "max-password-failures", value_name = "COUNT")]
     max_password_failures: Option<u32>,
@@ -438,6 +443,12 @@ fn build_config(cli: Cli) -> Result<Ssh3ServerConfig, clap::Error> {
         .or_else(|| env_number(ENV_MAX_SFTP_SESSIONS))
     {
         config.max_sftp_sessions_per_user = max;
+    }
+
+    // the initial QUIC packet size: the same flag and default as in the Go
+    // reference (`cmd/ssh3-server.go`, `-initial-packet-size`)
+    if let Some(size) = cli.initial_packet_size {
+        config.initial_packet_size = size;
     }
 
     // the drain window of the graceful shutdown: a plain number of seconds,

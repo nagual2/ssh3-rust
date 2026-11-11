@@ -89,7 +89,8 @@ pub use dynamic::{
 };
 pub use escape::{Ssh3EscapeAction, Ssh3EscapeCharError, Ssh3EscapeFilter, parse_escape_char};
 pub use forward::{
-    Ssh3ForwardParseError, Ssh3ForwardProtocol, Ssh3LocalForwardSpec, parse_local_forward_spec,
+    Ssh3ForwardParseError, Ssh3ForwardProtocol, Ssh3LocalForwardSpec, parse_legacy_forward_spec,
+    parse_local_forward_spec,
 };
 pub use host_key::{Ssh3HostKeyPromptError, Ssh3KnownHostsTrust};
 pub use known_hosts::{
@@ -142,6 +143,10 @@ pub const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60)
 /// The keep-alive packets keep an idle session alive, so the idle timeout
 /// above only closes a connection the peer really went away.
 pub const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The default initial QUIC packet size: the QUIC minimum, the default of
+/// the reference `-packet-size` flag (RFC 9000, section 14).
+pub const DEFAULT_INITIAL_PACKET_SIZE: u16 = 1200;
 
 /// The default escape character of an interactive session.
 pub const DEFAULT_ESCAPE_CHAR: u8 = b'~';
@@ -211,6 +216,15 @@ pub struct Ssh3ClientConfig {
     pub max_idle_timeout: Duration,
     /// The period of the keep-alive packets; `None` disables them.
     pub keep_alive_interval: Option<Duration>,
+    /// The initial QUIC packet size in bytes, the `-packet-size` of the
+    /// reference.
+    ///
+    /// The value is the size of the first packet of a direct connection;
+    /// the path MTU discovery grows it when the path allows. A value below
+    /// the QUIC minimum rides the minimum. The levels of a proxy jump chain
+    /// ignore it for their own packets: their budget is computed from this
+    /// value as the base instead.
+    pub packet_size: u16,
     /// The local forwards (`-L`) the session opens.
     pub local_forwards: Vec<Ssh3LocalForwardSpec>,
     /// The reverse forwards (`-R`) the session requests.
@@ -270,6 +284,7 @@ impl Ssh3ClientConfig {
             handshake_idle_timeout: DEFAULT_HANDSHAKE_IDLE_TIMEOUT,
             max_idle_timeout: DEFAULT_MAX_IDLE_TIMEOUT,
             keep_alive_interval: Some(DEFAULT_KEEP_ALIVE_INTERVAL),
+            packet_size: DEFAULT_INITIAL_PACKET_SIZE,
             local_forwards: Vec::new(),
             reverse_forwards: Vec::new(),
             dynamic_forwards: Vec::new(),
@@ -1804,8 +1819,16 @@ async fn build_proxy_jump_tunnel(
         Ssh3ClientError::Io(io::Error::new(io::ErrorKind::InvalidInput, reason))
     })?;
     let depth = hops.len();
-    let outer =
-        crate::proxy_jump::tunnel_outer_size(crate::proxy_jump::MIN_QUIC_PACKET_SIZE, depth);
+    // The `-packet-size` of the reference is the base of the datagram budget
+    // of the chain (`outerSize = tunnelOuterSize(*packetSize, hopCount)`): a
+    // base below the QUIC minimum rides the minimum, the way the transport
+    // clamps it for a direct connection.
+    let outer = crate::proxy_jump::tunnel_outer_size(
+        config
+            .packet_size
+            .max(crate::proxy_jump::MIN_QUIC_PACKET_SIZE),
+        depth,
+    );
     let destination_packet_size =
         crate::proxy_jump::tunneled_packet_size(outer, depth).map_err(|reason| {
             Ssh3ClientError::Io(io::Error::new(io::ErrorKind::InvalidInput, reason))
@@ -2203,6 +2226,21 @@ fn client_quinn_config(
         }
     };
 
+    let transport = client_transport_config(config, tunneled_packet_size)?;
+    client_config.transport_config(Arc::new(transport));
+
+    Ok((client_config, host_key_state))
+}
+
+/// The QUIC transport configuration of a client connection.
+///
+/// Split from [`client_quinn_config`] so the tests can pin the transport
+/// knobs of the reference (`-packet-size`, the discovery of the tunneled
+/// levels) without dialing a connection.
+fn client_transport_config(
+    config: &Ssh3ClientConfig,
+    tunneled_packet_size: Option<u16>,
+) -> Result<quinn::TransportConfig, Ssh3ClientError> {
     // The idle timeout of the ssh2 canon is an idle session that is never
     // killed, so the client raises its side too (QUIC negotiates the smaller
     // of the two values) and keeps the connection alive with keep-alive
@@ -2229,11 +2267,14 @@ fn client_quinn_config(
     if let Some(size) = tunneled_packet_size {
         transport.initial_mtu(size);
         transport.min_mtu(size);
-        transport.mtu_discovery_config(None);
+        ssh3_quinn::disable_path_mtu_discovery(&mut transport);
+    } else {
+        // The `-packet-size` of the reference: the size of the first packet
+        // of a direct connection, grown by the path MTU discovery when the
+        // path allows it. A value below the QUIC minimum rides the minimum.
+        ssh3_quinn::apply_initial_packet_size(&mut transport, config.packet_size);
     }
-    client_config.transport_config(Arc::new(transport));
-
-    Ok((client_config, host_key_state))
+    Ok(transport)
 }
 
 async fn resolve_target(
@@ -2702,11 +2743,12 @@ mod tests {
         PtySpec, Ssh3CapturedSession, Ssh3ClientConfig, Ssh3ClientError, Ssh3ForwardProtocol,
         Ssh3KnownHostsTrust, Ssh3LocalForwardSpec, Ssh3OidcConfig, Ssh3OidcError, Ssh3PtyPolicy,
         Ssh3SessionRequest, Ssh3StrictHostKeyChecking, Ssh3TrustStrategy, activate_client,
-        build_session_runtime, client_bind_addr, client_quinn_config, connect_client,
-        conversation_id_base64, exit_code_for_exit_signal, parse_dynamic_forward_spec,
-        parse_reverse_forward_spec, resolve_pty, resolve_target, run_capture_on_client,
-        run_exec_capture, send_initial_session_requests, send_signal_request,
-        send_window_change_request, start_dynamic_forwards, start_reverse_forwards,
+        build_session_runtime, client_bind_addr, client_quinn_config, client_transport_config,
+        connect_client, conversation_id_base64, exit_code_for_exit_signal,
+        parse_dynamic_forward_spec, parse_reverse_forward_spec, resolve_pty, resolve_target,
+        run_capture_on_client, run_exec_capture, send_initial_session_requests,
+        send_signal_request, send_window_change_request, start_dynamic_forwards,
+        start_reverse_forwards,
     };
     #[cfg(unix)]
     use super::{run_exec_capture_with_browser_opener, send_forward_agent_request};
@@ -8139,6 +8181,50 @@ mod tests {
         .unwrap();
         let address = endpoint.local_addr().unwrap();
         (endpoint, address, server_certificate)
+    }
+
+    /// The `-packet-size` of the reference reaches the transport builder of
+    /// the client, and a tunneled level pins its own size instead: the
+    /// budget of the level wins over the flag.
+    #[test]
+    fn the_packet_size_reaches_the_transport_config() {
+        let mut config = Ssh3ClientConfig::new("https://localhost:4433/ssh3-term".parse().unwrap());
+        config.packet_size = 1400;
+        let transport = client_transport_config(&config, None).unwrap();
+        assert!(
+            format!("{transport:?}").contains("initial_mtu: 1400"),
+            "{transport:?}"
+        );
+
+        // A tunneled level rides the size of its datagram budget, not the
+        // flag: the packets of the level travel as datagrams of the outer
+        // connection.
+        let transport = client_transport_config(&config, Some(1248)).unwrap();
+        let tunneled_debug = format!("{transport:?}");
+        assert!(
+            tunneled_debug.contains("initial_mtu: 1248")
+                && !tunneled_debug.contains("initial_mtu: 1400"),
+            "the tunneled size must override the flag: {tunneled_debug}"
+        );
+    }
+
+    /// The tunneled levels of a proxy jump chain keep the path MTU
+    /// discovery off whatever the budget is (the reference dials its
+    /// tunnels with `DisablePathMTUDiscovery: true`), and a direct
+    /// connection keeps the discovery on, like the reference does.
+    #[test]
+    fn the_tunneled_levels_keep_the_path_mtu_discovery_off() {
+        let config = Ssh3ClientConfig::new("https://localhost:4433/ssh3-term".parse().unwrap());
+        let tunneled = client_transport_config(&config, Some(1200)).unwrap();
+        assert!(
+            format!("{tunneled:?}").contains("mtu_discovery_config: None"),
+            "{tunneled:?}"
+        );
+        let direct = client_transport_config(&config, None).unwrap();
+        assert!(
+            format!("{direct:?}").contains("mtu_discovery_config: Some"),
+            "{direct:?}"
+        );
     }
 
     #[tokio::test]

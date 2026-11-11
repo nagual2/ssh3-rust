@@ -23,6 +23,15 @@ use crate::shutdown::{ShutdownSignal, shutdown_signal};
 /// the audit of 2026-10-27 (K3): the peer cannot open more concurrent streams
 /// per connection than the caps allow.
 pub fn apply_transport_limits(server_config: &mut ServerConfig, config: &Ssh3ServerConfig) {
+    server_config.transport = Arc::new(server_transport_config(config));
+}
+
+/// Builds the QUIC transport configuration of the server.
+///
+/// Split from [`apply_transport_limits`] so the tests can pin the transport
+/// knobs of the reference (the disabled path MTU discovery) without binding
+/// an endpoint.
+fn server_transport_config(config: &Ssh3ServerConfig) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     // SSH3 carries its UDP forwarding over the raw QUIC datagram API: the
     // frame size parameter announces the ability to receive them. Without
@@ -41,7 +50,15 @@ pub fn apply_transport_limits(server_config: &mut ServerConfig, config: &Ssh3Ser
     });
     transport.max_concurrent_bidi_streams(config.max_incoming_streams.into());
     transport.max_concurrent_uni_streams(config.max_incoming_uni_streams.into());
-    server_config.transport = Arc::new(transport);
+    // The `-initial-packet-size` of the reference rides the transport: the
+    // quinn builder floors the value at the QUIC minimum, the way the Go
+    // reference ignores a size below it (`cmd/ssh3-server.go`).
+    ssh3_quinn::apply_initial_packet_size(&mut transport, config.initial_packet_size);
+    // The reference never grows the packets of its server past the initial
+    // size (`cmd/ssh3-server.go`, `DisablePathMTUDiscovery: true`): the
+    // discovery has nothing to learn.
+    ssh3_quinn::disable_path_mtu_discovery(&mut transport);
+    transport
 }
 
 /// Serves SSH3 with a freshly generated self-signed certificate.
@@ -72,4 +89,49 @@ pub async fn run_with_self_signed(config: Ssh3ServerConfig) -> Result<(), Ssh3Se
         signal_task.trigger();
     });
     serve_endpoint_until_shutdown(endpoint, config, shutdown).await
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::Ssh3ServerConfig;
+
+    /// The server keeps the path MTU discovery off, the posture of the
+    /// reference (`cmd/ssh3-server.go`, `DisablePathMTUDiscovery: true`):
+    /// the packets stay at the initial size instead of growing towards the
+    /// path MTU.
+    #[test]
+    fn the_server_keeps_the_path_mtu_discovery_off() {
+        let transport = super::server_transport_config(&Ssh3ServerConfig::default());
+        assert!(
+            format!("{transport:?}").contains("mtu_discovery_config: None"),
+            "{transport:?}"
+        );
+    }
+
+    /// The `-initial-packet-size` knob reaches the transport builder: the
+    /// value lands in the initial MTU and a size below the QUIC minimum
+    /// rides the 1200-byte floor, like in the reference.
+    #[test]
+    fn the_initial_packet_size_reaches_the_server_transport() {
+        let config = Ssh3ServerConfig {
+            initial_packet_size: 1400,
+            ..Ssh3ServerConfig::default()
+        };
+        let transport = super::server_transport_config(&config);
+        assert!(
+            format!("{transport:?}").contains("initial_mtu: 1400"),
+            "{transport:?}"
+        );
+
+        // Below the QUIC minimum the transport clamps to the 1200 default.
+        let config = Ssh3ServerConfig {
+            initial_packet_size: 900,
+            ..Ssh3ServerConfig::default()
+        };
+        let transport = super::server_transport_config(&config);
+        assert!(
+            format!("{transport:?}").contains("initial_mtu: 1200"),
+            "{transport:?}"
+        );
+    }
 }

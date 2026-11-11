@@ -164,6 +164,55 @@ fn parse_port(port: &str) -> Option<u16> {
     port.parse::<u16>().ok()
 }
 
+/// Parses the legacy `localport/remoteip@remoteport` forward specification.
+///
+/// The deprecated `-forward-tcp` / `-forward-udp` flags of the reference
+/// implementation carry this historical shape (the `parseAddrPort` of
+/// `cmd/ssh3.go`): the local port, the remote IP literal and the remote
+/// port. The target must be an IP literal — the reference refuses a
+/// hostname here, unlike the ssh(1) shape of `-L` — and the forward binds
+/// no explicit address, so the loopback default of `-L` applies.
+pub fn parse_legacy_forward_spec(
+    spec: &str,
+    protocol: Ssh3ForwardProtocol,
+) -> Result<Ssh3LocalForwardSpec, Ssh3ForwardParseError> {
+    let fail = |reason: String| Ssh3ForwardParseError {
+        spec: spec.to_string(),
+        reason,
+    };
+    let malformed = || {
+        fail(
+            "expected localport/remoteip@remoteport, the remote target must be an IP literal"
+                .to_string(),
+        )
+    };
+    let Some((local_port, rest)) = spec.trim().split_once('/') else {
+        return Err(malformed());
+    };
+    let Some((remote_ip, remote_port)) = rest.split_once('@') else {
+        return Err(malformed());
+    };
+    let bind_port =
+        parse_port(local_port).ok_or_else(|| fail(format!("invalid local port {local_port:?}")))?;
+    let target = remote_ip.parse::<IpAddr>().map_err(|_| {
+        fail(format!(
+            "invalid remote IP {remote_ip:?}: the legacy form accepts an IP literal only"
+        ))
+    })?;
+    let target_port = parse_port(remote_port)
+        .ok_or_else(|| fail(format!("invalid remote port {remote_port:?}")))?;
+    if target_port == 0 {
+        return Err(fail("the target port cannot be 0".to_string()));
+    }
+    Ok(Ssh3LocalForwardSpec {
+        bind_address: None,
+        bind_port,
+        target_host: target.to_string(),
+        target_port,
+        protocol,
+    })
+}
+
 /// Splits on the separator, ignoring the separators inside brackets, so that
 /// an IPv6 literal like `[::1]:8080` stays in one part.
 fn split_outside_brackets(value: &str, separator: char) -> Vec<String> {
@@ -490,7 +539,10 @@ pub(crate) async fn open_udp_forward_bridge(
 
 #[cfg(test)]
 mod tests {
-    use super::{Ssh3ForwardProtocol, Ssh3LocalForwardSpec, parse_local_forward_spec};
+    use super::{
+        Ssh3ForwardProtocol, Ssh3LocalForwardSpec, parse_legacy_forward_spec,
+        parse_local_forward_spec,
+    };
 
     #[test]
     fn parses_the_ssh_local_forward_syntax() {
@@ -548,5 +600,46 @@ mod tests {
             protocol: Ssh3ForwardProtocol::Udp,
         };
         assert_eq!(spec.spec_string(), "udp://127.0.0.1:8080:example.com:80");
+    }
+
+    /// The deprecated `-forward-tcp` / `-forward-udp` shape: the local port,
+    /// the remote IP literal and the remote port, parsed into the same local
+    /// forward the `-L` spec produces.
+    #[test]
+    fn parses_the_legacy_forward_alias_shape() {
+        let spec =
+            parse_legacy_forward_spec("8080/192.0.2.1@80", Ssh3ForwardProtocol::Tcp).unwrap();
+        assert_eq!(spec.bind_address, None);
+        assert_eq!(spec.bind_port, 8080);
+        assert_eq!(spec.target_host, "192.0.2.1");
+        assert_eq!(spec.target_port, 80);
+        assert_eq!(spec.protocol, Ssh3ForwardProtocol::Tcp);
+
+        let spec =
+            parse_legacy_forward_spec("5353/2001:db8::1@53", Ssh3ForwardProtocol::Udp).unwrap();
+        assert_eq!(spec.bind_port, 5353);
+        assert_eq!(spec.target_host, "2001:db8::1");
+        assert_eq!(spec.target_port, 53);
+        assert_eq!(spec.protocol, Ssh3ForwardProtocol::Udp);
+    }
+
+    /// The legacy shape refuses the garbage the reference refuses: a
+    /// hostname target, a missing part, an out-of-range port, a zero target
+    /// port.
+    #[test]
+    fn refuses_the_malformed_legacy_forwards() {
+        let tcp = Ssh3ForwardProtocol::Tcp;
+        assert!(parse_legacy_forward_spec("", tcp).is_err());
+        assert!(parse_legacy_forward_spec("8080", tcp).is_err());
+        assert!(parse_legacy_forward_spec("8080/", tcp).is_err());
+        assert!(parse_legacy_forward_spec("8080/192.0.2.1", tcp).is_err());
+        assert!(parse_legacy_forward_spec("8080/192.0.2.1@", tcp).is_err());
+        assert!(parse_legacy_forward_spec("/192.0.2.1@80", tcp).is_err());
+        assert!(parse_legacy_forward_spec("8080/192.0.2.1@0", tcp).is_err());
+        assert!(parse_legacy_forward_spec("99999/192.0.2.1@80", tcp).is_err());
+        assert!(parse_legacy_forward_spec("8080/192.0.2.1@99999", tcp).is_err());
+        // the reference `parseAddrPort` refuses a hostname in the legacy
+        // form (the remote target rides `net.ParseIP`)
+        assert!(parse_legacy_forward_spec("8080/example.com@80", tcp).is_err());
     }
 }

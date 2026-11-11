@@ -41,7 +41,7 @@ Legend for the platform columns: `yes` = implemented, `-` = not implemented / N/
 | `-e` | - | char | none | - | yes | - | C only |
 | `-f` | - | flag | false | yes | yes | - | Go + C |
 | - | `--forward-agent` | flag | false | yes | - (see `-A`) | yes | all three (short `-A`) |
-| - | `--forward-tcp` / `--forward-udp` | string | "" | yes | - | - | Go only |
+| - | `--forward-tcp` / `--forward-udp` | string (`localport/remoteip@remoteport`) | "" | yes | - | yes (deprecated alias of `-L` / `-L udp://`) | Go + Rust (C never carried the aliases) |
 | - | `--handshake-idle-timeout` | duration | none | - | - | yes | Rust only |
 | - | `--identity` / `-i` / `--privkey` | path | "" | yes (`-i` / `-privkey`) | yes (`-i` / `-privkey`) | yes (`-i` / `--privkey`) | all three |
 | - | `--insecure` / `-insecure` | flag | false | yes | yes | yes | all three |
@@ -63,7 +63,7 @@ Legend for the platform columns: `yes` = implemented, `-` = not implemented / N/
 | - | `--oidc-token` / `--oidc-audience` | - | none | - | yes (C) | - | C only (Go/Rust use -o / --use-oidc) |
 | - | `--option` | KEY=VALUE | none | - (see `-o`) | - (see `-o`) | - (`-o` only) | all three (short `-o`) |
 | `-p` | - | int (port) | 0 | yes | yes | yes | all three |
-| - | `--packet-size` | int | 1200 | yes | - | - | Go only |
+| - | `--packet-size` | int | 1200 | yes | - | yes | Go + Rust (client; the server rides `-initial-packet-size` in Go) |
 | - | `--password` / `--password-file` | string/path | "" | yes (`--password`) | yes (`--password`) | yes | all three |
 | - | `--port` | u16 | none | - (see `-p`) | - (see `-p`) | yes (`-p`) | all three |
 | - | `--privkey` | path | "" | yes | yes (alias) | yes (alias) | all three |
@@ -74,8 +74,8 @@ Legend for the platform columns: `yes` = implemented, `-` = not implemented / N/
 | - | `--stream-rx-mb` | int | 8 | yes | - | - | Go only |
 | - | `--strict-host-key-checking` | value | "" | yes | yes (`-strict-host-key-checking`) | yes | all three |
 | `-t` | - | flag | false | yes | yes | yes | all three |
-| - | `--transfer` | flag | false | yes | - (--sftp replaces) | yes | Go + Rust |
-| - | `--sftp` | flag + spec (scp canon: `local :remote`, `:remote local`, `put|get:...`) | false | yes | yes | - | Go + C; missing in Rust — alias of `--transfer` (хвост UD1/UD4) |
+| - | `--transfer` | flag | false | yes | - (--sftp replaces) | yes | Go + Rust (Rust exposes `--sftp` as its alias) |
+| - | `--sftp` | flag (scp canon; the `put|get:local:remote` spec form stays UD4) | false | yes | yes | yes (`--transfer` alias) | all three (Rust rides `--transfer`; spec forms — UD4) |
 | - | `--url` | URL | required | - (positional) | - (positional) | yes | Rust only |
 | - | `--url-path` | path | `/ssh3-term` | - (see `-U`) | - (see `-U`) | yes (`-U`) | all three |
 | - | `--use-password` | flag | false | yes | - | - | Go only |

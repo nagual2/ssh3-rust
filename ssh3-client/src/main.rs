@@ -5,14 +5,15 @@ use std::time::Duration;
 use clap::{ArgGroup, CommandFactory, Parser, ValueHint, error::ErrorKind};
 use http::Uri;
 use ssh3_client::{
-    DEFAULT_HANDSHAKE_IDLE_TIMEOUT, DEFAULT_MAX_IDLE_TIMEOUT, DEFAULT_TRANSFER_PORT,
-    DEFAULT_TRANSFER_URL_PATH, SSH3_CLIENT_VERSION_STRING, Ssh3AgentSelection, Ssh3ClientConfig,
-    Ssh3ClientError, Ssh3DynamicForwardSpec, Ssh3IpFamily, Ssh3KnownHostsTrust,
-    Ssh3LocalForwardSpec, Ssh3OidcConfig, Ssh3PtyPolicy, Ssh3ReverseForwardSpec,
-    Ssh3SessionRequest, Ssh3StrictHostKeyChecking, Ssh3TransferOptions, Ssh3TransferPlan,
-    Ssh3TrustStrategy, SshConfig, default_known_hosts_path, default_ssh_config_path, diag_error,
-    diag_info, exit_code_for_exit_signal, is_remote_transfer_spec, load_certificates,
-    load_ssh_config, parse_duration, parse_dynamic_forward_spec, parse_escape_char,
+    DEFAULT_HANDSHAKE_IDLE_TIMEOUT, DEFAULT_INITIAL_PACKET_SIZE, DEFAULT_MAX_IDLE_TIMEOUT,
+    DEFAULT_TRANSFER_PORT, DEFAULT_TRANSFER_URL_PATH, SSH3_CLIENT_VERSION_STRING,
+    Ssh3AgentSelection, Ssh3ClientConfig, Ssh3ClientError, Ssh3DynamicForwardSpec, Ssh3IpFamily,
+    Ssh3KnownHostsTrust, Ssh3LocalForwardSpec, Ssh3OidcConfig, Ssh3PtyPolicy,
+    Ssh3ReverseForwardSpec, Ssh3SessionRequest, Ssh3StrictHostKeyChecking, Ssh3TransferOptions,
+    Ssh3TransferPlan, Ssh3TrustStrategy, SshConfig, default_known_hosts_path,
+    default_ssh_config_path, diag_error, diag_info, exit_code_for_exit_signal,
+    is_remote_transfer_spec, load_certificates, load_ssh_config, parse_duration,
+    parse_dynamic_forward_spec, parse_escape_char, parse_legacy_forward_spec,
     parse_local_forward_spec, parse_remote_transfer_spec, parse_reverse_forward_spec,
     read_config_text, resolve_strict_host_key_checking, run_file_transfer, run_forwards_only,
     run_session_stdio,
@@ -200,7 +201,10 @@ struct Cli {
     /// The mode takes exactly two operands: one in the `user@host:remote_path`
     /// form and one local path. The remote operand is the source of a
     /// download and the destination of an upload.
-    #[arg(long)]
+    ///
+    /// The `--sftp` spelling is the deprecated alias of the Go and C
+    /// implementations (the scp canon).
+    #[arg(long, visible_alias = "sftp")]
     transfer: bool,
 
     /// Transfer the directories recursively (transfer mode).
@@ -351,6 +355,24 @@ struct Cli {
     #[arg(short = 'L', value_name = "SPEC")]
     local_forward: Vec<String>,
 
+    /// Forward a local port towards a remote IP: localport/remoteip@remoteport.
+    ///
+    /// The deprecated fork-era alias of `-L` the Go implementation still
+    /// accepts; the ssh(1) shape of `-L` is the primary spelling. The remote
+    /// target must be an IP literal, like the historical parser refuses a
+    /// hostname.
+    #[arg(long = "forward-tcp", value_name = "SPEC")]
+    forward_tcp: Option<String>,
+
+    /// Forward a local port towards a remote IP: localport/remoteip@remoteport.
+    ///
+    /// The deprecated fork-era alias of `-L udp://` the Go implementation
+    /// still accepts; the ssh(1) shape of `-L` is the primary spelling. The
+    /// remote target must be an IP literal, like the historical parser
+    /// refuses a hostname.
+    #[arg(long = "forward-udp", value_name = "SPEC")]
+    forward_udp: Option<String>,
+
     /// Ask the server to bind a port and forward it to a local target:
     /// [bind_address:]bind_port[/udp]:target_host:target_port.
     #[arg(short = 'R', value_name = "SPEC")]
@@ -367,6 +389,11 @@ struct Cli {
     /// The timeout of an idle QUIC connection.
     #[arg(long, value_name = "DURATION")]
     max_idle_timeout: Option<String>,
+
+    /// The initial QUIC packet size in bytes: the QUIC minimum is 1200, and
+    /// the path MTU discovery grows it when the path allows (-packet-size).
+    #[arg(long, value_name = "BYTES")]
+    packet_size: Option<u16>,
 
     /// The subsystem to request on the session channel instead of a shell.
     /// `sftp` launches the built-in interactive SFTP client; any other
@@ -1272,7 +1299,7 @@ fn build_connection_config(
 
     // The forwards follow the same precedence as the other options: the
     // command line wins over the `-o` options.
-    config.local_forwards = if cli.local_forward.is_empty() {
+    let mut local_forwards = if cli.local_forward.is_empty() {
         overrides.local_forwards
     } else {
         cli.local_forward
@@ -1283,6 +1310,23 @@ fn build_connection_config(
             })
             .collect::<Result<Vec<Ssh3LocalForwardSpec>, clap::Error>>()?
     };
+    // The deprecated fork-form forward flags join the `-L` list, parsed with
+    // their historical localport/remoteip@remoteport shape; unlike the old
+    // fork code, a parse error aborts instead of continuing without the
+    // forward. The datagram alias rides first, the order of the reference.
+    if let Some(spec) = cli.forward_udp.as_deref() {
+        local_forwards.push(
+            parse_legacy_forward_spec(spec, ssh3_client::Ssh3ForwardProtocol::Udp)
+                .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))?,
+        );
+    }
+    if let Some(spec) = cli.forward_tcp.as_deref() {
+        local_forwards.push(
+            parse_legacy_forward_spec(spec, ssh3_client::Ssh3ForwardProtocol::Tcp)
+                .map_err(|err| cli_error(ErrorKind::ValueValidation, err.to_string()))?,
+        );
+    }
+    config.local_forwards = local_forwards;
 
     config.reverse_forwards = if cli.reverse_forward.is_empty() {
         overrides.reverse_forwards
@@ -1318,6 +1362,10 @@ fn build_connection_config(
         "SSH3_MAX_IDLE_TIMEOUT",
         DEFAULT_MAX_IDLE_TIMEOUT,
     )?;
+    // The `-packet-size` of the reference: the initial QUIC packet size of
+    // the direct connection. A value below the QUIC minimum rides the
+    // minimum when the transport applies it.
+    config.packet_size = cli.packet_size.unwrap_or(DEFAULT_INITIAL_PACKET_SIZE);
 
     // The `-N` flag holds the connection open for the forwards: no session is
     // opened, so a remote command makes no sense.
@@ -1717,6 +1765,8 @@ const GO_STYLE_LONG_FLAGS: &[&str] = &[
     "control-path",
     "control-persist",
     "forward-agent",
+    "forward-tcp",
+    "forward-udp",
     "identity",
     "insecure",
     "keylog",
@@ -1726,12 +1776,14 @@ const GO_STYLE_LONG_FLAGS: &[&str] = &[
     "oidc-client-id",
     "oidc-client-secret",
     "oidc-client-secret-file",
+    "packet-size",
     "password",
     "password-file",
     "privkey",
     "pubkey-for-agent",
     "proxy-jump",
     "server-name",
+    "sftp",
     "ssh-config",
     "strict-host-key-checking",
     "transfer",
@@ -2427,6 +2479,32 @@ mod tests {
         assert!(!no_session);
     }
 
+    /// The `-packet-size` of the reference lands in the configuration and
+    /// rides the single-dash spelling as well; a value that is not a number
+    /// is refused by the parser.
+    #[test]
+    fn the_packet_size_flag_is_parsed() {
+        let config = config_of(&["--packet-size", "1400"]);
+        assert_eq!(config.packet_size, 1400);
+        // The QUIC minimum is the default.
+        let config = config_of(&[]);
+        assert_eq!(config.packet_size, 1200);
+
+        let cli = Cli::try_parse_from(go_style_flags(
+            [
+                "ssh3",
+                "-packet-size",
+                "1400",
+                "https://localhost:4433/ssh3-term",
+            ]
+            .map(String::from),
+        ))
+        .unwrap();
+        assert_eq!(cli.packet_size, Some(1400));
+
+        assert!(Cli::try_parse_from(["ssh3", "--packet-size", "big"]).is_err());
+    }
+
     #[test]
     fn the_no_session_flag_refuses_a_remote_command() {
         let err =
@@ -2455,6 +2533,27 @@ mod tests {
         .unwrap();
         let err = build_transfer_config(cli).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    /// The `--sftp` spelling of the Go and C implementations (the scp canon)
+    /// rides the transfer mode as its deprecated visible alias, and the
+    /// reference single-dash form `-sftp` parses as well.
+    #[test]
+    fn the_sftp_alias_rides_the_transfer_mode() {
+        let arguments = [
+            "ssh3",
+            "--sftp",
+            "/tmp/local-file",
+            "max@host:/tmp/remote-file",
+        ];
+        let cli = Cli::try_parse_from(arguments).unwrap();
+        assert!(cli.transfer);
+        let plan = build_transfer_config(cli).unwrap();
+        let transfer = plan.transfer.expect("the alias starts the transfer mode");
+        assert!(transfer.upload);
+
+        let cli = Cli::try_parse_from(go_style_flags(arguments.map(String::from))).unwrap();
+        assert!(cli.transfer);
     }
 
     #[test]
@@ -2502,6 +2601,71 @@ mod tests {
         assert_eq!(config.local_forwards.len(), 1);
         assert_eq!(config.local_forwards[0].bind_port, 8080);
         assert_eq!(config.local_forwards[0].target_host, "example.com");
+    }
+
+    /// The deprecated `-forward-tcp` / `-forward-udp` aliases of the
+    /// reference join the `-L` forwards with their historical
+    /// localport/remoteip@remoteport shape: the datagram alias rides first,
+    /// the order of the reference, and the reference single-dash spelling
+    /// parses as well.
+    #[test]
+    fn the_legacy_forward_flags_build_local_forwards() {
+        let config = config_of(&[
+            "-L",
+            "9090:example.com:90",
+            "--forward-udp",
+            "5353/192.0.2.53@53",
+            "--forward-tcp",
+            "8080/192.0.2.1@80",
+        ]);
+        assert_eq!(config.local_forwards.len(), 3);
+        assert_eq!(config.local_forwards[0].bind_port, 9090);
+        let udp = &config.local_forwards[1];
+        assert_eq!(udp.protocol, Ssh3ForwardProtocol::Udp);
+        assert_eq!(udp.bind_port, 5353);
+        assert_eq!(udp.target_host, "192.0.2.53");
+        assert_eq!(udp.target_port, 53);
+        let tcp = &config.local_forwards[2];
+        assert_eq!(tcp.protocol, Ssh3ForwardProtocol::Tcp);
+        assert_eq!(tcp.bind_port, 8080);
+        assert_eq!(tcp.target_host, "192.0.2.1");
+        assert_eq!(tcp.target_port, 80);
+
+        // The single-dash spelling of the reference rides the rewrite.
+        let cli = Cli::try_parse_from(go_style_flags(
+            [
+                "ssh3",
+                "-forward-tcp",
+                "8080/192.0.2.1@80",
+                "https://localhost:4433/ssh3-term",
+            ]
+            .map(String::from),
+        ))
+        .unwrap();
+        assert_eq!(cli.forward_tcp.as_deref(), Some("8080/192.0.2.1@80"));
+    }
+
+    /// A broken value of the legacy forward aliases costs a process start
+    /// and nothing else: the reference aborts instead of continuing without
+    /// the forward.
+    #[test]
+    fn a_malformed_legacy_forward_is_refused() {
+        for spec in [
+            "8080/example.com@80",
+            "8080/192.0.2.1",
+            "8080/192.0.2.1@0",
+            "not-a-port/192.0.2.1@80",
+        ] {
+            let cli = Cli::try_parse_from([
+                "ssh3",
+                "--forward-tcp",
+                spec,
+                "https://localhost:4433/ssh3-term",
+            ])
+            .unwrap();
+            let err = build_config(cli).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ValueValidation, "{spec:?}");
+        }
     }
 
     #[test]
