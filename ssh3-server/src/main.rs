@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use clap::{Parser, ValueHint, error::ErrorKind};
 use ssh3_server::{
-    ForwardPolicy, GatewayPortsPolicy, InternalSftpOptions, SftpJailMode, Ssh3ServerConfig,
-    parse_duration, run_internal_sftp_server, run_with_self_signed, shutdown_drain_period,
+    ForwardPolicy, GatewayPortsPolicy, InternalSftpOptions, LogLevel, SftpJailMode,
+    Ssh3ServerConfig, log_error, log_warn, logging, parse_duration, run_internal_sftp_server,
+    run_with_self_signed, shutdown_drain_period,
 };
 
 /// The environment variables the server options can be set with.
@@ -29,6 +30,8 @@ const ENV_ENABLE_PASSWORD_LOGIN: &str = "SSH3_ENABLE_PASSWORD_LOGIN";
 const ENV_SFTP_JAIL: &str = "SSH3_SFTP_JAIL";
 const ENV_MAX_SFTP_SESSIONS: &str = "SSH3_MAX_SFTP_SESSIONS_PER_USER";
 const ENV_SHUTDOWN_DRAIN: &str = "SSH3_SHUTDOWN_DRAIN";
+const ENV_LOG_LEVEL: &str = "SSH3_LOG_LEVEL";
+const ENV_LOG_FILE: &str = "SSH3_LOG_FILE";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -268,7 +271,7 @@ fn env_duration(env: &impl EnvLookup, name: &str) -> Option<Duration> {
     match parse_duration(&value) {
         Ok(duration) => Some(duration),
         Err(err) => {
-            eprintln!("ssh3-rust-server ignoring {name}: {err}");
+            log_warn!("ssh3-rust-server ignoring {name}: {err}");
             None
         }
     }
@@ -280,7 +283,7 @@ fn env_number<T: std::str::FromStr>(env: &impl EnvLookup, name: &str) -> Option<
     match value.parse::<T>() {
         Ok(number) => Some(number),
         Err(_) => {
-            eprintln!("ssh3-rust-server ignoring {name}: {value:?} is not a number");
+            log_warn!("ssh3-rust-server ignoring {name}: {value:?} is not a number");
             None
         }
     }
@@ -463,7 +466,7 @@ fn build_config_with_env(cli: Cli, env: &impl EnvLookup) -> Result<Ssh3ServerCon
         };
     }
     if config.sftp_jail.effective() != config.sftp_jail {
-        eprintln!(
+        log_warn!(
             "ssh3-rust-server the {} jail of the sftp subsystem needs a unix platform, using the {} jail",
             config.sftp_jail,
             config.sftp_jail.effective()
@@ -488,11 +491,24 @@ fn build_config_with_env(cli: Cli, env: &impl EnvLookup) -> Result<Ssh3ServerCon
     // for it, like there is none in the Go implementation)
     config.shutdown_drain = shutdown_drain_period(env.lookup(ENV_SHUTDOWN_DRAIN).as_deref());
 
+    // the log of the daemon: the SSH3_LOG_LEVEL / SSH3_LOG_FILE pair of the
+    // Go reference (`cmd/ssh3-server.go:1238-1251`); there is no command
+    // line counterpart, like in the Go implementation
+    if let Some(value) = env_value(env, ENV_LOG_LEVEL) {
+        config.log_level = LogLevel::parse_default(&value);
+    }
+    if let Some(file) = env_value(env, ENV_LOG_FILE) {
+        config.log_file = Some(PathBuf::from(file));
+    }
+
     Ok(config)
 }
 
 /// Runs the internal SFTP child of the chroot jail.
 async fn run_internal_child(cli: &Cli) -> ExitCode {
+    // The child of the reference serves the protocol over its standard
+    // streams with an error-only log (`cmd/internal_sftp.go:40`).
+    logging::set_level(LogLevel::Error);
     let options = InternalSftpOptions {
         chroot_dir: cli.sftp_chroot.clone(),
         root_dir: cli.sftp_root.clone(),
@@ -502,7 +518,7 @@ async fn run_internal_child(cli: &Cli) -> ExitCode {
     match run_internal_sftp_server(options).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("ssh3-rust-server the internal sftp server failed: {err}");
+            log_error!("ssh3-rust-server the internal sftp server failed: {err}");
             ExitCode::FAILURE
         }
     }
@@ -540,10 +556,26 @@ async fn main() -> ExitCode {
         }
     };
 
+    // The log of the daemon: the level and the file of the reference
+    // (`cmd/ssh3-server.go:1228-1258`), the standard error under systemd
+    // and `/var/log/ssh3.log` otherwise. A file that cannot be opened ends
+    // the run on the standard error, the way the reference exits.
+    let under_systemd = std::env::var_os("INVOCATION_ID").is_some_and(|id| !id.is_empty());
+    let log_path = logging::effective_log_path(config.log_file.as_deref(), under_systemd);
+    if let Err(err) = logging::init(config.log_level, log_path.as_deref()) {
+        if let Some(path) = &log_path {
+            eprintln!(
+                "ssh3-rust-server cannot open log file {}: {err}",
+                path.display()
+            );
+        }
+        return ExitCode::FAILURE;
+    }
+
     match run_with_self_signed(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("ssh3-rust-server failed: {err}");
+            log_error!("ssh3-rust-server failed: {err}");
             ExitCode::FAILURE
         }
     }

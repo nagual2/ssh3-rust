@@ -21,6 +21,7 @@
 //! | Module | Responsibility |
 //! |---|---|
 //! | `config` | [`Ssh3ServerConfig`] and the defaults it is built from |
+//! | `logging` | the leveled log of the daemon, the `SSH3_LOG_LEVEL` / `SSH3_LOG_FILE` pair of the reference |
 //! | `auth` | request authorization: bearer tokens, OIDC identities, passwords, DoS guards |
 //! | `session` | session channels, process spawning, agent forwarding |
 //! | `pty` | pseudo-terminal allocation, sizing and signal delivery |
@@ -42,6 +43,7 @@ mod dynamic_forward;
 mod error;
 mod forwarding;
 mod forwarding_wire;
+pub mod logging;
 mod pty;
 mod reverse_forward;
 mod runtime;
@@ -66,6 +68,7 @@ pub use config::{
 pub use error::Ssh3ServerError;
 pub use forwarding::{ForwardPolicy, check_listen_target};
 pub use forwarding_wire::Ssh3ForwardingWireError;
+pub use logging::LogLevel;
 pub use runtime::{serve_connection, serve_endpoint, serve_endpoint_until_shutdown};
 pub use sftp::SftpSessionBudget;
 pub use sftp_child::{InternalSftpOptions, run_internal_sftp_server};

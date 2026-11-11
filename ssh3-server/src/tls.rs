@@ -11,6 +11,7 @@ use ssh3_quinn::self_signed_server_config;
 
 use crate::config::{Ssh3ServerConfig, validate_server_config};
 use crate::error::Ssh3ServerError;
+use crate::log_warn;
 use crate::runtime::serve_endpoint_until_shutdown;
 use crate::shutdown::{ShutdownSignal, shutdown_signal};
 
@@ -41,7 +42,7 @@ fn server_transport_config(config: &Ssh3ServerConfig) -> quinn::TransportConfig 
     transport.max_idle_timeout(match quinn::IdleTimeout::try_from(config.max_idle_timeout) {
         Ok(idle_timeout) => Some(idle_timeout),
         Err(_) => {
-            eprintln!(
+            log_warn!(
                 "ssh3-rust-server the idle timeout of {}s does not fit into the QUIC transport parameters, the idle timeout is disabled",
                 config.max_idle_timeout.as_secs()
             );

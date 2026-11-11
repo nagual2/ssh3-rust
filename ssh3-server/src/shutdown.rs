@@ -13,6 +13,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::config::DEFAULT_SHUTDOWN_DRAIN;
+use crate::log_error;
+use crate::log_warn;
 
 /// The application error code a connection is closed with when a graceful
 /// shutdown ends it: the `ApplicationErrorCode(0)` of the Go reference.
@@ -38,7 +40,7 @@ pub fn shutdown_drain_period(value: Option<&str>) -> Duration {
             // the cast is guarded by the comparison above
             Ok(seconds) if seconds >= 0 => return Duration::from_secs(seconds as u64),
             _ => {
-                eprintln!(
+                log_warn!(
                     "ssh3-rust-server invalid SSH3_SHUTDOWN_DRAIN {value:?}, using the default"
                 );
             }
@@ -145,7 +147,7 @@ pub async fn shutdown_signal() {
                 });
             }
             (Err(err), _) | (_, Err(err)) => {
-                eprintln!("ssh3-rust-server cannot listen for the shutdown signals: {err}");
+                log_error!("ssh3-rust-server cannot listen for the shutdown signals: {err}");
                 std::future::pending::<()>().await;
             }
         }
@@ -162,7 +164,7 @@ pub async fn shutdown_signal() {
                 tokio::spawn(async { while tokio::signal::ctrl_c().await.is_ok() {} });
             }
             Err(err) => {
-                eprintln!("ssh3-rust-server cannot listen for Ctrl-C: {err}");
+                log_error!("ssh3-rust-server cannot listen for Ctrl-C: {err}");
                 std::future::pending::<()>().await;
             }
         }

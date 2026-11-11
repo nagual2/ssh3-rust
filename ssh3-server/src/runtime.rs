@@ -35,6 +35,9 @@ use crate::error::{
     is_benign_server_error,
 };
 use crate::forwarding::{ForwardingState, handle_tcp_forwarding, handle_udp_forwarding};
+use crate::log_error;
+use crate::log_info;
+use crate::log_warn;
 use crate::reverse_forward::{CHANNEL_TYPE_REVERSE_FORWARD, handle_reverse_forward_channel};
 use crate::session::{
     AgentForwardingSlot, SessionUser, handle_plain_channel, resolve_session_user,
@@ -98,7 +101,7 @@ pub async fn serve_endpoint_until_shutdown(
         tokio::select! {
             _ = shutdown.wait(), if !shutdown_requested => {
                 shutdown_requested = true;
-                eprintln!("ssh3-rust-server shutdown signal received: no longer accepting new connections");
+                log_info!("ssh3-rust-server shutdown signal received: no longer accepting new connections");
                 if config.shutdown_drain == Duration::ZERO {
                     // a drain of zero closes every connection immediately,
                     // like the Go reference skips its drain and lets the
@@ -122,7 +125,7 @@ pub async fn serve_endpoint_until_shutdown(
                 }
                 let config = config.clone();
                 let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
-                    eprintln!(
+                    log_warn!(
                         "ssh3-rust-server too many connections ({} active), refusing the incoming connection",
                         config.max_connections
                     );
@@ -145,17 +148,17 @@ pub async fn serve_endpoint_until_shutdown(
                             slot.establish(&connection);
                             if let Err(err) = serve_connection(connection, config).await {
                                 if !is_benign_server_error(&err) {
-                                    eprintln!("ssh3-rust-server connection error: {err}");
+                                    log_error!("ssh3-rust-server connection error: {err}");
                                 }
                             }
                         }
                         Ok(Err(err)) => {
                             if !is_benign_connection_error(&err) {
-                                eprintln!("ssh3-rust-server accept error: {err}");
+                                log_error!("ssh3-rust-server accept error: {err}");
                             }
                         }
                         Err(_) => {
-                            eprintln!(
+                            log_info!(
                                 "ssh3-rust-server handshake timed out after {}s",
                                 handshake_idle_timeout.as_secs()
                             );
@@ -173,7 +176,7 @@ pub async fn serve_endpoint_until_shutdown(
     }
 
     if config.shutdown_drain > Duration::ZERO {
-        eprintln!(
+        log_info!(
             "ssh3-rust-server shutdown: draining active connections up to {:?}",
             config.shutdown_drain
         );
@@ -205,16 +208,16 @@ pub async fn serve_endpoint_until_shutdown(
             }
         }
         if drained {
-            eprintln!("ssh3-rust-server shutdown: all connections finished");
+            log_info!("ssh3-rust-server shutdown: all connections finished");
         } else {
             let remaining = tracker.close_remaining();
-            eprintln!(
+            log_warn!(
                 "ssh3-rust-server shutdown: drain timeout, closing {remaining} remaining connections"
             );
         }
     }
 
-    eprintln!("ssh3-rust-server shutdown complete");
+    log_info!("ssh3-rust-server shutdown complete");
     Ok(())
 }
 
@@ -341,7 +344,7 @@ pub async fn serve_connection(
             // the aborted phase), so the connection is closed the quiet way
             // of the refusal path, without a status the peer could mistake
             // for a credential verdict
-            eprintln!(
+            log_info!(
                 "ssh3-rust-server the pre-auth phase timed out after {}s, closing the connection",
                 config.handshake_idle_timeout.as_secs()
             );
@@ -473,7 +476,7 @@ async fn authorize_conversation(
     }
 
     let Some(_unauthenticated_slot) = UnauthenticatedSlot::try_acquire(config) else {
-        eprintln!(
+        log_warn!(
             "ssh3-rust-server too many unauthenticated conversations ({} active), refusing the request",
             config.max_unauthenticated_conversations
         );
@@ -589,7 +592,7 @@ async fn handle_conversation(
                     // instead of a silently dead channel
                     let Ok(permit) = channel_budget.clone().try_acquire_owned() else {
                         let channel = accepted_channel.channel().clone();
-                        eprintln!(
+                        log_warn!(
                             "ssh3-rust-server refusing channel {} of the conversation: the {}-channel budget is exhausted",
                             channel.channel_id(),
                             config.max_channels_per_conversation
@@ -618,7 +621,7 @@ async fn handle_conversation(
                         .await
                         {
                             if !is_benign_server_error(&err) {
-                                eprintln!("ssh3-rust-server channel error: {err}");
+                                log_error!("ssh3-rust-server channel error: {err}");
                             }
                         }
                     });

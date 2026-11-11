@@ -1927,10 +1927,15 @@ async fn main() -> ExitCode {
             return status;
         }
     };
-    // The diagnostic level of this invocation rides the `-q` / `-v` pair:
-    // the errors stay in every mode, the quiet hides the diagnostics, the
-    // verbose adds the connection details.
-    ssh3_client::log::configure(cli.quiet, cli.verbose);
+    // The diagnostic level of this invocation rides the `-q` / `-v` pair
+    // and the SSH3_LOG_LEVEL of the reference (cmd/ssh3.go:1335-1343): the
+    // exact `trace` spelling of the variable beats the flags, every other
+    // name yields to them, the errors stay in every mode.
+    ssh3_client::log::configure_with_env(
+        cli.quiet,
+        cli.verbose,
+        std::env::var("SSH3_LOG_LEVEL").ok().as_deref(),
+    );
     // The version string is printed on the standard output, like the Go
     // implementation does, and the connection is not opened.
     if cli.print_version {

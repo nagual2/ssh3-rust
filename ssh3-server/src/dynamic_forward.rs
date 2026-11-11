@@ -28,6 +28,10 @@ use crate::forwarding_wire::{
     DynamicForwardReply, DynamicForwardRequest, DynamicForwardTarget, DynamicForwardTargetReply,
     Ssh3ForwardingWireError,
 };
+use crate::log_debug;
+use crate::log_error;
+use crate::log_info;
+use crate::log_warn;
 
 /// Channel type of the control channel a client opens to announce a dynamic
 /// forward.
@@ -113,7 +117,7 @@ pub(crate) async fn handle_dynamic_forward_channel(
     let request = match read_dynamic_forward_request(&channel).await {
         Ok(request) => request,
         Err(err) => {
-            eprintln!("ssh3-rust-server invalid dynamic forwarding request: {err}");
+            log_warn!("ssh3-rust-server invalid dynamic forwarding request: {err}");
             let _ = channel.close().await;
             return Ok(());
         }
@@ -121,7 +125,7 @@ pub(crate) async fn handle_dynamic_forward_channel(
 
     let bind_address = dynamic_forward_bind_address(&request.bind_address);
     if !is_loopback_bind(&bind_address) {
-        eprintln!(
+        log_warn!(
             "ssh3-rust-server dynamic forwarding announced for a non-loopback client bind ({bind_address}:{}): the SOCKS listener is reachable from other hosts",
             request.bind_port
         );
@@ -135,11 +139,11 @@ pub(crate) async fn handle_dynamic_forward_channel(
         error: String::new(),
     };
     if let Err(err) = write_payload(&channel, &reply.encode()).await {
-        eprintln!("ssh3-rust-server could not send the dynamic forwarding reply: {err}");
+        log_error!("ssh3-rust-server could not send the dynamic forwarding reply: {err}");
         let _ = channel.close().await;
         return Ok(());
     }
-    eprintln!(
+    log_info!(
         "ssh3-rust-server dynamic forwarding (-D) enabled for the client bind {bind_address}:{}",
         request.bind_port
     );
@@ -152,7 +156,7 @@ pub(crate) async fn handle_dynamic_forward_channel(
             message = channel.next_message() => {
                 match message {
                     Ok(ssh3_proto::Ssh3Message::Data(data)) if !data.data.is_empty() => {
-                        eprintln!(
+                        log_debug!(
                             "ssh3-rust-server ignoring {} unexpected data bytes on the dynamic forwarding control channel",
                             data.data.len()
                         );
@@ -210,16 +214,17 @@ pub(crate) async fn handle_dynamic_forward_data_channel(
     let target = match read_dynamic_forward_target(&channel).await {
         Ok(target) => target,
         Err(err) => {
-            eprintln!("ssh3-rust-server invalid dynamic forwarding target: {err}");
+            log_warn!("ssh3-rust-server invalid dynamic forwarding target: {err}");
             let _ = channel.close().await;
             return Ok(());
         }
     };
 
     let Some(session) = state.dynamic_session() else {
-        eprintln!(
+        log_warn!(
             "ssh3-rust-server refusing the dynamic forwarding target {}:{}: no dynamic forwarding session",
-            target.address, target.port
+            target.address,
+            target.port
         );
         let reply = DynamicForwardTargetReply {
             error: "no dynamic forwarding session on this connection".to_string(),
@@ -238,9 +243,10 @@ pub(crate) async fn handle_dynamic_forward_data_channel(
         target.port,
         config.permit_open.as_ref(),
     ) {
-        eprintln!(
+        log_warn!(
             "ssh3-rust-server refusing the dynamic forwarding target {}:{}: {err}",
-            target.address, target.port
+            target.address,
+            target.port
         );
         let reply = DynamicForwardTargetReply {
             error: err.to_string(),
@@ -253,9 +259,10 @@ pub(crate) async fn handle_dynamic_forward_data_channel(
     let address = match resolve_dynamic_target(&target.address, target.port).await {
         Ok(address) => address,
         Err(err) => {
-            eprintln!(
+            log_error!(
                 "ssh3-rust-server could not resolve the dynamic forwarding target {}:{}: {err}",
-                target.address, target.port
+                target.address,
+                target.port
             );
             let reply = DynamicForwardTargetReply {
                 error: err.to_string(),
@@ -269,7 +276,7 @@ pub(crate) async fn handle_dynamic_forward_data_channel(
     let stream = match TcpStream::connect(address).await {
         Ok(stream) => stream,
         Err(err) => {
-            eprintln!(
+            log_error!(
                 "ssh3-rust-server could not dial the dynamic forwarding target {address}: {err}"
             );
             let reply = DynamicForwardTargetReply {
@@ -286,7 +293,7 @@ pub(crate) async fn handle_dynamic_forward_data_channel(
             "too many open dynamic forwarding connections ({})",
             crate::forwarding::MAX_DYNAMIC_FORWARD_CONNECTIONS
         );
-        eprintln!(
+        log_warn!(
             "ssh3-rust-server not bridging the dynamic forwarding target {address}: {reason}"
         );
         let reply = DynamicForwardTargetReply { error: reason };
@@ -300,7 +307,7 @@ pub(crate) async fn handle_dynamic_forward_data_channel(
         error: String::new(),
     };
     if let Err(err) = write_payload(&channel, &reply.encode()).await {
-        eprintln!("ssh3-rust-server could not acknowledge the dynamic forwarding target: {err}");
+        log_error!("ssh3-rust-server could not acknowledge the dynamic forwarding target: {err}");
         session.release_connection();
         drop(stream);
         let _ = channel.close().await;
@@ -312,7 +319,7 @@ pub(crate) async fn handle_dynamic_forward_data_channel(
     if let Err(err) = result
         && !is_benign_server_error(&err)
     {
-        eprintln!("ssh3-rust-server dynamic forwarding bridge error: {err}");
+        log_error!("ssh3-rust-server dynamic forwarding bridge error: {err}");
     }
     Ok(())
 }

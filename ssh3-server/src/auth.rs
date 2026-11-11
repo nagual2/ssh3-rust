@@ -36,6 +36,8 @@ use ssh3_auth::{
 };
 
 use crate::config::Ssh3ServerConfig;
+use crate::log_error;
+use crate::log_warn;
 use crate::session::SessionUser;
 
 /// Credentials extracted from the `Authorization` header of a CONNECT request.
@@ -523,14 +525,14 @@ pub(crate) async fn authorize_request(
             // account never authenticates by password, whatever its shadow
             // entry says
             if password_login_refused(username) {
-                eprintln!(
+                log_warn!(
                     "ssh3-rust-server password auth for {username} refused: the root account authenticates by key only"
                 );
                 return Ok(AuthOutcome::Unauthorized);
             }
 
             if config.auth_guard.password_locked(username) {
-                eprintln!(
+                log_warn!(
                     "ssh3-rust-server password auth for {username} refused: the account is locked out"
                 );
                 return Ok(AuthOutcome::TooManyRequests);
@@ -542,7 +544,7 @@ pub(crate) async fn authorize_request(
                     // a failing password backend is booked as a failed
                     // attempt as well, so a broken backend cannot be used to
                     // brute-force the account
-                    eprintln!("ssh3-rust-server password auth for {username} failed: {err}");
+                    log_error!("ssh3-rust-server password auth for {username} failed: {err}");
                     false
                 }
             };

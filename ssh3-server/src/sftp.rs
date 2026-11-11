@@ -42,6 +42,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::config::{SftpJailMode, Ssh3ServerConfig};
 use crate::error::Ssh3ServerError;
+use crate::log_error;
+use crate::log_warn;
 use crate::session::SessionUser;
 use crate::sftp_child;
 use crate::sftp_stream::ChannelStream;
@@ -815,7 +817,7 @@ pub(crate) async fn handle_sftp_channel(
 ) -> Result<(), Ssh3ServerError> {
     let budget = &config.sftp_budget;
     if !budget.try_acquire(&session_user.username, config.max_sftp_sessions_per_user) {
-        eprintln!(
+        log_warn!(
             "ssh3-rust-server user {} hit the concurrent sftp session limit, refusing the sftp channel {}",
             session_user.username,
             channel.channel_id()
@@ -851,7 +853,7 @@ async fn serve_sftp_channel(
                     serve_sftp_in_process(channel, &jail_root, false, owner).await
                 }
                 Err(error) => {
-                    eprintln!(
+                    log_error!(
                         "ssh3-rust-server could not start the sftp child for the channel {}: {error}",
                         channel.channel_id()
                     );
@@ -878,7 +880,7 @@ pub(crate) async fn serve_sftp_in_process(
     let jail = match SftpJail::new(jail_root.to_path_buf(), chrooted) {
         Ok(jail) => jail,
         Err(error) => {
-            eprintln!(
+            log_error!(
                 "ssh3-rust-server could not open the sftp jail {}: {error}",
                 jail_root.display()
             );

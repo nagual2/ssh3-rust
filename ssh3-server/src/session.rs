@@ -38,6 +38,8 @@ use crate::config::Ssh3ServerConfig;
 use crate::error::Ssh3ServerError;
 #[cfg(unix)]
 use crate::error::is_benign_server_error;
+#[cfg(unix)]
+use crate::log_error;
 use crate::pty::PendingPty;
 #[cfg(unix)]
 use crate::pty::{PtyController, SessionPtySize, spawn_pty_session_process};
@@ -857,7 +859,7 @@ async fn open_agent_socket_and_forward_agent(
                 let (stream, _) = match listener.accept().await {
                     Ok(stream) => stream,
                     Err(err) => {
-                        eprintln!("ssh3-rust-server agent socket accept error: {err}");
+                        log_error!("ssh3-rust-server agent socket accept error: {err}");
                         return;
                     }
                 };
@@ -874,7 +876,7 @@ async fn open_agent_socket_and_forward_agent(
                     .await
                     {
                         if !is_benign_server_error(&err) {
-                            eprintln!("ssh3-rust-server agent forwarding error: {err}");
+                            log_error!("ssh3-rust-server agent forwarding error: {err}");
                         }
                     }
                 });

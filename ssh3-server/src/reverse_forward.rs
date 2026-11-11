@@ -30,6 +30,9 @@ use crate::forwarding_wire::{
     FORWARDING_PROTOCOL_TCP, FORWARDING_PROTOCOL_UDP, ReverseForwardReply, ReverseForwardRequest,
     Ssh3ForwardingWireError,
 };
+use crate::log_error;
+use crate::log_info;
+use crate::log_warn;
 use crate::session::SessionUser;
 
 /// Channel type of the control channel a client opens to request a reverse
@@ -231,7 +234,7 @@ pub(crate) async fn handle_reverse_forward_channel(
     let request = match read_reverse_forward_request(&channel).await {
         Ok(request) => request,
         Err(err) => {
-            eprintln!("ssh3-rust-server invalid reverse-forwarding request: {err}");
+            log_warn!("ssh3-rust-server invalid reverse-forwarding request: {err}");
             let _ = channel.close().await;
             return Ok(());
         }
@@ -239,9 +242,11 @@ pub(crate) async fn handle_reverse_forward_channel(
 
     let bind = resolve_reverse_forward_bind(config.gateway_ports, &request.bind_address);
     if bind.restricted {
-        eprintln!(
+        log_warn!(
             "ssh3-rust-server the GatewayPorts={:?} policy restricted the client-requested bind {:?} to {:?}",
-            config.gateway_ports, request.bind_address, bind.address
+            config.gateway_ports,
+            request.bind_address,
+            bind.address
         );
     }
     let bind_address = bind.address;
@@ -253,7 +258,7 @@ pub(crate) async fn handle_reverse_forward_channel(
             "too many reverse forwards for user {} (limit {})",
             session_user.username, config.max_reverse_forwards_per_user
         );
-        eprintln!("ssh3-rust-server {reason}");
+        log_warn!("ssh3-rust-server {reason}");
         write_reverse_forward_reply(
             &channel,
             &ReverseForwardReply {
@@ -312,7 +317,7 @@ pub(crate) async fn handle_reverse_forward_channel(
     if let Err(err) =
         check_listen_target(listen_kind, socket_address, config.permit_listen.as_ref())
     {
-        eprintln!("ssh3-rust-server refusing the reverse-forward bind: {err}");
+        log_warn!("ssh3-rust-server refusing the reverse-forward bind: {err}");
         let reason = err.to_string();
         write_reverse_forward_reply(
             &channel,
@@ -347,11 +352,11 @@ pub(crate) async fn handle_reverse_forward_channel(
             let bound_address = listener.local_addr().unwrap_or(socket_address);
             let bound_port = bound_address.port();
             if !bound_address.ip().is_loopback() {
-                eprintln!(
+                log_warn!(
                     "ssh3-rust-server the reverse forward binds a non-loopback address ({bound_address}): the port is reachable from other hosts"
                 );
             }
-            eprintln!(
+            log_info!(
                 "ssh3-rust-server reverse forwarding TCP {bound_address} towards the client target {target}"
             );
             write_reverse_forward_reply(
@@ -383,7 +388,7 @@ pub(crate) async fn handle_reverse_forward_channel(
             };
             let bound_address = socket.local_addr().unwrap_or(socket_address);
             let bound_port = bound_address.port();
-            eprintln!(
+            log_info!(
                 "ssh3-rust-server reverse forwarding UDP {bound_address} towards the client target {target}"
             );
             write_reverse_forward_reply(
@@ -428,14 +433,14 @@ async fn serve_reverse_tcp(
             accepted = listener.accept() => match accepted {
                 Ok(accepted) => accepted,
                 Err(err) => {
-                    eprintln!("ssh3-rust-server error while accepting on the reverse-forwarded listener: {err}");
+                    log_error!("ssh3-rust-server error while accepting on the reverse-forwarded listener: {err}");
                     return Ok(());
                 }
             },
         };
 
         if !state.acquire_forwarded_channel() {
-            eprintln!(
+            log_warn!(
                 "ssh3-rust-server too many open forwarded channels, dropping the connection from {peer}"
             );
             drop(stream);
@@ -462,7 +467,7 @@ async fn serve_reverse_tcp(
             {
                 Ok(channel) => channel,
                 Err(err) => {
-                    eprintln!(
+                    log_error!(
                         "ssh3-rust-server could not open the forwarded-tcp channel for the connection from {peer}: {err}"
                     );
                     state.release_forwarded_channel();
@@ -474,7 +479,7 @@ async fn serve_reverse_tcp(
             if let Err(err) = result
                 && !is_benign_server_error(&err)
             {
-                eprintln!("ssh3-rust-server reverse-forwarded connection error: {err}");
+                log_error!("ssh3-rust-server reverse-forwarded connection error: {err}");
             }
         });
     }
@@ -498,7 +503,7 @@ async fn serve_reverse_udp(
             received = socket.recv_from(&mut buffer) => match received {
                 Ok(received) => received,
                 Err(err) => {
-                    eprintln!("ssh3-rust-server error while reading on the reverse-forwarded socket: {err}");
+                    log_error!("ssh3-rust-server error while reading on the reverse-forwarded socket: {err}");
                     return Ok(());
                 }
             },
@@ -508,7 +513,7 @@ async fn serve_reverse_udp(
             Entry::Occupied(entry) => entry.get().clone(),
             Entry::Vacant(entry) => {
                 if !state.acquire_forwarded_channel() {
-                    eprintln!(
+                    log_warn!(
                         "ssh3-rust-server too many open forwarded channels, dropping the datagram from {peer}"
                     );
                     continue;
@@ -526,7 +531,7 @@ async fn serve_reverse_udp(
                 {
                     Ok(channel) => channel,
                     Err(err) => {
-                        eprintln!(
+                        log_error!(
                             "ssh3-rust-server could not open the forwarded-udp channel for the peer {peer}: {err}"
                         );
                         state.release_forwarded_channel();
@@ -541,7 +546,7 @@ async fn serve_reverse_udp(
         };
 
         if let Err(err) = channel.send_datagram(buffer[..length].to_vec()).await {
-            eprintln!(
+            log_error!(
                 "ssh3-rust-server could not send the datagram on the forwarded-udp channel: {err}"
             );
         }

@@ -27,6 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use crate::error::Ssh3ServerError;
+use crate::log_warn;
 use crate::session::SessionUser;
 use crate::sftp::SftpJail;
 use crate::sftp_stream::{ChannelStream, StdioStream};
@@ -145,7 +146,7 @@ pub(crate) async fn spawn_chroot_child(
     if let Ok(status) = &status
         && !status.success()
     {
-        eprintln!("ssh3-rust-server the sftp child ended with {status}");
+        log_warn!("ssh3-rust-server the sftp child ended with {status}");
     }
     // the pumps are unblocked when the peer keeps the channel open past the
     // death of the child; the close of the channel does the final teardown

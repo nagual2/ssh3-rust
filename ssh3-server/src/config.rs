@@ -13,6 +13,7 @@ use ssh3_h3::SSH3_VERSION_STRING;
 use crate::auth::{Ssh3AuthGuard, password_auth_available};
 use crate::error::Ssh3ServerError;
 use crate::forwarding::ForwardPolicy;
+use crate::logging::LogLevel;
 use crate::sftp::SftpSessionBudget;
 
 /// Callback that decides whether a username/password pair is valid.
@@ -261,6 +262,19 @@ pub struct Ssh3ServerConfig {
     /// The budget is shared by the conversations of the server: the sessions
     /// of a user are counted across them.
     pub sftp_budget: Arc<SftpSessionBudget>,
+    /// The level of the daemon log, the `SSH3_LOG_LEVEL` of the Go
+    /// reference (`util/util.go:64`).
+    ///
+    /// The names of the reference parse case-insensitively (`trace`,
+    /// `debug`, `info`, `warning`, `error`); an unknown name keeps the
+    /// `warn` default.
+    pub log_level: LogLevel,
+    /// The log file of the daemon, the `SSH3_LOG_FILE` of the Go reference
+    /// (`cmd/ssh3-server.go:1242-1251`).
+    ///
+    /// `None` keeps the behavior of the reference: the standard error when
+    /// the run is under systemd, `/var/log/ssh3.log` otherwise.
+    pub log_file: Option<PathBuf>,
 }
 
 impl fmt::Debug for Ssh3ServerConfig {
@@ -316,6 +330,8 @@ impl fmt::Debug for Ssh3ServerConfig {
             )
             .field("sftp_root", &self.sftp_root)
             .field("sftp_budget", &self.sftp_budget)
+            .field("log_level", &self.log_level)
+            .field("log_file", &self.log_file)
             .finish()
     }
 }
@@ -355,6 +371,8 @@ impl Default for Ssh3ServerConfig {
             max_sftp_sessions_per_user: DEFAULT_MAX_SFTP_SESSIONS_PER_USER,
             sftp_root: None,
             sftp_budget: Arc::new(SftpSessionBudget::new()),
+            log_level: LogLevel::default(),
+            log_file: None,
         }
     }
 }
