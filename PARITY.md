@@ -382,6 +382,18 @@
 | 4 | Эшелон 3 — дорогие | 55 | ACME, control master, proxy jump (+ бюджет датаграмм), man-страницы, аудит, **сжатие тела канала** |
 | | **Итого** | **≈ 80** | Из них эшелоны 0–2 (до полезного «второго стека» без ACME/control master/proxy jump/сжатия) — **≈ 25** |
 
+### 4.5. Хвосты без плановых строк (внесено 2026-11-02)
+
+Сверка покрытия (запрос Пилота: «rust отстаёт — проверь, чтобы всё было в плане»): пять пробелов таблицы §2 не имели строк ни в одном эшелоне §4. Внесены здесь; в сводку §1 добавят ≈ 2–3 дня.
+
+| № | Шаг | Что делать | Файлы | Критерий готовности | Чел.-дней | Эшелон |
+|---|-----|-----------|-------|---------------------|-----------|--------|
+| H8 | `-packet-size` / `-initial-packet-size` | Применять значение к `TransportConfig` quinn (`initial_mtu`/`min_mtu`), клиент и сервер | `ssh3-quinn/src/config.rs` | Флаг меняет фактический initial packet; тест с релеем-фильтром MTU, как у эталона | 0.5 | 2 |
+| H9 | Отключение path-MTU discovery (сервер, туннелированные соединения) | `TransportConfig` quinn: `mtu_discovery` off; в `-J`-туннеле — всегда off (сейчас выключен только бюджетом), глобальный серверный дефолт как в Go | `ssh3-quinn/src/config.rs`, `ssh3-server/src/tls.rs` | Сервер не растит пакеты выше initial; jumbo-замер (методика эталона B11) воспроизводит 1439-потолок Go или задокументированное расхождение | 0.5 | 2 |
+| B14 | `-f` — уход в фон | ssh2-канон: detached re-exec (`SSH3_F_DAEMON=1`, своя группа, stdin=null), отказ при интерактивных конфигах (пароль, OIDC-браузер, ask-хост) — по эталону `cmd/background.go` | `ssh3-client/src/main.rs`, `ssh3-client/src/lib.rs` | `-f -N -L …` держит форварды после выхода родителя; Windows — foreground с предупреждением, как в эталоне | 1.5 | 2 |
+| C5 | Legacy-алиасы `-forward-tcp` / `-forward-udp` | Парсер форм `localport/remoteip@remoteport` как deprecated-алиасы (живые установки эталона их ещё знают) | `ssh3-client/src/forward.rs`, `ssh3-client/src/main.rs` | Обе формы форвардят; канон `-L` остаётся primary | 0.5 | 1 |
+| G12 | Переменные окружения `SSH3_*` (серверная политика) | Порт env-политики эталона (`SSH3_ENABLE_PASSWORD_LOGIN`, `SSH3_GATEWAY_PORTS`, `SSH3_MAX_*`, `SSH3_PERMIT_OPEN`/`LISTEN`, `SSH3_SHUTDOWN_DRAIN`); связать с systemd EnvironmentFile (`packaging/ssh3-rust-server.env` уже существует, но политик не несёт) | `ssh3-server/src/config.rs`, `ssh3-server/src/main.rs`, `packaging/ssh3-rust-server.env` | Юнит+env настраивают сервер без CLI; негативные тесты на некорректные значения | 1 | 2 |
+
 ---
 
 ## 5. Блокирующие зависимости между шагами
