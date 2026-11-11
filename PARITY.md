@@ -13,7 +13,7 @@
 
 **Сноска †** — все упомянутые файлы закоммичены в `main` (актуальный HEAD `f1ebe59`); незакоммиченного рабочего дерева больше нет.
 
-Обновление 2026-11-11 (волна F6/B10 + сверка T10.3): закрыты B10 (`-s`-подсистема) и F6 (интерактивный SFTP-клиент, `6fe9b0e`) — пробел паритета **9 из 110**. Сверка T10.3 (статика): заявка «агент недоступен на Windows (паритет Go)» **опровергнута** — Go и C ходят в агент на Windows через named pipe `\\.\pipe\openssh-ssh-agent` (Go `client/agent_dial_windows.go:18,38`, C `app/ssh3_client.c:909,9957`), Rust на Windows отвечает `AgentUnavailable`; строки A2/A11 несут Windows-оговорку, закрытие — T10.1 (named-pipe транспорт). Затем волна L9 (graceful shutdown, `101d0b4`) — пробел паритета **8 из 110**. Затем волна T10.1 (named-pipe транспорт SSH-агента на Windows по контракту Go, `43c3f6d`) — Windows-оговорки A2/A11 сняты (живой прогон против OpenSSH for Windows остаётся за T10.1-VM).
+Обновление 2026-11-11 (волна F6/B10 + сверка T10.3): закрыты B10 (`-s`-подсистема) и F6 (интерактивный SFTP-клиент, `6fe9b0e`) — пробел паритета **9 из 110**. Сверка T10.3 (статика): заявка «агент недоступен на Windows (паритет Go)» **опровергнута** — Go и C ходят в агент на Windows через named pipe `\\.\pipe\openssh-ssh-agent` (Go `client/agent_dial_windows.go:18,38`, C `app/ssh3_client.c:909,9957`), Rust на Windows отвечает `AgentUnavailable`; строки A2/A11 несут Windows-оговорку, закрытие — T10.1 (named-pipe транспорт). Затем волна L9 (graceful shutdown, `101d0b4`) — пробел паритета **8 из 110**. Затем волна T10.1 (named-pipe транспорт SSH-агента на Windows по контракту Go, `43c3f6d`) — Windows-оговорки A2/A11 сняты (живой прогон против OpenSSH for Windows остаётся за T10.1-VM). Затем дешёвый пакет (C5, H8, H9, `f0df165`) — пробел паритета **6 из 110**; сводка §1 и разбивка пересчитаны по живой таблице (в том числе досчитан только-Rust B6).
 
 Обозначения: **Сложность** — S (≤1 чел.-день), M (2-5), L (>5). **Go**/**Rust** — `да` / `нет` / `частично`.
 
@@ -25,38 +25,38 @@
 |---|---------|----------|
 | 1 | Всего строк возможностей в таблице паритета | **110** |
 | 2 | Реализовано в Go | **109** |
-| 3 | Реализовано в Rust | **95** (93 полностью + 1 с расхождением + 1 частично) |
-| 4 | Полное совпадение (обе стороны, поведение эквивалентно) | **99** |
+| 3 | Реализовано в Rust | **104** (102 полностью + 1 с расхождением + 1 частично) |
+| 4 | Полное совпадение (обе стороны, поведение эквивалентно) | **100** |
 | 5 | Расхождение по семантике при наличии в обеих | **1** (I4: парольный вход по умолчанию; Rust — в безопасную сторону) |
-| 6 | **Пробелов** (в Go есть, в Rust нет) | **8** |
+| 6 | **Пробелов** (в Go есть, в Rust нет) | **6** |
 | 7 | Пробелов по безопасности (High/Critical) | **0** (A10, I5, I8, I9, K1–K3 закрыты — волны T5, T8) |
-| 8 | Клиентских пробелов | **4** (B14, C5, G12, H9) |
+| 8 | Клиентских пробелов | **2** (B14, G12) |
 | 9 | Серверных пробелов | **4** (L3, L4, M4, M5) |
-| 10 | Только в Rust (нет аналога в Go) | **1** (A7) |
+| 10 | Только в Rust (нет аналога в Go) | **2** (A7, B6) |
 | 11 | Протокольных пробелов (сжатие тела канала) | **0** (N1–N6 закрыты, `wave/t9-compression`) |
-| 12 | Оценка закрытия разрыва | **≈ 5–7 человеко-дней** (дешёвый эшелон: H8, H9, C5, B14) или **≈ 27** (полный паритет, включая ACME) |
+| 12 | Оценка закрытия разрыва | **≈ 2–3 человеко-дня** (остатки эшелона 2: B14, G12) или **≈ 25** (полный паритет, включая ACME) |
 
-Контроль суммы: 99 (совпадение) + 1 (расхождение) + 1 (частично) + 8 (пробел) + 1 (только Rust) = **110**.
+Контроль суммы: 100 (совпадение) + 1 (расхождение) + 1 (частично) + 6 (пробел) + 2 (только Rust) = **110**.
 
 Разбивка по подсистемам:
 
 | № | Подсистема | Строк | Совпадает | Расхождение | Частично | Пробел | Только Rust |
 |---|-----------|-------|-----------|-------------|----------|--------|-------------|
-| 1 | Клиент: аутентификация | 11 | 9 | 0 | 0 | 1 | 1 |
-| 2 | Клиент: сессия / PTY / сигналы | 15 | 14 | 0 | 0 | 1 | 0 |
-| 3 | Клиент: форвардинг | 8 | 7 | 0 | 0 | 1 | 0 |
+| 1 | Клиент: аутентификация | 11 | 10 | 0 | 0 | 0 | 1 |
+| 2 | Клиент: сессия / PTY / сигналы | 15 | 13 | 0 | 0 | 1 | 1 |
+| 3 | Клиент: форвардинг | 8 | 8 | 0 | 0 | 0 | 0 |
 | 4 | Клиент: control master | 5 | 5 | 0 | 0 | 0 | 0 |
 | 5 | Клиент: proxy jump | 4 | 4 | 0 | 0 | 0 | 0 |
 | 6 | Клиент: передача файлов | 6 | 6 | 0 | 0 | 0 | 0 |
-| 7 | Клиент: конфигурация / `-o` / ssh_config | 12 | 10 | 0 | 0 | 2 | 0 |
-| 8 | Клиент: прочие флаги и сервисы | 9 | 3 | 0 | 1 | 5 | 0 |
+| 7 | Клиент: конфигурация / `-o` / ssh_config | 12 | 11 | 0 | 0 | 1 | 0 |
+| 8 | Клиент: прочие флаги и сервисы | 9 | 8 | 0 | 1 | 0 | 0 |
 | 9 | Сервер: аутентификация и политики | 9 | 8 | 1 | 0 | 0 | 0 |
 | 10 | Сервер: политики форвардинга | 4 | 4 | 0 | 0 | 0 | 0 |
 | 11 | Сервер: лимиты и таймауты | 6 | 6 | 0 | 0 | 0 | 0 |
 | 12 | Сервер: функциональность | 9 | 7 | 0 | 0 | 2 | 0 |
 | 13 | Эксплуатация: упаковка, логи, exit-коды | 6 | 4 | 0 | 0 | 2 | 0 |
 | 14 | Протокол: сжатие тела канала (B8) | 6 | 6 | 0 | 0 | 0 | 0 |
-| | **Итого** | **110** | **99** | **1** | **1** | **8** | **1** |
+| | **Итого** | **110** | **100** | **1** | **1** | **6** | **2** |
 
 ---
 
@@ -106,7 +106,7 @@
 | C2 | Форвардинг | `-L udp://` прямой UDP-форвардинг (CLI) | да | да | Go `cmd/ssh3.go:709`, `cmd/ssh2_parity.go:208` (`localListenUDPAddr`); Rust `ssh3-client/src/forward.rs:95-96` (префикс `udp://`), `ssh3-client/src/forward.rs:384` (`forward_udp_socket`) | S | C1 |
 | C3 | Форвардинг | `-D` — SOCKS5 / динамический форвардинг | да | да | Go `cmd/ssh3.go:711`, `cmd/cli_flags.go:85` (`parseDynamicForwardSpec`), `cmd/dynamic_forward.go`, `cmd/dynamic_forward_server.go`; Rust `ssh3-client/src/dynamic.rs` (`parse_dynamic_forward_spec`, `serve_socks5_connection`), `ssh3-client/src/forwarding_wire.rs` (кодеки `dynamic-forward`/`dynamic-forward-tcp`), `ssh3-client/src/lib.rs` (`start_dynamic_forwards`), `ssh3-server/src/dynamic_forward.rs` | — | C1 |
 | C4 | Форвардинг | `-R` — обратный форвардинг | да | да | Go `cmd/ssh3.go:713`, `cmd/reverse_forward.go`, `cmd/reverse_forward_server.go`; Rust `ssh3-client/src/reverse.rs` (`parse_reverse_forward_spec`, `request_reverse_forward`, `bridge_forwarded_tcp`), `ssh3-client/src/incoming.rs` (диспетчер серверных каналов, авторизация цели), `ssh3-client/src/forwarding_wire.rs`, `ssh3-server/src/reverse_forward.rs` | — | J2, J3 |
-| C5 | Форвардинг | `-forward-tcp` / `-forward-udp` (legacy-алиасы) | да | нет | Go `cmd/ssh3.go:721-722`; Rust — **не найдено** | S | C1, C2 |
+| C5 | Форвардинг | `-forward-tcp` / `-forward-udp` (legacy-алиасы) | да | да (волна 2026-11-11, `f0df165`) | Go `cmd/ssh3.go:721-722`, `:919-920`, `:1506-1531`; Rust `ssh3-client/src/forward.rs` (`parse_legacy_forward_spec`, форма `localport/remoteip@remoteport`, IP-литерал), `main.rs` (`--forward-tcp`/`--forward-udp`, deprecated в help, одно-дефисные ремапы) | S | C1, C2 |
 | C6 | Форвардинг | `-o LocalForward=` / `-o RemoteForward=` / `-o DynamicForward=` | да | да | Go `cmd/ssh3.go:883`, `cmd/ssh3.go:889`, `cmd/ssh3.go:897`; Rust `ssh3-client/src/main.rs:279` (`localforward`), `ssh3-client/src/main.rs:285` (`remoteforward`), `ssh3-client/src/main.rs:291` (`dynamicforward`) | S | C1, C3, C4 |
 | C7 | Форвардинг | Серверный приём форвардинга (TCP/UDP) | да | да | Go `cmd/ssh3-server.go:1386` (маршрутизация каналов), `message/dynamic_forward.go`; Rust `ssh3-server/src/forwarding.rs:84` (`handle_tcp_forwarding`), `ssh3-server/src/forwarding.rs:24` (`handle_udp_forwarding`) | — | — |
 | C8 | Форвардинг | Безопасная семантика (политика целей `permit-open`) | да | да | Go `cmd/forward_policy.go:52` (`parsePermitOpen`), `cmd/ssh3-server.go:1039`; Rust `ssh3-server/src/forwarding.rs:81-121` (`ForwardPolicy::parse`: `*`, `!`, `host:port`), `ssh3-server/src/runtime.rs:367-368` (передача политики в обработчик) | S | J1 |
@@ -171,7 +171,7 @@
 | H6 | Прочее | `-version` / `-V` | да | да | Go `cmd/ssh3.go:688-689`; Rust `ssh3-client/src/main.rs:170` (`-V`/`--version`), `ssh3-client/src/lib.rs:95` (`SSH3_CLIENT_VERSION_STRING`) — печатается строка версии в формате Go (`SSH 3.0 ssh3-rust 0.1.0 experimental_spec_version=alpha-00`) | — | — |
 | H7 | Прочее | X11 forwarding | да (серверная заглушка) | да (заглушка как в Go) | Go `cmd/ssh3-server.go:564` (`newX11Req` — отказ «not implemented»), `client/session_pump.go:156` («not implemented» на клиенте); Rust — протокольный тип (`ssh3-proto/src/message.rs:330-331`), парсер (`ssh3-core/src/channel.rs:954`), сервер отклоняет запрос в stderr сессии | M | — |
 | H8 | Прочее | `-packet-size` / `-initial-packet-size` — начальный размер QUIC-пакета (дефолт 1200, минимум RFC 9000) | да | частично | Go `cmd/ssh3.go:703` (клиент), `cmd/ssh3-server.go:965` (сервер), `cmd/ssh3.go:210-212` (применение к `qconf.InitialPacketSize`); Rust — параметра **не найдено** (`ssh3-quinn/src/config.rs` не задаёт `TransportConfig`), но фактическое значение совпадает: дефолт `quinn` `initial_mtu` = 1200 | S | — |
-| H9 | Прочее | Отключённый path-MTU discovery (сервер и туннелированные соединения) | да | нет | Go `cmd/ssh3-server.go:1316` (`DisablePathMTUDiscovery: true`), `cmd/ssh3.go:216-220` (туннель); Rust — **не найдено**: `quinn` оставляет PMTUD включённым по умолчанию, `ssh3-server/src/tls.rs:22-33` меняет только таймауты | S | H8, E4 |
+| H9 | Прочее | Отключённый path-MTU discovery (сервер и туннелированные соединения) | да | да (волна 2026-11-11, `f0df165`) | Go `cmd/ssh3-server.go:1316` (`DisablePathMTUDiscovery: true`), `cmd/ssh3.go:216-220` (туннель); Rust `ssh3-quinn/src/config.rs` (`disable_path_mtu_discovery`), `ssh3-server/src/tls.rs` (сервер — всегда off), клиентский `-J`-туннель — всегда off независимо от бюджета, прямое соединение — включён как у эталона | S | H8, E4 |
 
 ### 2.9. Сервер — аутентификация и политики
 
@@ -390,10 +390,10 @@
 
 | № | Шаг | Что делать | Файлы | Критерий готовности | Чел.-дней | Эшелон |
 |---|-----|-----------|-------|---------------------|-----------|--------|
-| H8 | `-packet-size` / `-initial-packet-size` | Применять значение к `TransportConfig` quinn (`initial_mtu`/`min_mtu`), клиент и сервер | `ssh3-quinn/src/config.rs` | Флаг меняет фактический initial packet; тест с релеем-фильтром MTU, как у эталона | 0.5 | 2 |
-| H9 | Отключение path-MTU discovery (сервер, туннелированные соединения) | `TransportConfig` quinn: `mtu_discovery` off; в `-J`-туннеле — всегда off (сейчас выключен только бюджетом), глобальный серверный дефолт как в Go | `ssh3-quinn/src/config.rs`, `ssh3-server/src/tls.rs` | Сервер не растит пакеты выше initial; jumbo-замер (методика эталона B11) воспроизводит 1439-потолок Go или задокументированное расхождение | 0.5 | 2 |
+| H8 | `-packet-size` / `-initial-packet-size` | Применять значение к `TransportConfig` quinn (`initial_mtu`/`min_mtu`), клиент и сервер | `ssh3-quinn/src/config.rs` | Флаг меняет фактический initial packet; тест с релеем-фильтром MTU, как у эталона — ✅ закрыто 2026-11-11 (`f0df165`): клиентский `--packet-size` + серверный `-initial-packet-size`, тесты на конфиг-строителе (relay-замер не делался) | 0.5 | 2 |
+| H9 | Отключение path-MTU discovery (сервер, туннелированные соединения) | `TransportConfig` quinn: `mtu_discovery` off; в `-J`-туннеле — всегда off (сейчас выключен только бюджетом), глобальный серверный дефолт как в Go | `ssh3-quinn/src/config.rs`, `ssh3-server/src/tls.rs` | Сервер не растит пакеты выше initial; jumbo-замер (методика эталона B11) воспроизводит 1439-потолок Go или задокументированное расхождение — ✅ закрыто 2026-11-11 (`f0df165`), jumbo-замер не делался | 0.5 | 2 |
 | B14 | `-f` — уход в фон | ssh2-канон: detached re-exec (`SSH3_F_DAEMON=1`, своя группа, stdin=null), отказ при интерактивных конфигах (пароль, OIDC-браузер, ask-хост) — по эталону `cmd/background.go` | `ssh3-client/src/main.rs`, `ssh3-client/src/lib.rs` | `-f -N -L …` держит форварды после выхода родителя; Windows — foreground с предупреждением, как в эталоне | 1.5 | 2 |
-| C5 | Legacy-алиасы `-forward-tcp` / `-forward-udp` | Парсер форм `localport/remoteip@remoteport` как deprecated-алиасы (живые установки эталона их ещё знают) | `ssh3-client/src/forward.rs`, `ssh3-client/src/main.rs` | Обе формы форвардят; канон `-L` остаётся primary | 0.5 | 1 |
+| C5 | Legacy-алиасы `-forward-tcp` / `-forward-udp` | Парсер форм `localport/remoteip@remoteport` как deprecated-алиасы (живые установки эталона их ещё знают) | `ssh3-client/src/forward.rs`, `ssh3-client/src/main.rs` | Обе формы форвардят; канон `-L` остаётся primary — ✅ закрыто 2026-11-11 (`f0df165`) | 0.5 | 1 |
 | G12 | Переменные окружения `SSH3_*` (серверная политика) | Порт env-политики эталона (`SSH3_ENABLE_PASSWORD_LOGIN`, `SSH3_GATEWAY_PORTS`, `SSH3_MAX_*`, `SSH3_PERMIT_OPEN`/`LISTEN`, `SSH3_SHUTDOWN_DRAIN`); связать с systemd EnvironmentFile (`packaging/ssh3-rust-server.env` уже существует, но политик не несёт) | `ssh3-server/src/config.rs`, `ssh3-server/src/main.rs`, `packaging/ssh3-rust-server.env` | Юнит+env настраивают сервер без CLI; негативные тесты на некорректные значения | 1 | 2 |
 
 ---
