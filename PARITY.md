@@ -13,7 +13,7 @@
 
 **Сноска †** — все упомянутые файлы закоммичены в `main` (актуальный HEAD `f1ebe59`); незакоммиченного рабочего дерева больше нет.
 
-Обновление 2026-11-11 (волна F6/B10 + сверка T10.3): закрыты B10 (`-s`-подсистема) и F6 (интерактивный SFTP-клиент, `6fe9b0e`) — пробел паритета **9 из 110**. Сверка T10.3 (статика): заявка «агент недоступен на Windows (паритет Go)» **опровергнута** — Go и C ходят в агент на Windows через named pipe `\\.\pipe\openssh-ssh-agent` (Go `client/agent_dial_windows.go:18,38`, C `app/ssh3_client.c:909,9957`), Rust на Windows отвечает `AgentUnavailable`; строки A2/A11 несут Windows-оговорку, закрытие — T10.1 (named-pipe транспорт).
+Обновление 2026-11-11 (волна F6/B10 + сверка T10.3): закрыты B10 (`-s`-подсистема) и F6 (интерактивный SFTP-клиент, `6fe9b0e`) — пробел паритета **9 из 110**. Сверка T10.3 (статика): заявка «агент недоступен на Windows (паритет Go)» **опровергнута** — Go и C ходят в агент на Windows через named pipe `\\.\pipe\openssh-ssh-agent` (Go `client/agent_dial_windows.go:18,38`, C `app/ssh3_client.c:909,9957`), Rust на Windows отвечает `AgentUnavailable`; строки A2/A11 несут Windows-оговорку, закрытие — T10.1 (named-pipe транспорт). Затем волна L9 (graceful shutdown, `101d0b4`) — пробел паритета **8 из 110**.
 
 Обозначения: **Сложность** — S (≤1 чел.-день), M (2-5), L (>5). **Go**/**Rust** — `да` / `нет` / `частично`.
 
@@ -25,18 +25,18 @@
 |---|---------|----------|
 | 1 | Всего строк возможностей в таблице паритета | **110** |
 | 2 | Реализовано в Go | **109** |
-| 3 | Реализовано в Rust | **94** (92 полностью + 1 с расхождением + 1 частично) |
-| 4 | Полное совпадение (обе стороны, поведение эквивалентно) | **98** |
+| 3 | Реализовано в Rust | **95** (93 полностью + 1 с расхождением + 1 частично) |
+| 4 | Полное совпадение (обе стороны, поведение эквивалентно) | **99** |
 | 5 | Расхождение по семантике при наличии в обеих | **1** (I4: парольный вход по умолчанию; Rust — в безопасную сторону) |
-| 6 | **Пробелов** (в Go есть, в Rust нет) | **9** |
+| 6 | **Пробелов** (в Go есть, в Rust нет) | **8** |
 | 7 | Пробелов по безопасности (High/Critical) | **0** (A10, I5, I8, I9, K1–K3 закрыты — волны T5, T8) |
 | 8 | Клиентских пробелов | **4** (B14, C5, G12, H9) |
-| 9 | Серверных пробелов | **5** (L3, L4, L9, M4, M5) |
+| 9 | Серверных пробелов | **4** (L3, L4, M4, M5) |
 | 10 | Только в Rust (нет аналога в Go) | **1** (A7) |
 | 11 | Протокольных пробелов (сжатие тела канала) | **0** (N1–N6 закрыты, `wave/t9-compression`) |
-| 12 | Оценка закрытия разрыва | **≈ 5–7 человеко-дней** (дешёвый эшелон: H8, H9, C5, B14) или **≈ 28** (полный паритет, включая ACME) |
+| 12 | Оценка закрытия разрыва | **≈ 5–7 человеко-дней** (дешёвый эшелон: H8, H9, C5, B14) или **≈ 27** (полный паритет, включая ACME) |
 
-Контроль суммы: 98 (совпадение) + 1 (расхождение) + 1 (частично) + 9 (пробел) + 1 (только Rust) = **110**.
+Контроль суммы: 99 (совпадение) + 1 (расхождение) + 1 (частично) + 8 (пробел) + 1 (только Rust) = **110**.
 
 Разбивка по подсистемам:
 
@@ -53,10 +53,10 @@
 | 9 | Сервер: аутентификация и политики | 9 | 8 | 1 | 0 | 0 | 0 |
 | 10 | Сервер: политики форвардинга | 4 | 4 | 0 | 0 | 0 | 0 |
 | 11 | Сервер: лимиты и таймауты | 6 | 6 | 0 | 0 | 0 | 0 |
-| 12 | Сервер: функциональность | 9 | 6 | 0 | 0 | 3 | 0 |
+| 12 | Сервер: функциональность | 9 | 7 | 0 | 0 | 2 | 0 |
 | 13 | Эксплуатация: упаковка, логи, exit-коды | 6 | 4 | 0 | 0 | 2 | 0 |
 | 14 | Протокол: сжатие тела канала (B8) | 6 | 6 | 0 | 0 | 0 | 0 |
-| | **Итого** | **110** | **98** | **1** | **1** | **9** | **1** |
+| | **Итого** | **110** | **99** | **1** | **1** | **8** | **1** |
 
 ---
 
@@ -219,7 +219,7 @@
 | L6 | Сервер | Смена размера окна / сигналы на сервере | да | да | Go `cmd/ssh3-server.go:1497`; Rust `ssh3-server/src/session.rs:503` (`WindowChange`), `ssh3-server/src/session.rs:490` (`Signal`) | — | — |
 | L7 | Сервер | Подсистема SFTP | да | да † | Go `cmd/ssh3-server.go:1386` (`serveSFTPSubsystem`), `cmd/ssh3-server.go:721` (`newSubsystemReq`), `cmd/sftp_subsystem.go`; Rust `ssh3-server/src/runtime.rs:348` (`handle_sftp_channel`), `ssh3-server/src/sftp.rs:50` (`CHANNEL_TYPE_SFTP`), `ssh3-server/src/sftp_stream.rs` | L | F1 |
 | L8 | Сервер | Изоляция путей SFTP (`-sftp-jail`: chroot / lexical) | да | да † | Go `cmd/ssh3-server.go:1030`, `cmd/ssh3-server.go:1143`, `cmd/internal_sftp.go`; Rust `ssh3-server/src/config.rs:93` (`SftpJailMode`), `ssh3-server/src/sftp.rs:815-836` (chroot/lexical), `ssh3-server/src/sftp_child.rs` (дочерний процесс с chroot и сменой uid/gid) | M | L7 |
-| L9 | Сервер | Graceful shutdown (SIGTERM → drain) | да | нет | Go `cmd/ssh3-server.go:1612-1633` (drain), `cmd/ssh3-server.go:1642` (`shutdownDrainPeriod`), `packaging/ssh3-server.env` (`SSH3_SHUTDOWN_DRAIN`); Rust — **не найдено**: `ssh3-server/src/runtime.rs:42-58` — остановки по сигналу нет | M | — |
+| L9 | Сервер | Graceful shutdown (SIGTERM → drain) | да | да (волна 2026-11-11, `101d0b4`) | Go `cmd/ssh3-server.go:1612-1633` (drain), `cmd/ssh3-server.go:1642` (`shutdownDrainPeriod`), `packaging/ssh3-server.env` (`SSH3_SHUTDOWN_DRAIN`); Rust `ssh3-server/src/shutdown.rs` (сигналы SIGINT+SIGTERM / Ctrl-C, парс drain-периода как Go Atoi, дефолт 5 с), `ssh3-server/src/runtime.rs` (`serve_endpoint_until_shutdown`: отказ новым входящим, drain по `ConnectionTracker`, закрытие по дедлайну с кодом 0 «server shutdown», второй сигнал игнорируется) | M | — |
 
 ### 2.13. Эксплуатация
 
@@ -269,7 +269,7 @@
 | P2 | F6, B10 | Передача файлов | Интерактивный SFTP-клиент (`-s sftp`) и `-s`-подсистема — `cmd/sftp_client.go`. | Закрыто волной 2026-11-11: `-s`/`--subsystem` и встроенный интерактивный клиент (`ssh3-client/src/interactive_sftp.rs`); пакетный `-transfer` — T3.2 (`transfer.rs`), серверная подсистема — L7 | Кросс-interop интерактивного клиента против Go/C-серверов — живая проверка UD4 |
 | P3 | I8 | Сервер: аутентификация | Сравнение хэша пароля константно-временно (`util/unix_util/linux_user.go:109`). | Обычный `==` с ранним выходом (`ssh3-server/src/auth.rs:411`; подтверждено аудитом 2026-10-27). | Timing-канал на подбор пароля остаётся (lockout в `ssh3-server/src/auth.rs:164-186` ограничивает частоту, но не устраняет канал); SSHFP-сравнение уже константно-временное (I9) |
 | P4 | K1, K2, K3 | Сервер: лимиты | Капы соединений, каналов и входящих потоков (`-max-connections`, `-max-channels-per-conversation`, `-max-incoming-streams`). | Закрыто волной T8: семафор приёма (`ssh3-server/src/runtime.rs`), канальный бюджет (`runtime.rs:378-394`), QUIC-лимиты стримов (`ssh3-server/src/tls.rs`); кап карты dangling-очередей — `ssh3-core/src/conversation.rs` (A3) | Вектор исчерпания памяти закрыт; без флагов действуют дефолты эталона (0/64/100/100) |
-| P5 | L9 | Сервер | По SIGTERM/SIGINT сервер перестаёт принимать соединения и дренирует активные в течение `SSH3_SHUTDOWN_DRAIN` (по умолчанию 5 с) — `cmd/ssh3-server.go:1612`, `cmd/ssh3-server.go:1620-1633`. | Сигналы не ловятся: процесс умирает по умолчанию, активные сессии обрываются (`ssh3-server/src/runtime.rs:42-58`). | При обновлении сервера рвутся живые сессии; в systemd без `KillMode=process` — тем более |
+| P5 | L9 | Сервер | По SIGTERM/SIGINT сервер перестаёт принимать соединения и дренирует активные в течение `SSH3_SHUTDOWN_DRAIN` (по умолчанию 5 с) — `cmd/ssh3-server.go:1612`, `cmd/ssh3-server.go:1620-1633`. | Закрыто волной 2026-11-11: сигнальный хук + drain (`ssh3-server/src/shutdown.rs`, `runtime.rs` `serve_endpoint_until_shutdown`); нюанс — новые входящие при drain отклоняются application-close (`CONNECTION_REFUSED`), а не падают на закрытом сокете (ограничение quinn `Endpoint::close`) | Обновление сервера больше не рвёт живые сессии; расхождение отказа новых соединений задокументировано |
 | P6 | D1–D5, E1 | Control master / proxy jump | Control master (`-M`/`-S`/`-O`, протокол `client/cm`) и цепочка `-J` с UDP-туннелем. | Закрыто: control master — `ssh3-client/src/control.rs` (T4), туннель — `ssh3-client/src/proxy_jump.rs` (T5.1); межпроцессные хвосты control master и Windows-отказ остаются в ROADMAP. | Каждое соединение — новое QUIC-рукопожатие; jump-хост недоступен |
 
 Дополнительные расхождения **внутри wire-уровня** (не продуктовая поверхность, но влияют на совместимость) — уже зафиксированы в `ROADMAP.md:208-217` (M5): порядок `family`/`protocol` в `ForwardingRequest` (`ssh3-proto/src/message.rs:783` против `message/channel_request.go:609`), обработка `bool` (`ssh3-proto/src/wire.rs:185`), отсутствие клампа `maxPacketSize` (`ssh3-core/src/channel.rs:667`), отсутствие `forward-port` в карте Go.
