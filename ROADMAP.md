@@ -162,7 +162,7 @@
 
 | № | Задача | Эталон | Критерий |
 |---|--------|--------|----------|
-| 10.1 | Агент-клиент на Windows: живой прогон Rust-клиента против OpenSSH for Windows agent (named pipe) на VM | `ssh3-client/src/agent.rs`, C-эталон `app/ssh3_client.c` | auth по ключу из агента работает; если нет — доделать pipe-транспорт (оценка вырастает до M) |
+| 10.1 | Агент-клиент на Windows: живой прогон Rust-клиента против OpenSSH for Windows agent (named pipe) на VM | `ssh3-client/src/agent.rs`, C-эталон `app/ssh3_client.c` | auth по ключу из агента работает; если нет — доделать pipe-транспорт (оценка вырастает до M) — ✅ код готов (2026-11-11, `43c3f6d`): pipe-транспорт + резолв/soft-hard по Go-контракту, 463 теста зелёные, `cargo check --target x86_64-pc-windows-gnu` чист; осталось — живой прогон на VM |
 | 10.2 | Консоль/PTY под Win32 на живой VM (не runner): VT/UTF-8, raw mode, Ctrl-C, resize доезжает до сервера, сигнальные форвардеры | `ssh3-client/src/console/windows.rs` | интерактивная сессия в Windows Terminal ведёт себя как у C/Go-клиентов |
 | 10.3 | Сверка заявки «агент недоступен (паритет Go)» против Go-клиента на той же VM | `auth/plugins/pubkey_authentication/client/` | факт зафиксирован в PARITY (A2-строка, Windows-колонка) — либо паритет подтверждён, либо у Rust дыра против эталона и она попадает в план — ✅ статически закрыто (2026-11-11): дыра подтверждена, PARITY A2/A11 несут Windows-оговорку; живая сверка на VM остаётся в объёме 10.1 |
 
