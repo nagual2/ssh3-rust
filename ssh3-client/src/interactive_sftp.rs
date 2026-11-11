@@ -237,6 +237,13 @@ pub(crate) fn split_fields(line: &str) -> Vec<String> {
     fields
 }
 
+fn print_help() {
+    println!("Commands:");
+    println!("  ls [path], cd <path>, pwd");
+    println!("  get <remote> [local], put <local> <remote>");
+    println!("  mkdir <path>, rmdir <path>, rm <path>");
+    println!("  help, quit, exit");
+}
 
 #[cfg(test)]
 mod tests {
@@ -289,12 +296,4 @@ mod tests {
         assert_eq!(join_path("/home/user", Some(".")), "/home/user");
         assert_eq!(join_path("/home/user", Some("")), "/home/user");
     }
-}
-
-fn print_help() {
-    println!("Commands:");
-    println!("  ls [path], cd <path>, pwd");
-    println!("  get <remote> [local], put <local> <remote>");
-    println!("  mkdir <path>, rmdir <path>, rm <path>");
-    println!("  help, quit, exit");
 }
