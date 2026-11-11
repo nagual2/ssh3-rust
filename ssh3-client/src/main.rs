@@ -260,6 +260,16 @@ struct Cli {
     #[arg(short = 'N')]
     no_session: bool,
 
+    /// Go to background after the startup checks (ssh2 -f): the session
+    /// detaches from the terminal and keeps running.
+    ///
+    /// Non-interactive authentication only (key or agent), and the host must
+    /// be pinned under the ask policy. The client re-executes itself as a
+    /// detached child; a Windows build stays in the foreground, like the
+    /// control master.
+    #[arg(short = 'f')]
+    background: bool,
+
     /// Run as the control master: share one authenticated connection across
     /// the invocations through the control socket (-M).
     ///
@@ -764,6 +774,9 @@ struct ClientPlan {
     request: Ssh3SessionRequest,
     /// The connection is held open for the forwards only.
     no_session: bool,
+    /// The `-f` flag: the session detaches into the background after the
+    /// startup checks.
+    background: bool,
     /// The transfer the mode asks for; `None` for the other modes.
     transfer: Option<Ssh3TransferPlan>,
     /// The resolved control master settings of the command line.
@@ -851,6 +864,7 @@ fn build_config(cli: Cli) -> Result<ClientPlan, clap::Error> {
     }
     let command = cli.command.clone();
     let no_session = cli.no_session;
+    let background = cli.background;
     let url = cli.url.clone().ok_or_else(|| {
         cli_error(
             ErrorKind::MissingRequiredArgument,
@@ -909,6 +923,7 @@ fn build_config(cli: Cli) -> Result<ClientPlan, clap::Error> {
         config,
         request,
         no_session,
+        background,
         transfer: None,
         control,
     })
@@ -932,6 +947,7 @@ fn build_transfer_config(cli: Cli) -> Result<ClientPlan, clap::Error> {
             "-s cannot be combined with --transfer",
         ));
     }
+    let background = cli.background;
     let first = cli.url.clone().ok_or_else(|| {
         cli_error(
             ErrorKind::MissingRequiredArgument,
@@ -1014,6 +1030,7 @@ fn build_transfer_config(cli: Cli) -> Result<ClientPlan, clap::Error> {
         config,
         request: Ssh3SessionRequest::Shell,
         no_session: false,
+        background,
         transfer: Some(transfer),
         control,
     })
@@ -1588,7 +1605,7 @@ async fn run_control_mode(plan: &ClientPlan) -> Option<ExitCode> {
     // The daemon mode: this process is the detached master the CLI
     // re-executed; it serves the socket until a slave sends EXIT or STOP or
     // the idle timeout fires, and never runs a session of its own.
-    if std::env::var("SSH3_CM_DAEMON").as_deref() == Ok("1") {
+    if std::env::var(SSH3_CM_DAEMON_ENV).as_deref() == Ok("1") {
         let client = match control::connect_shared(&plan.config).await {
             Ok(client) => client,
             Err(err) => {
@@ -1712,22 +1729,93 @@ async fn run_slave(plan: &ClientPlan) -> ExitCode {
     }
 }
 
-/// Re-executes this binary detached with the daemon marker, the way
-/// `startDetached` does in the reference: no terminal, own process group.
+/// The marker of the re-executed control-master daemon, the `cmDaemonEnv`
+/// of the reference.
 #[cfg(unix)]
-fn start_detached_master() -> std::io::Result<()> {
+const SSH3_CM_DAEMON_ENV: &str = "SSH3_CM_DAEMON";
+
+/// Re-executes this binary detached with the given daemon marker, the way
+/// `startDetached` does in the reference: no terminal, own process group.
+///
+/// The marker tells the child which background role it plays; the child runs
+/// its full startup itself, because an established connection cannot cross a
+/// process boundary.
+#[cfg(unix)]
+fn start_detached(env_marker: &str) -> std::io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     let current = std::env::current_exe()?;
     let child = std::process::Command::new(current)
         .args(std::env::args_os().skip(1))
-        .env("SSH3_CM_DAEMON", "1")
+        .env(env_marker, "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .process_group(0)
         .spawn()?;
-    drop(child);
-    Ok(())
+    Ok(child)
+}
+
+#[cfg(unix)]
+fn start_detached_master() -> std::io::Result<()> {
+    start_detached(SSH3_CM_DAEMON_ENV).map(|_| ())
+}
+
+/// Whether this process is already the re-executed `-f` background child:
+/// the marker of the reference makes the child skip the detach step and run
+/// the session straight away.
+fn background_child() -> bool {
+    background_child_marker(
+        std::env::var(ssh3_client::SSH3_F_DAEMON_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The gate of the marker value: only the exact `1` makes a process the
+/// re-executed background child, like the reference reads its environment.
+fn background_child_marker(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Gathers the facts of the plan the `-f` validation judges: what keeps
+/// running, which authentication methods were asked for, the resolved host
+/// key policy and whether the host is pinned yet.
+///
+/// The ask policy prompts only in the known_hosts layer — the insecure and
+/// the certificate-authority layers accept without a question — so the host
+/// is pinned when the known_hosts file of the plan already carries an entry
+/// under the canonical key of the target, the way the reference looks its
+/// `knownHosts` map up by `options.CanonicalHostFormat()`.
+#[cfg(unix)]
+fn background_facts(plan: &ClientPlan) -> Result<(), String> {
+    use ssh3_client::{KnownHosts, Ssh3BackgroundOptions, canonical_host_key};
+    let (strict_ask, host_pinned) = match &plan.config.trust {
+        Ssh3TrustStrategy::KnownHosts(trust) => {
+            let pinned = canonical_host_key(&plan.config.target_url)
+                .and_then(|key| {
+                    KnownHosts::load(&trust.path)
+                        .ok()
+                        .map(|(hosts, _)| hosts.knows(&key))
+                })
+                .unwrap_or(false);
+            (trust.policy == Ssh3StrictHostKeyChecking::Ask, pinned)
+        }
+        _ => (false, true),
+    };
+    let options = Ssh3BackgroundOptions {
+        password_auth: plan.config.password.is_some(),
+        oidc: plan.config.oidc.is_some(),
+        control_master: plan.control.master != ControlMasterPolicy::No,
+        strict_ask,
+        host_pinned,
+        has_command: matches!(plan.request, Ssh3SessionRequest::Exec(_)),
+        no_session: plan.no_session,
+        has_forwards: plan.transfer.is_some()
+            || !plan.config.local_forwards.is_empty()
+            || !plan.config.reverse_forwards.is_empty()
+            || !plan.config.dynamic_forwards.is_empty(),
+    };
+    ssh3_client::validate_background_mode(&options)
 }
 
 /// Polls the control socket until a master answers or the deadline passes,
@@ -1862,6 +1950,41 @@ async fn main() -> ExitCode {
         }
     };
 
+    // The `-f` background form (ssh2 canon): the parent re-executes a
+    // detached child that runs the full startup itself, because an
+    // established connection cannot cross a process boundary. Every refusal
+    // happens here, in the parent: the child has no terminal and would die
+    // silently instead of reporting. Windows stays in the foreground, like
+    // the control master.
+    if plan.background && !background_child() {
+        #[cfg(unix)]
+        {
+            if let Err(reason) = background_facts(&plan) {
+                diag_error!("{reason}");
+                return ExitCode::from(255);
+            }
+            match start_detached(ssh3_client::SSH3_F_DAEMON_ENV) {
+                Ok(child) => {
+                    diag_info!(
+                        "-f: the session continues in the background (pid {})",
+                        child.id()
+                    );
+                    return ExitCode::SUCCESS;
+                }
+                Err(err) => {
+                    diag_error!("-f: could not start the background session: {err}");
+                    return ExitCode::from(255);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            diag_info!(
+                "-f: backgrounding is unavailable on windows, running the session in the foreground"
+            );
+        }
+    }
+
     // The transfer mode moves the files and opens no session.
     if let Some(transfer) = plan.transfer {
         return match run_file_transfer(&plan.config, &transfer).await {
@@ -1948,6 +2071,182 @@ mod tests {
         let cli = Cli::try_parse_from(argv).unwrap();
         let plan = build_config(cli).unwrap();
         (plan.config, plan.no_session)
+    }
+
+    /// The whole plan the command line parsing produces.
+    fn plan_of(arguments: &[&str]) -> super::ClientPlan {
+        let mut argv = vec!["ssh3"];
+        argv.extend_from_slice(arguments);
+        argv.push("https://localhost:4433/ssh3-term");
+        let cli = Cli::try_parse_from(argv).unwrap();
+        build_config(cli).unwrap()
+    }
+
+    /// The `-f` flag parses and lands in the plan.
+    #[test]
+    fn the_background_flag_reaches_the_plan() {
+        let plan = plan_of(&["-f", "-N"]);
+        assert!(plan.background);
+        assert!(plan.no_session);
+        // Without the flag the plan rides the foreground.
+        let plan = plan_of(&["-N"]);
+        assert!(!plan.background);
+    }
+
+    /// The `-f` refusals follow the reference `validateBackgroundMode`: the
+    /// interactive configurations come with a readable reason, in the order
+    /// of the reference checks.
+    #[cfg(unix)]
+    #[test]
+    fn the_background_mode_refuses_interactive_configurations() {
+        use super::background_facts;
+
+        // A shell alone has nothing to keep running.
+        let reason = background_facts(&plan_of(&["-f"])).unwrap_err();
+        assert!(
+            reason.contains("nothing to keep running in the background"),
+            "{reason}"
+        );
+        // A password needs a prompt.
+        let reason = background_facts(&plan_of(&[
+            "-f",
+            "-N",
+            "--user",
+            "max",
+            "--password",
+            "secret",
+        ]))
+        .unwrap_err();
+        assert!(
+            reason.contains("password authentication needs a prompt"),
+            "{reason}"
+        );
+        // The OIDC flow opens a browser.
+        let reason = background_facts(&plan_of(&[
+            "-f",
+            "-N",
+            "--use-oidc",
+            "https://sso.example.org",
+            "--oidc-client-id",
+            "ssh3",
+        ]))
+        .unwrap_err();
+        assert!(reason.contains("the OIDC flow opens a browser"), "{reason}");
+        // The control master backgrounds itself already.
+        let reason = background_facts(&plan_of(&["-f", "-N", "-M"])).unwrap_err();
+        assert!(
+            reason.contains("the control master already goes to the background"),
+            "{reason}"
+        );
+    }
+
+    /// The default ask policy refuses an unpinned host: the detached child
+    /// has no terminal to confirm the certificate on.
+    #[cfg(unix)]
+    #[test]
+    fn the_background_mode_refuses_an_unpinned_host_under_the_ask_policy() {
+        use super::background_facts;
+        let directory = tempfile::TempDir::new().unwrap();
+        let known_hosts = directory.path().join("known_hosts");
+        let path = known_hosts.to_str().unwrap();
+        let reason = background_facts(&plan_of(&["-f", "-N", "--known-hosts", path])).unwrap_err();
+        assert!(
+            reason.contains("the default ask policy cannot prompt in the background"),
+            "{reason}"
+        );
+    }
+
+    /// A pinned host passes the ask policy, and the explicit policies never
+    /// need a prompt.
+    #[cfg(unix)]
+    #[test]
+    fn the_background_mode_allows_a_pinned_host_and_explicit_policies() {
+        use super::background_facts;
+        let directory = tempfile::TempDir::new().unwrap();
+        let known_hosts = directory.path().join("known_hosts");
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        ssh3_client::append_known_host(
+            &known_hosts,
+            "localhost:4433/ssh3-term",
+            certificate.cert.der(),
+        )
+        .unwrap();
+        let path = known_hosts.to_str().unwrap();
+        // The pinned host under the ask policy comes up without a prompt.
+        background_facts(&plan_of(&["-f", "-N", "--known-hosts", path])).unwrap();
+        // The explicit policies accept an unpinned host as well.
+        background_facts(&plan_of(&[
+            "-f",
+            "-N",
+            "--strict-host-key-checking",
+            "accept-new",
+        ]))
+        .unwrap();
+        background_facts(&plan_of(&["-f", "-N", "--strict-host-key-checking", "yes"])).unwrap();
+        background_facts(&plan_of(&["-f", "-N", "--strict-host-key-checking", "no"])).unwrap();
+        background_facts(&plan_of(&["-f", "-N", "--insecure"])).unwrap();
+    }
+
+    /// The forwards and the transfer give the background child something to
+    /// keep running, like in the reference. The unpinned test host rides
+    /// `accept-new`: under the default ask policy even a forward is refused
+    /// until the host is pinned.
+    #[cfg(unix)]
+    #[test]
+    fn the_background_mode_allows_forwards_and_transfers() {
+        use super::{Cli, background_facts};
+        background_facts(&plan_of(&[
+            "-f",
+            "-N",
+            "--strict-host-key-checking",
+            "accept-new",
+            "-L",
+            "8080:localhost:80",
+        ]))
+        .unwrap();
+        background_facts(&plan_of(&[
+            "-f",
+            "-N",
+            "--strict-host-key-checking",
+            "accept-new",
+            "-D",
+            "1080",
+        ]))
+        .unwrap();
+        background_facts(&plan_of(&[
+            "-f",
+            "-N",
+            "--strict-host-key-checking",
+            "accept-new",
+            "-R",
+            "8080:localhost:80",
+        ]))
+        .unwrap();
+        // A remote command keeps running too; it rides after the URL.
+        let cli = Cli::try_parse_from([
+            "ssh3",
+            "-f",
+            "--strict-host-key-checking",
+            "accept-new",
+            "https://localhost:4433/ssh3-term",
+            "echo",
+            "hi",
+        ])
+        .unwrap();
+        background_facts(&build_config(cli).unwrap()).unwrap();
+    }
+
+    /// The marker of the background child is recognized by its exact value,
+    /// like the reference reads its environment variable.
+    #[test]
+    fn the_background_marker_gate_recognizes_the_exact_one() {
+        use super::background_child_marker;
+        assert!(!background_child_marker(None));
+        assert!(background_child_marker(Some("1")));
+        assert!(!background_child_marker(Some("0")));
+        assert!(!background_child_marker(Some("")));
+        assert!(!background_child_marker(Some(" 1")));
     }
 
     /// The reference writes its long flags with a single dash: the

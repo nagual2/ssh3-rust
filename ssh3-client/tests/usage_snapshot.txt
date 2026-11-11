@@ -71,6 +71,8 @@ Options:
           Set an option: RequestTTY=auto|yes|no|force, Term=<type>, EscapeChar=<char>, StrictHostKeyChecking=ask|yes|accept-new|no, LocalForward=<spec>, RemoteForward=<spec>, DynamicForward=<spec>, ProxyJump=<chain>, ServerAliveInterval=<seconds>
   -N
           Do not execute a remote command or session; hold the connection open for the forwards
+  -f
+          Go to background after the startup checks (ssh2 -f): the session detaches from the terminal and keeps running
   -M
           Run as the control master: share one authenticated connection across the invocations through the control socket (-M)
   -S <PATH>

@@ -39,7 +39,7 @@ Legend for the platform columns: `yes` = implemented, `-` = not implemented / N/
 | - | `--control-persist` | value | "no" | yes | - | yes (unix) | Go + Rust |
 | - | `--dynamic-forward` (internal? no) | - | - | - | - | - | (see `-D`) |
 | `-e` | - | char | none | - | yes | - | C only |
-| `-f` | - | flag | false | yes | yes | - | Go + C |
+| `-f` | - | flag | false | yes | yes | yes | all three |
 | - | `--forward-agent` | flag | false | yes | - (see `-A`) | yes | all three (short `-A`) |
 | - | `--forward-tcp` / `--forward-udp` | string (`localport/remoteip@remoteport`) | "" | yes | - | yes (deprecated alias of `-L` / `-L udp://`) | Go + Rust (C never carried the aliases) |
 | - | `--handshake-idle-timeout` | duration | none | - | - | yes | Rust only |

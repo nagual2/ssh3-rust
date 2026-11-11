@@ -159,6 +159,71 @@ const DEFAULT_PTY_ROWS: u16 = 24;
 /// local environment provides one.
 const DEFAULT_TERM_TYPE: &str = "xterm-256color";
 
+/// The environment marker of the re-executed `-f` background child.
+///
+/// The parent re-executes this binary detached with the marker set to `1`;
+/// the child skips the detach step and runs the session straight away, the
+/// way the `backgroundEnv` of the reference does (`cmd/background.go:17`).
+pub const SSH3_F_DAEMON_ENV: &str = "SSH3_F_DAEMON";
+
+/// The facts the parent of a `-f` invocation needs to judge whether the
+/// detached child can come up without a terminal: what keeps running, which
+/// authentication methods were asked for, the resolved host key policy and
+/// whether the host is already pinned. The struct mirrors the
+/// `backgroundOptions` of the reference (`cmd/background.go:25`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ssh3BackgroundOptions {
+    /// A password was asked for: a tty prompt the child cannot serve.
+    pub password_auth: bool,
+    /// The OIDC flow was asked for: it opens a browser.
+    pub oidc: bool,
+    /// The control master backgrounds itself already (`-M`/`-control-master`
+    /// resolved to `yes` or `auto`).
+    pub control_master: bool,
+    /// The resolved host key policy is the default `ask`.
+    pub strict_ask: bool,
+    /// The target is pinned in the known_hosts file already.
+    pub host_pinned: bool,
+    /// A remote command was given.
+    pub has_command: bool,
+    /// `-N` was given.
+    pub no_session: bool,
+    /// A forward or a transfer was given (`-L`/`-D`/`-R`/`--transfer`).
+    pub has_forwards: bool,
+}
+
+/// Validates the `-f` background mode of the command line.
+///
+/// Returns the reason the detached child cannot come up on its own, or `Ok`
+/// when `-f` may detach. The refusals and their order follow the
+/// `validateBackgroundMode` of the reference (`cmd/background.go:38`): every
+/// configuration that would need an interactive answer is refused here, in
+/// the parent, instead of letting the session die silently in the
+/// background.
+pub fn validate_background_mode(options: &Ssh3BackgroundOptions) -> Result<(), String> {
+    if !options.has_command && !options.no_session && !options.has_forwards {
+        return Err("-f: nothing to keep running in the background: give a remote command, -N or a forward (-L/-D/-R/-transfer)".to_string());
+    }
+    if options.password_auth {
+        return Err("-f: password authentication needs a prompt and cannot run in the background: use a key or the agent".to_string());
+    }
+    if options.oidc {
+        return Err(
+            "-f: the OIDC flow opens a browser and cannot run in the background".to_string(),
+        );
+    }
+    if options.control_master {
+        return Err(
+            "-f: the control master already goes to the background with -control-persist: drop -f"
+                .to_string(),
+        );
+    }
+    if options.strict_ask && !options.host_pinned {
+        return Err("-f: the default ask policy cannot prompt in the background and the host is not pinned yet: pin it (run once without -f) or pass -o StrictHostKeyChecking=accept-new".to_string());
+    }
+    Ok(())
+}
+
 /// The trust the client has in the certificate of the server.
 #[derive(Clone, Debug)]
 pub enum Ssh3TrustStrategy {
