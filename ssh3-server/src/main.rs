@@ -240,17 +240,31 @@ where
         .collect()
 }
 
+/// The source of the environment the configuration reads: the process
+/// environment of the server in production, an injected map in the tests.
+trait EnvLookup {
+    fn lookup(&self, name: &str) -> Option<String>;
+}
+
+/// The process environment the server runs with.
+struct ProcessEnv;
+
+impl EnvLookup for ProcessEnv {
+    fn lookup(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+}
+
 /// Reads an environment variable, ignoring an empty value.
-fn env_value(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
+fn env_value(env: &impl EnvLookup, name: &str) -> Option<String> {
+    env.lookup(name)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
 
 /// Reads a duration from the environment, ignoring an unparsable value.
-fn env_duration(name: &str) -> Option<Duration> {
-    let value = env_value(name)?;
+fn env_duration(env: &impl EnvLookup, name: &str) -> Option<Duration> {
+    let value = env_value(env, name)?;
     match parse_duration(&value) {
         Ok(duration) => Some(duration),
         Err(err) => {
@@ -261,8 +275,8 @@ fn env_duration(name: &str) -> Option<Duration> {
 }
 
 /// Reads a number from the environment, ignoring an unparsable value.
-fn env_number<T: std::str::FromStr>(name: &str) -> Option<T> {
-    let value = env_value(name)?;
+fn env_number<T: std::str::FromStr>(env: &impl EnvLookup, name: &str) -> Option<T> {
+    let value = env_value(env, name)?;
     match value.parse::<T>() {
         Ok(number) => Some(number),
         Err(_) => {
@@ -274,6 +288,16 @@ fn env_number<T: std::str::FromStr>(name: &str) -> Option<T> {
 
 /// Builds the configuration of the server from the command line.
 fn build_config(cli: Cli) -> Result<Ssh3ServerConfig, clap::Error> {
+    build_config_with_env(cli, &ProcessEnv)
+}
+
+/// Builds the configuration of the server from the command line and the
+/// given environment source.
+///
+/// The environment variables are the `SSH3_*` policy knobs of the Go
+/// reference (`cmd/ssh3-server.go:993-1083`): every one of them has a
+/// command-line counterpart, and the command line wins over the environment.
+fn build_config_with_env(cli: Cli, env: &impl EnvLookup) -> Result<Ssh3ServerConfig, clap::Error> {
     let mut config = Ssh3ServerConfig::default();
     if let Some(bind_addr) = cli.bind {
         config.bind_addr = bind_addr;
@@ -286,7 +310,7 @@ fn build_config(cli: Cli) -> Result<Ssh3ServerConfig, clap::Error> {
     }
     config.require_authentication = cli.require_auth;
     config.enable_password_login = cli.enable_password_login
-        || env_value(ENV_ENABLE_PASSWORD_LOGIN).is_some_and(|value| {
+        || env_value(env, ENV_ENABLE_PASSWORD_LOGIN).is_some_and(|value| {
             matches!(
                 value.to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
@@ -304,7 +328,7 @@ fn build_config(cli: Cli) -> Result<Ssh3ServerConfig, clap::Error> {
 
     let permit_open = match cli.permit_open {
         Some(spec) => Some(spec),
-        None => env_value(ENV_PERMIT_OPEN),
+        None => env_value(env, ENV_PERMIT_OPEN),
     };
     if let Some(spec) = permit_open {
         config.permit_open = match ForwardPolicy::parse(&spec) {
@@ -320,7 +344,7 @@ fn build_config(cli: Cli) -> Result<Ssh3ServerConfig, clap::Error> {
 
     let permit_listen = match cli.permit_listen {
         Some(spec) => Some(spec),
-        None => env_value(ENV_PERMIT_LISTEN),
+        None => env_value(env, ENV_PERMIT_LISTEN),
     };
     if let Some(spec) = permit_listen {
         config.permit_listen = match ForwardPolicy::parse(&spec) {
@@ -334,11 +358,14 @@ fn build_config(cli: Cli) -> Result<Ssh3ServerConfig, clap::Error> {
         };
     }
 
-    if let Some(url_path) = cli.url_path.or_else(|| env_value(ENV_URL_PATH)) {
+    if let Some(url_path) = cli.url_path.or_else(|| env_value(env, ENV_URL_PATH)) {
         config.url_path = url_path;
     }
 
-    if let Some(policy) = cli.gateway_ports.or_else(|| env_value(ENV_GATEWAY_PORTS)) {
+    if let Some(policy) = cli
+        .gateway_ports
+        .or_else(|| env_value(env, ENV_GATEWAY_PORTS))
+    {
         config.gateway_ports = match GatewayPortsPolicy::parse(&policy) {
             Ok(policy) => policy,
             Err(err) => {
@@ -352,74 +379,79 @@ fn build_config(cli: Cli) -> Result<Ssh3ServerConfig, clap::Error> {
 
     if let Some(max) = cli
         .max_reverse_forwards
-        .or_else(|| env_number(ENV_MAX_REVERSE_FORWARDS))
+        .or_else(|| env_number(env, ENV_MAX_REVERSE_FORWARDS))
     {
         config.max_reverse_forwards_per_user = max;
     }
 
     if let Some(timeout) = cli
         .handshake_idle_timeout
-        .or_else(|| env_duration(ENV_HANDSHAKE_IDLE_TIMEOUT))
+        .or_else(|| env_duration(env, ENV_HANDSHAKE_IDLE_TIMEOUT))
     {
         config.handshake_idle_timeout = timeout;
     }
 
     if let Some(timeout) = cli
         .max_idle_timeout
-        .or_else(|| env_duration(ENV_MAX_IDLE_TIMEOUT))
+        .or_else(|| env_duration(env, ENV_MAX_IDLE_TIMEOUT))
     {
         config.max_idle_timeout = timeout;
     }
 
     if let Some(max) = cli
         .max_unauthenticated_conversations
-        .or_else(|| env_number(ENV_MAX_UNAUTH_CONVERSATIONS))
+        .or_else(|| env_number(env, ENV_MAX_UNAUTH_CONVERSATIONS))
     {
         config.max_unauthenticated_conversations = max;
     }
 
     if let Some(max) = cli
         .max_connections
-        .or_else(|| env_number(ENV_MAX_CONNECTIONS))
+        .or_else(|| env_number(env, ENV_MAX_CONNECTIONS))
     {
         config.max_connections = max;
     }
 
     if let Some(max) = cli
         .max_channels_per_conversation
-        .or_else(|| env_number(ENV_MAX_CHANNELS_PER_CONVERSATION))
+        .or_else(|| env_number(env, ENV_MAX_CHANNELS_PER_CONVERSATION))
     {
         config.max_channels_per_conversation = max;
     }
 
     if let Some(max) = cli
         .max_incoming_streams
-        .or_else(|| env_number(ENV_MAX_INCOMING_STREAMS))
+        .or_else(|| env_number(env, ENV_MAX_INCOMING_STREAMS))
     {
         config.max_incoming_streams = max;
     }
 
     if let Some(max) = cli
         .max_incoming_uni_streams
-        .or_else(|| env_number(ENV_MAX_INCOMING_UNI_STREAMS))
+        .or_else(|| env_number(env, ENV_MAX_INCOMING_UNI_STREAMS))
     {
         config.max_incoming_uni_streams = max;
     }
 
     if let Some(max) = cli
         .max_password_failures
-        .or_else(|| env_number(ENV_MAX_PASSWORD_FAILURES))
+        .or_else(|| env_number(env, ENV_MAX_PASSWORD_FAILURES))
     {
         config.max_password_failures = max;
     }
 
     if let Some(lockout) = cli.password_lockout.or_else(|| {
-        env_duration(ENV_PASSWORD_LOCKOUT).or_else(|| env_duration(ENV_PASSWORD_LOCKOUT_ALIAS))
+        env_duration(env, ENV_PASSWORD_LOCKOUT)
+            .or_else(|| env_duration(env, ENV_PASSWORD_LOCKOUT_ALIAS))
     }) {
         config.password_lockout = lockout;
     }
 
-    if let Some(mode) = cli.sftp_jail.clone().or_else(|| env_value(ENV_SFTP_JAIL)) {
+    if let Some(mode) = cli
+        .sftp_jail
+        .clone()
+        .or_else(|| env_value(env, ENV_SFTP_JAIL))
+    {
         config.sftp_jail = match SftpJailMode::parse(&mode) {
             Ok(mode) => mode,
             Err(err) => {
@@ -440,7 +472,7 @@ fn build_config(cli: Cli) -> Result<Ssh3ServerConfig, clap::Error> {
 
     if let Some(max) = cli
         .max_sftp_sessions_per_user
-        .or_else(|| env_number(ENV_MAX_SFTP_SESSIONS))
+        .or_else(|| env_number(env, ENV_MAX_SFTP_SESSIONS))
     {
         config.max_sftp_sessions_per_user = max;
     }
@@ -454,8 +486,7 @@ fn build_config(cli: Cli) -> Result<Ssh3ServerConfig, clap::Error> {
     // the drain window of the graceful shutdown: a plain number of seconds,
     // parsed like the Go reference parses it (there is no command-line flag
     // for it, like there is none in the Go implementation)
-    config.shutdown_drain =
-        shutdown_drain_period(std::env::var(ENV_SHUTDOWN_DRAIN).ok().as_deref());
+    config.shutdown_drain = shutdown_drain_period(env.lookup(ENV_SHUTDOWN_DRAIN).as_deref());
 
     Ok(config)
 }
@@ -514,6 +545,228 @@ async fn main() -> ExitCode {
         Err(err) => {
             eprintln!("ssh3-rust-server failed: {err}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use clap::Parser;
+
+    use super::{Cli, build_config_with_env};
+    use ssh3_server::{GatewayPortsPolicy, SftpJailMode, Ssh3ServerConfig};
+
+    /// The environment the tests inject: a map instead of the process
+    /// environment, so the parallel tests never race on global state.
+    struct FakeEnv(HashMap<String, String>);
+
+    impl FakeEnv {
+        /// Builds an environment from `name=value` pairs.
+        fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+            Self(
+                pairs
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
+            )
+        }
+    }
+
+    impl super::EnvLookup for FakeEnv {
+        fn lookup(&self, name: &str) -> Option<String> {
+            self.0.get(name).cloned()
+        }
+    }
+
+    /// Builds the configuration the given environment and command line
+    /// produce, the way the binary puts them together.
+    fn config_of(env: &FakeEnv, arguments: &[&str]) -> Ssh3ServerConfig {
+        let cli = Cli::try_parse_from(arguments).unwrap();
+        build_config_with_env(cli, env).unwrap()
+    }
+
+    /// Every policy variable of the reference configures the server without
+    /// a single command line option: a systemd EnvironmentFile carries the
+    /// whole policy (`packaging/ssh3-rust-server.env`).
+    #[test]
+    fn the_environment_configures_the_server_without_the_command_line() {
+        let env = FakeEnv::from_pairs(&[
+            ("SSH3_PERMIT_OPEN", "*.example.org:443"),
+            ("SSH3_PERMIT_LISTEN", "127.0.0.1:*"),
+            ("SSH3_GATEWAY_PORTS", "clientspecified"),
+            ("SSH3_MAX_REVERSE_FORWARDS", "7"),
+            ("SSH3_MAX_UNAUTH_CONVERSATIONS", "33"),
+            ("SSH3_MAX_PASSWORD_FAILURES", "4"),
+            ("SSH3_PASSWORD_LOCKOUT_SECONDS", "9"),
+            ("SSH3_MAX_CONNECTIONS", "11"),
+            ("SSH3_MAX_CHANNELS_PER_CONVERSATION", "12"),
+            ("SSH3_MAX_INCOMING_STREAMS", "13"),
+            ("SSH3_MAX_INCOMING_UNI_STREAMS", "14"),
+            ("SSH3_MAX_SFTP_SESSIONS_PER_USER", "15"),
+            ("SSH3_SFTP_JAIL", "lexical"),
+            ("SSH3_URL_PATH", "/secret-term"),
+            ("SSH3_HANDSHAKE_IDLE_TIMEOUT", "7"),
+            ("SSH3_MAX_IDLE_TIMEOUT", "86400"),
+            ("SSH3_SHUTDOWN_DRAIN", "42"),
+        ]);
+        let config = config_of(&env, &["ssh3-rust-server"]);
+        assert_eq!(config.max_reverse_forwards_per_user, 7);
+        assert_eq!(config.max_unauthenticated_conversations, 33);
+        assert_eq!(config.max_password_failures, 4);
+        assert_eq!(config.password_lockout, Duration::from_secs(9));
+        assert_eq!(config.max_connections, 11);
+        assert_eq!(config.max_channels_per_conversation, 12);
+        assert_eq!(config.max_incoming_streams, 13);
+        assert_eq!(config.max_incoming_uni_streams, 14);
+        assert_eq!(config.max_sftp_sessions_per_user, 15);
+        assert_eq!(config.sftp_jail, SftpJailMode::Lexical);
+        assert_eq!(config.url_path, "/secret-term");
+        assert_eq!(config.handshake_idle_timeout, Duration::from_secs(7));
+        assert_eq!(config.max_idle_timeout, Duration::from_secs(86400));
+        assert_eq!(config.shutdown_drain, Duration::from_secs(42));
+        assert_eq!(config.gateway_ports, GatewayPortsPolicy::ClientSpecified);
+        let permit_open = config
+            .permit_open
+            .expect("the env set a permit-open policy");
+        assert!(permit_open.allows("srv.example.org", 443));
+        assert!(!permit_open.allows("srv.example.org", 80));
+        let permit_listen = config
+            .permit_listen
+            .expect("the env set a permit-listen policy");
+        assert!(permit_listen.allows("127.0.0.1", 8080));
+        assert!(!permit_listen.allows("192.0.2.1", 8080));
+    }
+
+    /// The password login of the I4 semantics: the environment only enables
+    /// it, the default stays the safe side (off), and the garbage keeps the
+    /// default like a failed `strconv.ParseBool` of the reference does.
+    #[test]
+    fn the_password_login_env_only_enables_the_login() {
+        for affirmative in ["1", "true", "TRUE", "True", "yes", "on"] {
+            let env = FakeEnv::from_pairs(&[("SSH3_ENABLE_PASSWORD_LOGIN", affirmative)]);
+            assert!(
+                config_of(&env, &["ssh3-rust-server"]).enable_password_login,
+                "{affirmative} enables the password login"
+            );
+        }
+        for negative in ["0", "false", "no", "off", "garbage", ""] {
+            let env = FakeEnv::from_pairs(&[("SSH3_ENABLE_PASSWORD_LOGIN", negative)]);
+            assert!(
+                !config_of(&env, &["ssh3-rust-server"]).enable_password_login,
+                "{negative} keeps the login off"
+            );
+        }
+        // Without the variable the default stays off, the documented I4
+        // divergence from the Go default on the safe side.
+        let env = FakeEnv::from_pairs(&[]);
+        assert!(!config_of(&env, &["ssh3-rust-server"]).enable_password_login);
+    }
+
+    /// The numeric variables fall back to the defaults on garbage, the way
+    /// the `strconv.Atoi` of the reference keeps its default on a parse
+    /// error (`cmd/ssh3-server.go:1004` and the other `SSH3_MAX_*` knobs).
+    #[test]
+    fn the_garbage_numbers_fall_back_to_the_defaults() {
+        let env = FakeEnv::from_pairs(&[
+            ("SSH3_MAX_REVERSE_FORWARDS", "many"),
+            ("SSH3_MAX_UNAUTH_CONVERSATIONS", "1e3"),
+            ("SSH3_MAX_PASSWORD_FAILURES", "-3"),
+            ("SSH3_MAX_CONNECTIONS", "four"),
+            ("SSH3_MAX_CHANNELS_PER_CONVERSATION", "0x10"),
+            ("SSH3_MAX_INCOMING_STREAMS", "much"),
+            ("SSH3_MAX_INCOMING_UNI_STREAMS", "more"),
+            ("SSH3_MAX_SFTP_SESSIONS_PER_USER", "unbounded"),
+        ]);
+        let config = config_of(&env, &["ssh3-rust-server"]);
+        assert_eq!(config.max_reverse_forwards_per_user, 10);
+        assert_eq!(config.max_unauthenticated_conversations, 100);
+        assert_eq!(config.max_password_failures, 10);
+        assert_eq!(config.max_connections, 0);
+        assert_eq!(config.max_channels_per_conversation, 64);
+        assert_eq!(config.max_incoming_streams, 100);
+        assert_eq!(config.max_incoming_uni_streams, 100);
+        assert_eq!(config.max_sftp_sessions_per_user, 16);
+    }
+
+    /// The command line wins over the environment, like in the reference.
+    #[test]
+    fn the_command_line_wins_over_the_environment() {
+        let env = FakeEnv::from_pairs(&[
+            ("SSH3_MAX_CONNECTIONS", "9"),
+            ("SSH3_GATEWAY_PORTS", "clientspecified"),
+        ]);
+        let config = config_of(
+            &env,
+            &[
+                "ssh3-rust-server",
+                "--max-connections",
+                "5",
+                "--gateway-ports",
+                "yes",
+            ],
+        );
+        assert_eq!(config.max_connections, 5);
+        assert_eq!(config.gateway_ports, GatewayPortsPolicy::Yes);
+    }
+
+    /// The policy values are validated like the reference validates them: a
+    /// garbage policy refuses the configuration instead of being ignored.
+    #[test]
+    fn the_garbage_policy_values_refuse_the_configuration() {
+        for (name, value) in [
+            ("SSH3_GATEWAY_PORTS", "sometimes"),
+            ("SSH3_SFTP_JAIL", "none"),
+            ("SSH3_PERMIT_OPEN", "host-without-port"),
+            ("SSH3_PERMIT_LISTEN", "*.example.org"),
+        ] {
+            let env = FakeEnv::from_pairs(&[(name, value)]);
+            let cli = Cli::try_parse_from(["ssh3-rust-server"]).unwrap();
+            assert!(
+                build_config_with_env(cli, &env).is_err(),
+                "{name}={value} refuses the configuration"
+            );
+        }
+    }
+
+    /// The duration variables read the second-based spellings of the
+    /// reference; the unit suffixes ride along as a superset.
+    #[test]
+    fn the_duration_variables_read_the_reference_spellings() {
+        let env = FakeEnv::from_pairs(&[
+            ("SSH3_HANDSHAKE_IDLE_TIMEOUT", "7"),
+            ("SSH3_MAX_IDLE_TIMEOUT", "2m"),
+            ("SSH3_PASSWORD_LOCKOUT_SECONDS", "90"),
+        ]);
+        let config = config_of(&env, &["ssh3-rust-server"]);
+        assert_eq!(config.handshake_idle_timeout, Duration::from_secs(7));
+        assert_eq!(config.max_idle_timeout, Duration::from_secs(120));
+        assert_eq!(config.password_lockout, Duration::from_secs(90));
+        // The lockout alias of the earlier waves keeps working.
+        let env = FakeEnv::from_pairs(&[("SSH3_MAX_PASSWORD_FAILOUT_SECONDS", "120")]);
+        let config = config_of(&env, &["ssh3-rust-server"]);
+        assert_eq!(config.password_lockout, Duration::from_secs(120));
+    }
+
+    /// The drain window of the graceful shutdown: a plain number of seconds
+    /// like the reference parses it, the default on garbage and on the unit
+    /// suffixes (`SSH3_SHUTDOWN_DRAIN` of the Go implementation).
+    #[test]
+    fn the_shutdown_drain_env_sets_the_drain_window() {
+        let env = FakeEnv::from_pairs(&[("SSH3_SHUTDOWN_DRAIN", "30")]);
+        assert_eq!(
+            config_of(&env, &["ssh3-rust-server"]).shutdown_drain,
+            Duration::from_secs(30)
+        );
+        for garbage in ["5s", " 5", "-2", "soon"] {
+            let env = FakeEnv::from_pairs(&[("SSH3_SHUTDOWN_DRAIN", garbage)]);
+            assert_eq!(
+                config_of(&env, &["ssh3-rust-server"]).shutdown_drain,
+                Duration::from_secs(5),
+                "{garbage} falls back to the default drain"
+            );
         }
     }
 }
