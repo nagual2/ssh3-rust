@@ -9,6 +9,9 @@
 //! * [`run_with_self_signed`] — convenience entry point that generates a
 //!   self-signed certificate, serves until the endpoint dies and drains the
 //!   conversations on a shutdown signal.
+//! * [`run_with_certificates`] / [`load_identity`] — the `-cert`/`-key` pair
+//!   of the reference: the operator's PEM files are loaded once at startup
+//!   and served the same way.
 //! * [`serve_endpoint`] / [`serve_connection`] — building blocks for callers
 //!   that own the TLS configuration or the QUIC endpoint themselves.
 //! * [`serve_endpoint_until_shutdown`] / [`ShutdownSignal`] — the graceful
@@ -32,7 +35,7 @@
 //! | `sftp` | the server side of the SFTP subsystem (the file transfer) |
 //! | `sftp_child` | the internal child of the chroot jail of the SFTP subsystem |
 //! | `sftp_stream` | the byte streams of the SFTP subsystem |
-//! | `tls` | self-signed TLS entry point |
+//! | `tls` | TLS entry points: the self-signed generation and the `-cert`/`-key` pair of the reference |
 //! | `runtime` | endpoint/connection acceptance and channel routing |
 //! | `shutdown` | the graceful shutdown: the signal request, the OS signals and the drain window |
 //! | `error` | [`Ssh3ServerError`] and benign-error classification |
@@ -73,4 +76,4 @@ pub use runtime::{serve_connection, serve_endpoint, serve_endpoint_until_shutdow
 pub use sftp::SftpSessionBudget;
 pub use sftp_child::{InternalSftpOptions, run_internal_sftp_server};
 pub use shutdown::{ShutdownSignal, shutdown_drain_period, shutdown_signal};
-pub use tls::{apply_transport_limits, run_with_self_signed};
+pub use tls::{apply_transport_limits, load_identity, run_with_certificates, run_with_self_signed};

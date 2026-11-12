@@ -8,6 +8,7 @@
 .Nm
 .Op Fl -bind Ar addr:port
 .Op Fl -hostname Ar name
+.Op Fl -cert Ar file Fl -key Ar file
 .Op Fl -url-path Ar path
 .Op Fl -user Ar name
 .Op Fl -shell Ar path
@@ -74,8 +75,12 @@ The QUIC handshake needs a certificate: on the first start the server
 generates a self-signed pair in memory, and the
 .Fl -hostname
 options (repeated for every name, the addresses included) carry the
-subject alternative names the clients validate the certificate
-against.
+subject alternative names the clients validate the certificate against.
+The operator's own pair rides the
+.Fl -cert , Fl -key
+options: a server started with them serves the given files instead of
+the generated pair, and the clients pin or trust that identity
+.Pq the Fl -ca-cert option of Xr ssh3 1 .
 .Pp
 Every option below has an
 .Ev SSH3_*
@@ -96,6 +101,20 @@ The QUIC listen address
 .It Fl -hostname Ar name
 The subject alternative name of the generated certificate, repeatable
 .Pq default Cm localhost .
+.It Fl -cert Ar file , Fl -key Ar file
+The operator's certificate chain (or fullchain) and its private key: a
+server started with the pair serves it instead of the generated
+self-signed certificate. The two are given together, a lone half
+refuses the start, and the sshd shapes
+.Fl c Ar file No and Fl h Ar file
+are aliases of the same knobs
+.Pq a doubled form of one knob, Cm -c No with Cm -cert , is an error ;
+.Fl h
+is the host key, the usage rides the long
+.Fl -help .
+The files are read once at startup: a missing or broken file refuses
+the start, and a new identity takes a restart
+.Pq the reference does not re-read the files either .
 .It Fl -url-path Ar path
 The secret HTTP/3 CONNECT route
 .Pq default Li /ssh3-term .

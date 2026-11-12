@@ -30,6 +30,7 @@ clap = { version = "4.5.39", features = ["derive"] }
 h3 = "0.0.8"
 http = "1.3.1"
 quinn = "0.11.12"
+rustls-pemfile = "2.2.0"
 russh-sftp = "3.0.1"
 ssh3-auth = { path = "../ssh3-auth" }
 ssh3-core = { path = "../ssh3-core" }
@@ -51,6 +52,7 @@ tokio = { version = "1.48.0", features = [
 
 [dev-dependencies]
 futures-util = "0.3.31"
+rcgen = "0.14.7"
 p256 = { version = "0.13.2", features = ["ecdsa"] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 rsa = { version = "0.9.10", features = ["sha2"] }

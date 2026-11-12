@@ -7,7 +7,7 @@ use clap::{Parser, ValueHint, error::ErrorKind};
 use ssh3_server::{
     ForwardPolicy, GatewayPortsPolicy, InternalSftpOptions, LogLevel, SftpJailMode,
     Ssh3ServerConfig, log_error, log_warn, logging, parse_duration, run_internal_sftp_server,
-    run_with_self_signed, shutdown_drain_period,
+    run_with_certificates, run_with_self_signed, shutdown_drain_period,
 };
 
 /// The environment variables the server options can be set with.
@@ -37,6 +37,7 @@ const ENV_LOG_FILE: &str = "SSH3_LOG_FILE";
 #[command(
     name = "ssh3-rust-server",
     version,
+    disable_help_flag = true,
     about = "Starts a minimal Rust SSH3 server with a self-signed certificate."
 )]
 struct Cli {
@@ -45,6 +46,44 @@ struct Cli {
 
     #[arg(long, value_name = "NAME", action = clap::ArgAction::Append)]
     hostname: Vec<String>,
+
+    /// The certificate chain (or fullchain) the server serves, the `-cert`
+    /// of the reference.
+    ///
+    /// The flag rides with its private key: `-key` is mandatory with it, and
+    /// a server started with the pair skips the self-signed generation.
+    #[arg(
+        long = "cert",
+        value_name = "FILE",
+        value_hint = ValueHint::FilePath
+    )]
+    cert: Option<PathBuf>,
+
+    /// The private key of the `-cert` certificate.
+    #[arg(
+        long = "key",
+        value_name = "FILE",
+        value_hint = ValueHint::FilePath
+    )]
+    key: Option<PathBuf>,
+
+    /// The sshd-shaped alias of `-cert` (`sshd -c`).
+    #[arg(short = 'c', value_name = "FILE", value_hint = ValueHint::FilePath)]
+    cert_alias: Option<PathBuf>,
+
+    /// The sshd-shaped alias of `-key` (`sshd -h`).
+    ///
+    /// The alias takes over the `-h` short flag, like in the reference where
+    /// `-h` is the host key; the usage rides the long `--help`.
+    #[arg(short = 'h', value_name = "FILE", value_hint = ValueHint::FilePath)]
+    key_alias: Option<PathBuf>,
+
+    /// Prints the usage.
+    ///
+    /// The help is long-only: the `-h` short flag belongs to the host key,
+    /// the sshd shape of the reference.
+    #[arg(long, action = clap::ArgAction::Help)]
+    help: (),
 
     #[arg(long = "server-header", value_name = "TEXT")]
     server_header: Option<String>,
@@ -216,6 +255,8 @@ const GO_STYLE_OPTIONS: &[&str] = &[
     "password-lockout",
     "sftp-jail",
     "max-sftp-sessions-per-user",
+    "cert",
+    "key",
 ];
 
 /// Rewrites the Go-style single-dash options into their clap spelling.
@@ -241,6 +282,53 @@ where
             }
         })
         .collect()
+}
+
+/// Applies the sshd(8)-shaped `-c`/`-h` aliases to the `-cert`/`-key` values,
+/// the way the reference does (`cmd/ssh2_parity.go:206-220`): the alias wins
+/// when only it is given, and giving both forms of the same knob is an error
+/// instead of a silent last-one-wins.
+fn resolve_server_cert_key_aliases(
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+    cert_alias: Option<PathBuf>,
+    key_alias: Option<PathBuf>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+    if cert.is_some() && cert_alias.is_some() {
+        return Err("-c and -cert are mutually exclusive".to_string());
+    }
+    if key.is_some() && key_alias.is_some() {
+        return Err("-h and -key are mutually exclusive".to_string());
+    }
+    Ok((cert.or(cert_alias), key.or(key_alias)))
+}
+
+/// Resolves the TLS identity of the server from the command line flags.
+///
+/// `Some` carries the `-cert`/`-key` pair the server serves instead of the
+/// generated self-signed certificate; `None` keeps the self-signed default.
+/// A lone half of the pair is refused: the certificate and its private key
+/// are configured together, the half-configured pair of the reference is a
+/// startup failure (`cmd/ssh3-server.go:1185-1200`).
+fn resolve_server_identity(cli: &Cli) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let (cert, key) = resolve_server_cert_key_aliases(
+        cli.cert.clone(),
+        cli.key.clone(),
+        cli.cert_alias.clone(),
+        cli.key_alias.clone(),
+    )?;
+    match (cert, key) {
+        (Some(cert), Some(key)) => Ok(Some((cert, key))),
+        (Some(_), None) => Err(
+            "-cert requires -key: the certificate and its private key are configured as a pair"
+                .to_string(),
+        ),
+        (None, Some(_)) => Err(
+            "-key requires -cert: the certificate and its private key are configured as a pair"
+                .to_string(),
+        ),
+        (None, None) => Ok(None),
+    }
 }
 
 /// The source of the environment the configuration reads: the process
@@ -544,6 +632,16 @@ async fn main() -> ExitCode {
         return run_internal_child(&cli).await;
     }
 
+    // the TLS identity of the server: the -cert/-key pair of the operator or
+    // the generated self-signed certificate
+    let identity = match resolve_server_identity(&cli) {
+        Ok(identity) => identity,
+        Err(message) => {
+            eprintln!("ssh3-rust-server {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let config = match build_config(cli) {
         Ok(config) => config,
         Err(err) => {
@@ -572,7 +670,14 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match run_with_self_signed(config).await {
+    // the -cert/-key pair of the operator goes over the serve_endpoint path
+    // with the loaded identity; without the pair the server generates its
+    // self-signed certificate, the L2 behavior
+    let run = match identity {
+        Some((cert, key)) => run_with_certificates(config, &cert, &key).await,
+        None => run_with_self_signed(config).await,
+    };
+    match run {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             log_error!("ssh3-rust-server failed: {err}");
@@ -584,6 +689,7 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use clap::Parser;
@@ -800,5 +906,102 @@ mod tests {
                 "{garbage} falls back to the default drain"
             );
         }
+    }
+
+    /// Parses the certificate flags the way the binary does: the arguments
+    /// ride the Go-style normalizer first, then the resolver of the identity.
+    fn identity_of(arguments: &[&str]) -> Result<Option<(PathBuf, PathBuf)>, String> {
+        let mut owned = vec!["ssh3-rust-server"];
+        owned.extend_from_slice(arguments);
+        let normalized = super::normalize_go_style_args(owned);
+        let cli = Cli::try_parse_from(normalized).unwrap();
+        super::resolve_server_identity(&cli)
+    }
+
+    /// The `-cert`/`-key` pair of the reference
+    /// (`cmd/ssh3-server.go:969-970`) reaches the server identity: both the
+    /// clap spelling and the single-dash Go shape of the same flags.
+    #[test]
+    fn the_cert_and_key_flags_take_the_pair() {
+        let identity = identity_of(&["--cert", "cert.pem", "--key", "priv.key"]).unwrap();
+        assert_eq!(
+            identity,
+            Some((PathBuf::from("cert.pem"), PathBuf::from("priv.key")))
+        );
+        let identity = identity_of(&["-cert", "cert.pem", "-key", "priv.key"]).unwrap();
+        assert_eq!(
+            identity,
+            Some((PathBuf::from("cert.pem"), PathBuf::from("priv.key"))),
+            "the single-dash Go spelling of the reference works"
+        );
+    }
+
+    /// The sshd-shaped aliases of the reference
+    /// (`cmd/ssh3-server.go:973-974`, `cmd/ssh2_parity.go:206-220`): the
+    /// alias wins when only it is given, and the two spellings of the same
+    /// knob ride together (`-cert` with `-h`).
+    #[test]
+    fn the_cert_key_aliases_apply_like_the_reference() {
+        let identity = identity_of(&["-c", "host.crt", "-h", "host.key"]).unwrap();
+        assert_eq!(
+            identity,
+            Some((PathBuf::from("host.crt"), PathBuf::from("host.key"))),
+            "the sshd aliases alone configure the pair"
+        );
+        let identity = identity_of(&["--cert", "cert.pem", "-h", "host.key"]).unwrap();
+        assert_eq!(
+            identity,
+            Some((PathBuf::from("cert.pem"), PathBuf::from("host.key"))),
+            "the long cert rides with the short key alias"
+        );
+        let identity = identity_of(&["-c", "host.crt", "--key", "priv.key"]).unwrap();
+        assert_eq!(
+            identity,
+            Some((PathBuf::from("host.crt"), PathBuf::from("priv.key"))),
+            "the short cert alias rides with the long key"
+        );
+    }
+
+    /// Giving both forms of the same knob is an error instead of a silent
+    /// last-one-wins, with the messages of the reference
+    /// (`cmd/ssh2_parity.go:207-211`).
+    #[test]
+    fn the_doubled_cert_or_key_forms_refuse_the_start() {
+        assert_eq!(
+            identity_of(&["--cert", "cert.pem", "-c", "host.crt"]).unwrap_err(),
+            "-c and -cert are mutually exclusive"
+        );
+        assert_eq!(
+            identity_of(&["--key", "priv.key", "-h", "host.key"]).unwrap_err(),
+            "-h and -key are mutually exclusive"
+        );
+    }
+
+    /// A lone half of the pair is refused: the certificate and its private
+    /// key are configured together.
+    #[test]
+    fn a_lone_cert_or_key_flag_refuses_the_start() {
+        for lone in [
+            &["--cert", "cert.pem"][..],
+            &["--key", "priv.key"][..],
+            &["-c", "host.crt"][..],
+            &["-h", "host.key"][..],
+        ] {
+            assert!(identity_of(lone).is_err(), "{lone:?} refuses the start");
+        }
+        // and the plain start keeps the self-signed default
+        assert_eq!(identity_of(&[]).unwrap(), None);
+    }
+
+    /// The `-h` alias of the host key takes over the help short flag, like
+    /// in the Go reference where `-h` is the host key; the long `--help`
+    /// keeps showing the usage.
+    #[test]
+    fn the_h_alias_does_not_shadow_the_long_help() {
+        let normalized = super::normalize_go_style_args(["ssh3-rust-server", "-h", "host.key"]);
+        let cli = Cli::try_parse_from(normalized).unwrap();
+        assert_eq!(cli.key_alias, Some(PathBuf::from("host.key")));
+        let help = Cli::try_parse_from(["ssh3-rust-server", "--help"]).unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 }
