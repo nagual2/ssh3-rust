@@ -912,12 +912,13 @@ fn build_config(cli: Cli) -> Result<ClientPlan, clap::Error> {
         }
     }
     let (config, control) = build_connection_config(cli, url, user)?;
-    // The `sftp` name opens the built-in interactive client; the other
-    // names ride the session channel as the subsystem request.
+    // Every named subsystem — `sftp` included — rides the session request:
+    // the dispatch of `main` opens the built-in interactive client for the
+    // `sftp` name, the other names ride the session channel.
     let request = match subsystem.as_deref() {
-        Some(name) if name != "sftp" => Ssh3SessionRequest::Subsystem(name.to_string()),
-        _ if command.is_empty() => Ssh3SessionRequest::Shell,
-        _ => Ssh3SessionRequest::Exec(command.join(" ")),
+        Some(name) => Ssh3SessionRequest::Subsystem(name.to_string()),
+        None if command.is_empty() => Ssh3SessionRequest::Shell,
+        None => Ssh3SessionRequest::Exec(command.join(" ")),
     };
     Ok(ClientPlan {
         config,
@@ -2869,6 +2870,17 @@ mod tests {
         assert_eq!(
             plan.request,
             Ssh3SessionRequest::Subsystem("netconf".to_string())
+        );
+    }
+
+    #[test]
+    fn the_sftp_name_rides_the_session_request_for_the_dispatch() {
+        let cli = Cli::try_parse_from(["ssh3", "-s", "sftp", "https://localhost:4433/ssh3-term"])
+            .unwrap();
+        let plan = build_config(cli).unwrap();
+        assert_eq!(
+            plan.request,
+            Ssh3SessionRequest::Subsystem("sftp".to_string())
         );
     }
 
