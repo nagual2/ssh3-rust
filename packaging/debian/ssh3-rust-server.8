@@ -115,6 +115,12 @@ is the host key, the usage rides the long
 The files are read once at startup: a missing or broken file refuses
 the start, and a new identity takes a restart
 .Pq the reference does not re-read the files either .
+A public Let's Encrypt certificate is obtained with an ACME client of
+your choice
+.Pq Xo certbot certonly Fl -preferred-challenges http-01 Xc ;
+in-process ACME automation is deliberately not carried, because the
+QUIC-only reference server never opens the TCP:443 listener the
+TLS-ALPN-01 validation requires.
 .It Fl -url-path Ar path
 The secret HTTP/3 CONNECT route
 .Pq default Li /ssh3-term .

@@ -88,6 +88,14 @@ Der Rust-Server startet mit einem selbstsignierten Zertifikat, deshalb nutzen
 die Beispiele unten `--insecure` (stattdessen das Zertifikat mit `--ca-cert`
 festnageln, wenn die Gegenstelle nicht auf demselben Host läuft).
 
+Für ein **öffentliches Zertifikat** holen Sie eines mit einem ACME-Client
+Ihrer Wahl (z. B. `certbot certonly --preferred-challenges http-01 -d
+<domain>`) und servieren es mit `--cert fullchain.pem --key privkey.pem` —
+die Dateien werden einmal beim Start geladen, ein erneuertes Paar erfordert
+einen Neustart. Eine eingebaute ACME-Automatik wird bewusst nicht übernommen:
+die QUIC-only-Form der Referenz kann die TLS-ALPN-01-Validierung nicht
+abschließen (sie öffnet nie einen TCP-Listener).
+
 Lokalen Server starten:
 
 ```bash
@@ -302,7 +310,7 @@ ausgelieferte Produkt, und der Rust-Workspace versucht nicht, sie nachzubauen:
 | Control Master / Verbindungs-Multiplexing | ja | ja |
 | Dateiübertragung (`-transfer`) | ja | ja |
 | Geheimer URL-Pfad | ja | ja |
-| Automatisierung öffentlicher Zertifikate (Let's Encrypt) | ja | nein (nur selbstsigniert) |
+| Automatisierung öffentlicher Zertifikate (Let's Encrypt) | ja | nein (bewusst nicht übernommen — ein certbot-Zertifikat mit `--cert`/`--key` servieren) |
 | Release-Verpackung (`.deb`, systemd-Unit, Release-Pipeline) | ja | ja (ohne goreleaser) |
 
 ## Bekannte Einschränkungen und Audit-Fundstellen

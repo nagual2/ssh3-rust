@@ -88,6 +88,13 @@ The Rust server starts with a self-signed certificate, so the examples below
 use `--insecure` (pin the certificate with `--ca-cert` instead whenever the
 peer is not on the same host).
 
+For a **public certificate**, obtain one with an ACME client of your choice
+(e.g. `certbot certonly --preferred-challenges http-01 -d <domain>`) and serve
+it with `--cert fullchain.pem --key privkey.pem` — the files are loaded once
+at the startup and a renewed pair takes a restart. In-process ACME
+automation is deliberately not carried: the reference QUIC-only form cannot
+complete the TLS-ALPN-01 validation (it never opens a TCP listener).
+
 Start a local server:
 
 ```bash
@@ -301,7 +308,7 @@ and the Rust workspace does not attempt to replicate it:
 | Control master / connection multiplexing | yes | yes |
 | File transfer (`-transfer`) | yes | yes |
 | Secret URL path | yes | yes |
-| Public certificate automation (Let's Encrypt) | yes | no (self-signed only) |
+| Public certificate automation (Let's Encrypt) | yes | no (deliberately not carried — serve a certbot certificate with `--cert`/`--key`) |
 | Release packaging (`.deb`, systemd unit, release pipeline) | yes | yes (no goreleaser) |
 
 ## Known limitations and audit findings
