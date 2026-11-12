@@ -281,7 +281,7 @@ T2 (шим h3) — отдельный трек, идёт параллельно;
 | UD1 | Выравнивание ключей | 3 дня | все имена/дефолты/алиасы синхронизируются; тестовый snapshot usage в CI | `ssh3 -h` байт-в-байт как в Go/C (в пределах разумного) — ✅ закрыто 2026-11-11 (`2959121`, хвост `f0df165`): `--proxy-jump` — visible-алиас `-J`, Go-орфографии `-pubkey-for-agent`/`-keylog`/`-oidc-config` ремапятся; алиас `--sftp` у `--transfer`; golden-снапшот usage (unix+windows) и гейт реестра `CLI_KEYS.md` в тестах |
 | UD2 | Серверные возможности (ACME/certs, graceful, root-gate, permit-open/listen) | 6–8 дней | server-side | C/Go interop |
 | UD3 | Windows-живость | 4 дня | named-pipe agent, консольные события согласно C | тест на Win-VM |
-| UD4 | SFTP-клиент + transfer-пути | 5 дней | `-s sftp`, `put:`, `get:`, resume | кросс-interop |
+| UD4 | SFTP-клиент + transfer-пути | 5 дней | `-s sftp`, `put:`, `get:`, resume | кросс-interop — ✅ закрыто 2026-11-12 (`196e1d1` + фиксы `ae52f89`/`16ab6f4`): полная interop-матрица с реальным эталоном (SSH3_GO_REPO, 29 кросс-сценариев зелёных, 0 skip), интерактивный SFTP в обе стороны Rust↔Go, e2e CLI-диспетчера `sftp_cli.rs`; попутно исправлены EOF-семантика read сервера и недостижимый диспетчер `-s sftp` |
 | UD5 | Reverse/proxyjump/UDP и тестовые сборки | 4 дня | довести X | triple-interop |
 | UD6 | Аудит по трёхсторонней матрице | 3 дня | отчёт `docs/audit-2026-11.md` | 0 критичных расхождений |
 
