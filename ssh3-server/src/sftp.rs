@@ -527,6 +527,13 @@ impl Handler for SftpHandler {
         let mut buffer = vec![0u8; len as usize];
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            // a read past the end answers the EOF status, as the reference
+            // does: the pkg/sftp client of the reference never ends a
+            // download without it, an empty data reply keeps it polling the
+            // same offset forever
+            return Err(SftpError::Eof);
+        }
         buffer.truncate(read);
         Ok(Data { id, data: buffer })
     }
