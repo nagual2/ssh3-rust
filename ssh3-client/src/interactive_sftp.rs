@@ -5,10 +5,10 @@
 //! `cmd/subsystem.go`, `runSFTPSubsystem`). The command set stays reduced,
 //! but every command names and behaves like the one of the reference.
 
-use std::io::{self, Write};
+use std::io;
 
 use russh_sftp::client::SftpSession;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::Ssh3ClientError;
 use crate::connect_client;
@@ -31,21 +31,37 @@ pub async fn run(config: &crate::Ssh3ClientConfig) -> Result<i32, Ssh3ClientErro
         .await
         .unwrap_or_else(|_| String::from("/"));
     println!("Connected to {}.", cwd);
-    run_prompt(&sftp, &mut cwd).await;
+    let mut reader = BufReader::new(tokio::io::stdin());
+    let mut writer = tokio::io::stdout();
+    run_prompt(&sftp, &mut cwd, &mut reader, &mut writer).await;
     let _ = sftp.close().await;
     client.shutdown().await;
     Ok(0)
 }
 
-async fn run_prompt(sftp: &SftpSession, cwd: &mut String) {
-    let mut reader = BufReader::new(tokio::io::stdin());
+/// Runs the prompt loop of the interactive client.
+///
+/// The commands arrive through the reader line by line and the reports of
+/// the session go through the writer, so a batched session (a script on the
+/// stdin pipe, a test with an in-memory buffer) behaves like an interactive
+/// one. The failures of a command go to the stderr of the process, as an
+/// interactive session reports them.
+pub(crate) async fn run_prompt<R, W>(
+    sftp: &SftpSession,
+    cwd: &mut String,
+    reader: &mut R,
+    writer: &mut W,
+) where
+    R: AsyncBufRead + ?Sized + Unpin,
+    W: AsyncWrite + ?Sized + Unpin,
+{
     loop {
-        print!("sftp> ");
-        let _ = io::stdout().flush();
+        let _ = writer.write_all(b"sftp> ").await;
+        let _ = writer.flush().await;
         let mut line = String::new();
         match reader.read_line(&mut line).await {
             Ok(0) | Err(_) => {
-                println!();
+                let _ = writer.write_all(b"\n").await;
                 break;
             }
             Ok(_) => {}
@@ -57,8 +73,10 @@ async fn run_prompt(sftp: &SftpSession, cwd: &mut String) {
         let command = fields[0].to_ascii_lowercase();
         let args = &fields[1..];
         match command.as_str() {
-            "help" => print_help(),
-            "pwd" => println!("{}", cwd),
+            "help" => print_help(writer).await,
+            "pwd" => {
+                let _ = writer.write_all(format!("{cwd}\n").as_bytes()).await;
+            }
             "quit" | "exit" => break,
             "ls" => {
                 let target = join_path(cwd, args.first().map(|s| s.as_str()));
@@ -68,9 +86,9 @@ async fn run_prompt(sftp: &SftpSession, cwd: &mut String) {
                             let name = entry.file_name();
                             let meta = entry.metadata();
                             if meta.is_dir() {
-                                println!("{}/", name);
+                                let _ = writer.write_all(format!("{name}/\n").as_bytes()).await;
                             } else {
-                                println!("{}", name);
+                                let _ = writer.write_all(format!("{name}\n").as_bytes()).await;
                             }
                         }
                     }
@@ -136,7 +154,11 @@ async fn run_prompt(sftp: &SftpSession, cwd: &mut String) {
                         .unwrap_or_else(|| "remote-file".to_string())
                 });
                 match download_file(sftp, &remote, &local).await {
-                    Ok(bytes) => println!("Downloaded {} ({} bytes).", remote, bytes),
+                    Ok(bytes) => {
+                        let _ = writer
+                            .write_all(format!("Downloaded {remote} ({bytes} bytes).\n").as_bytes())
+                            .await;
+                    }
                     Err(error) => eprintln!("could not download {}: {}", remote, error),
                 }
             }
@@ -148,13 +170,18 @@ async fn run_prompt(sftp: &SftpSession, cwd: &mut String) {
                 let (local, remote_name) = (&args[0], &args[1]);
                 let remote = join_path(cwd, Some(remote_name));
                 match upload_file(sftp, local, &remote).await {
-                    Ok(bytes) => println!("Uploaded {} ({} bytes).", remote, bytes),
+                    Ok(bytes) => {
+                        let _ = writer
+                            .write_all(format!("Uploaded {remote} ({bytes} bytes).\n").as_bytes())
+                            .await;
+                    }
                     Err(error) => eprintln!("could not upload {}: {}", remote, error),
                 }
             }
             other => eprintln!("unknown command {} (type \"help\")", other),
         }
     }
+    let _ = writer.flush().await;
 }
 
 /// Streams a remote file into the local path: the data rides the sftp
@@ -232,12 +259,15 @@ pub(crate) fn split_fields(line: &str) -> Vec<String> {
     fields
 }
 
-fn print_help() {
-    println!("Commands:");
-    println!("  ls [path], cd <path>, pwd");
-    println!("  get <remote> [local], put <local> <remote>");
-    println!("  mkdir <path>, rmdir <path>, rm <path>");
-    println!("  help, quit, exit");
+async fn print_help<W>(writer: &mut W)
+where
+    W: AsyncWrite + ?Sized + Unpin,
+{
+    let _ = writer
+        .write_all(
+            b"Commands:\n  ls [path], cd <path>, pwd\n  get <remote> [local], put <local> <remote>\n  mkdir <path>, rmdir <path>, rm <path>\n  help, quit, exit\n",
+        )
+        .await;
 }
 
 #[cfg(test)]

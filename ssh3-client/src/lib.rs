@@ -2770,10 +2770,13 @@ mod tests {
     use p256::SecretKey as P256SecretKey;
     use quinn::Endpoint;
     use rand_core::OsRng;
+    // The sftp session of the interactive client scenarios of the tests.
     use rsa::BigUint as RsaBigUint;
     use rsa::RsaPrivateKey as JwtRsaPrivateKey;
     use rsa::pkcs1v15::{Signature as RsaSignature, SigningKey as RsaSigningKey};
     use rsa::traits::PublicKeyParts;
+    #[cfg(unix)]
+    use russh_sftp::client::SftpSession;
     use sha2::Sha256;
     use signature::{SignatureEncoding, Signer};
     use ssh_key::private::{EcdsaKeypair, Ed25519Keypair, KeypairData, RsaKeypair};
@@ -2791,6 +2794,9 @@ mod tests {
         self_signed_server_config,
     };
     use ssh3_server::{Ssh3ServerConfig, serve_connection};
+    // The jail mode configures the sftp subsystem of the interop servers.
+    #[cfg(unix)]
+    use ssh3_server::SftpJailMode;
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     #[cfg(unix)]
@@ -3640,6 +3646,80 @@ mod tests {
             .unwrap()
             .unwrap(),
         )
+    }
+
+    /// Runs the interactive sftp client of the Go reference against a server.
+    ///
+    /// The session script rides the stdin pipe in one batch: the prompt of
+    /// the reference reads the commands line by line (no tty is involved),
+    /// so a scripted session behaves like an interactive one. The output of
+    /// the whole session is collected for the assertions of the scenarios.
+    #[cfg(unix)]
+    async fn run_go_cli_sftp_session(
+        home_dir: &Path,
+        url: &str,
+        private_key_path: &Path,
+        script: &str,
+    ) -> Option<std::process::Output> {
+        let binaries = go_cli_binaries()?;
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
+        let mut child = TokioCommand::new(&binaries.client)
+            .arg("-s")
+            .arg("sftp")
+            .arg("-insecure")
+            .arg("-privkey")
+            .arg(private_key_path)
+            .arg(url)
+            .env("HOME", home_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        // the script is written and closed (the EOF ends the prompt after
+        // the quit command) before the output is collected
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(script.as_bytes()).await.unwrap();
+        drop(stdin);
+
+        let mut stdout = child.stdout.take().unwrap();
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf).await;
+            buf
+        });
+        let mut stderr = child.stderr.take().unwrap();
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf).await;
+            buf
+        });
+
+        Some(match timeout(Duration::from_secs(30), child.wait()).await {
+            Ok(status) => std::process::Output {
+                status: status.unwrap(),
+                stdout: stdout_task.await.unwrap(),
+                stderr: stderr_task.await.unwrap(),
+            },
+            Err(_) => {
+                let _ = child.kill().await;
+                let status = child.wait().await.unwrap();
+                let output = std::process::Output {
+                    status,
+                    stdout: stdout_task.await.unwrap(),
+                    stderr: stderr_task.await.unwrap(),
+                };
+                panic!(
+                    "go sftp client timed out\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+        })
     }
 
     #[cfg(unix)]
@@ -5069,6 +5149,7 @@ mod tests {
         "run_go_cli_client_with_forwarded_agent",
         "run_go_cli_client_with_oidc",
         "run_go_cli_client_with_password",
+        "run_go_cli_sftp_session",
         "spawn_go_cli_shell_with_pty",
         "run_go_cli_shell",
         "go_agent_probe_binary",
@@ -7056,6 +7137,216 @@ mod tests {
         assert!(!logs.contains("an error was encountered"), "{logs}");
 
         echo_task.abort();
+        if server_task.is_finished() {
+            server_task.await.unwrap();
+        } else {
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rust_client_interactive_sftp_round_trips_against_the_real_go_server() {
+        let _guard = lock_go_binary_tests();
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let tempdir = TempDir::new().unwrap();
+        let home_dir = tempdir.path().join("home");
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::write(
+            home_dir.join(".ssh").join("authorized_keys"),
+            fs::read(&fixture.authorized_identities_path).unwrap(),
+        )
+        .unwrap();
+
+        let bind_port = reserve_udp_port();
+        let bind_addr = format!("127.0.0.1:{bind_port}");
+        let cert_path = tempdir.path().join("cert.pem");
+        let key_path = tempdir.path().join("key.pem");
+        let log_path = tempdir.path().join("go-server.log");
+
+        let Some(mut server) = spawn_go_cli_server(
+            &bind_addr,
+            &fixture.username,
+            &home_dir,
+            &cert_path,
+            &key_path,
+            &log_path,
+        )
+        .await
+        else {
+            skip_interop("rust_client_interactive_sftp_round_trips_against_the_real_go_server");
+            return;
+        };
+
+        // The payload crosses the wire twice (an upload then a download) and
+        // is checked byte for byte in both copies; the size spans several
+        // sftp chunks, so the round trip exercises the chunked reads and
+        // writes of the interactive client.
+        let payload: Vec<u8> = (0..256 * 1024u32).map(|byte| (byte % 251) as u8).collect();
+        let upload_source = tempdir.path().join("upload-source.bin");
+        fs::write(&upload_source, &payload).unwrap();
+        let download_target = tempdir.path().join("download-target.bin");
+
+        let mut config = Ssh3ClientConfig::new(
+            format!(
+                "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
+                fixture.username
+            )
+            .parse()
+            .unwrap(),
+        );
+        config.trust = Ssh3TrustStrategy::Insecure;
+        config.username = Some(fixture.username.clone());
+        config.identity_file = Some(fixture.private_key_path.clone());
+
+        // The connection of the interactive client: an sftp channel over an
+        // established session, the way `-s sftp` opens it.
+        let client = connect_client(&config).await.unwrap();
+        let channel = client.open_sftp_channel().await.unwrap();
+        let stream = crate::sftp_stream::ChannelStream::new(channel);
+        let sftp = SftpSession::new(stream).await.unwrap();
+
+        // The batched session of the interactive client: the commands ride
+        // an in-memory reader and the transcript lands in a buffer, the way
+        // a script on the stdin pipe feeds the prompt.
+        let remote_dir = "interop";
+        let remote_path = "interop/round-trip.bin";
+        let script = format!(
+            "pwd\nmkdir {remote_dir}\nput {} {remote_path}\nls {remote_dir}\nget {remote_path} {}\nquit\n",
+            upload_source.display(),
+            download_target.display(),
+        );
+        let mut cwd = sftp.canonicalize(".").await.unwrap();
+        let mut reader = io::Cursor::new(script.into_bytes());
+        let mut transcript = Vec::new();
+        timeout(
+            Duration::from_secs(30),
+            crate::interactive_sftp::run_prompt(&sftp, &mut cwd, &mut reader, &mut transcript),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the interactive sftp session timed out"));
+
+        let _ = sftp.close().await;
+        client.shutdown().await;
+
+        // The echo of the session: the client-visible root of the jail, the
+        // listing of the fresh directory and the reports of both transfers
+        // (the paths of the transcript are the client-visible ones, rooted
+        // at the home directory of the session user).
+        let transcript = String::from_utf8_lossy(&transcript);
+        assert!(transcript.contains("sftp> /"), "{transcript}");
+        assert!(
+            transcript.contains("Uploaded /interop/round-trip.bin"),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Downloaded /interop/round-trip.bin"),
+            "{transcript}"
+        );
+        assert!(transcript.contains("round-trip.bin"), "{transcript}");
+
+        // the uploaded copy on the server and the downloaded copy on the
+        // client both carry the payload byte for byte
+        assert_eq!(
+            fs::read(home_dir.join("interop").join("round-trip.bin")).unwrap(),
+            payload
+        );
+        assert_eq!(fs::read(&download_target).unwrap(), payload);
+
+        let _ = server.kill().await;
+        let _ = server.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_go_client_sftp_round_trips_against_the_rust_server() {
+        let _guard = lock_go_binary_tests();
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let authorized_identities_path = fixture.authorized_identities_path.clone();
+        let username = fixture.username.clone();
+        let private_key_path = fixture.private_key_path.clone();
+        let (server_config, _server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        // The jail of the sftp subsystem of the server: the files of the
+        // session live in a directory of the test.
+        let jail = TempDir::new().unwrap();
+        let jail_root = jail.path().to_path_buf();
+        let server_task = tokio::spawn(async move {
+            let incoming = tokio::time::timeout(Duration::from_secs(5), server_endpoint.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = tokio::time::timeout(Duration::from_secs(5), incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut config = Ssh3ServerConfig::default();
+            config.require_authentication = true;
+            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
+            config.default_user = Some("does-not-exist".to_string());
+            config.sftp_jail = SftpJailMode::Lexical;
+            config.sftp_root = Some(jail_root);
+            serve_connection(connection, config).await.unwrap();
+        });
+
+        let tempdir = TempDir::new().unwrap();
+        let payload: Vec<u8> = (0..256 * 1024u32).map(|byte| (byte % 251) as u8).collect();
+        let upload_source = tempdir.path().join("upload-source.bin");
+        fs::write(&upload_source, &payload).unwrap();
+        let download_target = tempdir.path().join("download-target.bin");
+
+        // The batched session of the reference: the working directory of the
+        // jailed server is the root of the jail, so the relative paths of
+        // the script land in it.
+        let script = format!(
+            "pwd\nmkdir backup\nput {} backup/round-trip.bin\nls backup\nget backup/round-trip.bin {}\nquit\n",
+            upload_source.display(),
+            download_target.display(),
+        );
+
+        let Some(output) = run_go_cli_sftp_session(
+            tempdir.path(),
+            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &private_key_path,
+            &script,
+        )
+        .await
+        else {
+            skip_interop("real_go_client_sftp_round_trips_against_the_rust_server");
+            return;
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        // the greeting of the reference and the echo of the listing of the
+        // directory the file landed in
+        assert!(stdout.contains("Connected to "), "{stdout}");
+        assert!(stdout.contains("round-trip.bin"), "{stdout}");
+
+        assert!(!stderr.contains("could not "), "{stderr}");
+
+        // the uploaded copy in the jail and the downloaded copy on the
+        // client both carry the payload byte for byte
+        assert_eq!(
+            fs::read(jail.path().join("backup").join("round-trip.bin")).unwrap(),
+            payload
+        );
+        assert_eq!(fs::read(&download_target).unwrap(), payload);
+
         if server_task.is_finished() {
             server_task.await.unwrap();
         } else {
