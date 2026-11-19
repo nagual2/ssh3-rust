@@ -119,6 +119,11 @@ pub struct HostKeyDecision {
     pub outcome: HostKeyOutcome,
     /// Whether the certificate must be pinned in the known_hosts file.
     pub pin: bool,
+    /// Whether the pin replaces the old pins of the host instead of
+    /// appending: the rotation of a legitimate certificate drops the retired
+    /// pins, so a stolen old certificate never matches again
+    /// (CERT-VERIFICATION-CANON.md 2.4).
+    pub replace: bool,
     /// The message that explains the decision.
     pub message: Option<String>,
 }
@@ -129,6 +134,18 @@ impl HostKeyDecision {
         Self {
             outcome: HostKeyOutcome::Accept,
             pin,
+            replace: false,
+            message: None,
+        }
+    }
+
+    /// A decision that lets the session continue while the rotated
+    /// certificate replaces the old pins of the host.
+    fn accept_replacement() -> Self {
+        Self {
+            outcome: HostKeyOutcome::Accept,
+            pin: true,
+            replace: true,
             message: None,
         }
     }
@@ -138,6 +155,7 @@ impl HostKeyDecision {
         Self {
             outcome: HostKeyOutcome::Warn,
             pin,
+            replace: false,
             message: Some(message.into()),
         }
     }
@@ -147,6 +165,7 @@ impl HostKeyDecision {
         Self {
             outcome: HostKeyOutcome::Reject,
             pin: false,
+            replace: false,
             message: Some(message.into()),
         }
     }
@@ -156,6 +175,7 @@ impl HostKeyDecision {
         Self {
             outcome: HostKeyOutcome::Ask,
             pin: false,
+            replace: false,
             message: None,
         }
     }
@@ -200,6 +220,16 @@ pub fn decide_host_key(
 }
 
 /// The decision about a host whose certificate is not the pinned one.
+///
+/// The renewal of a certificate is not an attack: when the chain of the
+/// presented certificate verifies against a certificate authority — the
+/// chain check includes the SAN against the target — the rotation is
+/// legitimate and the rotated certificate replaces the pinned one
+/// (CERT-VERIFICATION-CANON.md 2.4). Without the renewal semantics every
+/// legitimate certificate renewal looks like a machine-in-the-middle
+/// attack to the clients. The self-signed rotation has no proof at all and
+/// stays a refusal: it rides the SSHFP re-pin of an out-of-band unpinned
+/// first contact instead.
 fn decide_changed_certificate(
     policy: Ssh3StrictHostKeyChecking,
     context: &HostKeyContext<'_>,
@@ -215,6 +245,16 @@ fn decide_changed_certificate(
             ),
             false,
         );
+    }
+
+    // The chain of the presented certificate verified against a
+    // certificate authority and the SAN covered the target (the chain
+    // check of the inner verifier includes the name): the rotation is the
+    // legitimate successor of the pinned certificate, whatever the policy
+    // is — the way the reference re-pins under yes, ask and accept-new
+    // alike (CERT-VERIFICATION-CANON.md 2.4).
+    if context.chain_trusted && !context.self_signed {
+        return HostKeyDecision::accept_replacement();
     }
 
     HostKeyDecision::reject(format!(
@@ -474,6 +514,103 @@ mod tests {
             &context(
                 HostCertificateStatus::Unknown,
                 &[],
+                "SHA256:presented",
+                false,
+                false,
+            ),
+        );
+
+        assert_eq!(decision.outcome, HostKeyOutcome::Reject);
+        assert!(!decision.pin);
+    }
+
+    /// A legitimate rotation does not look like an attack: when the chain of
+    /// the presented certificate verifies against a certificate authority and
+    /// the SAN covered the target (the chain check includes the name), the
+    /// rotated certificate replaces the pinned one instead of refusing the
+    /// session (CERT-VERIFICATION-CANON.md 2.4).
+    #[test]
+    fn a_ca_valid_rotation_repins_instead_of_refusing() {
+        for policy in [
+            Ssh3StrictHostKeyChecking::Ask,
+            Ssh3StrictHostKeyChecking::Yes,
+            Ssh3StrictHostKeyChecking::AcceptNew,
+        ] {
+            let decision = decide_host_key(
+                policy,
+                &context(
+                    HostCertificateStatus::Changed,
+                    &["SHA256:pinned".to_string()],
+                    "SHA256:presented",
+                    true,
+                    false,
+                ),
+            );
+
+            assert_eq!(
+                decision.outcome,
+                HostKeyOutcome::Accept,
+                "the rotation of a CA valid certificate is legitimate under {policy:?}"
+            );
+            assert!(decision.pin, "the rotated certificate is pinned");
+            assert!(
+                decision.replace,
+                "the rotation replaces the old pins instead of appending"
+            );
+        }
+    }
+
+    /// The `no` policy keeps its historical warning on a rotation: it never
+    /// pins anything, a legitimate rotation included.
+    #[test]
+    fn the_no_policy_still_only_warns_about_a_ca_valid_rotation() {
+        let decision = decide_host_key(
+            Ssh3StrictHostKeyChecking::No,
+            &context(
+                HostCertificateStatus::Changed,
+                &["SHA256:pinned".to_string()],
+                "SHA256:presented",
+                true,
+                false,
+            ),
+        );
+
+        assert_eq!(decision.outcome, HostKeyOutcome::Warn);
+        assert!(!decision.pin);
+    }
+
+    /// A self-signed rotation has no proof at all: the chain of a
+    /// self-signed certificate cannot verify against a certificate
+    /// authority, so the refusal stays (CERT-VERIFICATION-CANON.md 2.4: the
+    /// self-signed rotation rides the SSHFP re-pin of an out-of-band
+    /// unpinned first contact, not the automatic renewal).
+    #[test]
+    fn a_self_signed_rotation_stays_a_refusal() {
+        let decision = decide_host_key(
+            Ssh3StrictHostKeyChecking::AcceptNew,
+            &context(
+                HostCertificateStatus::Changed,
+                &["SHA256:pinned".to_string()],
+                "SHA256:presented",
+                false,
+                true,
+            ),
+        );
+
+        assert_eq!(decision.outcome, HostKeyOutcome::Reject);
+        assert!(!decision.pin);
+    }
+
+    /// A changed certificate whose chain verifies against no known
+    /// authority and that is not self-signed is refused: nobody vouches for
+    /// it.
+    #[test]
+    fn a_changed_certificate_of_an_unknown_chain_stays_a_refusal() {
+        let decision = decide_host_key(
+            Ssh3StrictHostKeyChecking::Ask,
+            &context(
+                HostCertificateStatus::Changed,
+                &["SHA256:pinned".to_string()],
                 "SHA256:presented",
                 false,
                 false,

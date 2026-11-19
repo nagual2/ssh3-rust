@@ -95,7 +95,7 @@ pub use forward::{
 pub use host_key::{Ssh3HostKeyPromptError, Ssh3KnownHostsTrust};
 pub use known_hosts::{
     HostCertificateStatus, KnownHosts, Ssh3KnownHostsError, append_known_host, canonical_host_key,
-    certificate_fingerprint, default_known_hosts_path,
+    certificate_fingerprint, default_known_hosts_path, replace_known_host,
 };
 use reverse::{Ssh3ResolvedReverseForward, Ssh3ReverseForwardHandle};
 pub use reverse::{
@@ -2128,13 +2128,36 @@ async fn connect_direct_with_browser_opener(
         )));
     };
 
+    // SSHFP (VerifyHostKeyDNS) rides BEFORE any pin record is written, the
+    // way the reference runs the SSHFP verdicts before the pin verdicts
+    // (CERT-VERIFICATION-CANON.md 2.5): a mismatch vetoes the connection —
+    // and the rotation re-pin — before the known_hosts file changes. The
+    // certificate is the very one the handshake verified: the known_hosts
+    // check answers "is this the key we saw last time?", SSHFP answers
+    // "does the zone vouch for this key?". The bare hostname carries the
+    // DNS meaning; the port and the path do not.
+    run_sshfp_verification(&connection, config).await?;
+
     // The certificate the handshake accepted is pinned once the connection is
-    // established: the pin is only useful for the next session.
+    // established: the pin is only useful for the next session. The rotation
+    // of a legitimate certificate replaces the old pins of the host instead
+    // of appending (CERT-VERIFICATION-CANON.md 2.4): the old pin must not
+    // survive, or a stolen retired certificate would still match.
     if let Some(state) = host_key_state.as_ref()
-        && let Some(certificate) = state.take_to_pin()
+        && let Some(pin) = state.take_to_pin()
     {
-        known_hosts::append_known_host(&state.path(), &state.host(), &certificate)
-            .map_err(Ssh3ClientError::KnownHosts)?;
+        if pin.replaces {
+            known_hosts::replace_known_host(&state.path(), &state.host(), &pin.certificate)
+                .map_err(Ssh3ClientError::KnownHosts)?;
+            crate::diag_info!(
+                "ssh3: certificate rotated, chain valid: re-pinned {} in {}",
+                state.host(),
+                state.path().display()
+            );
+        } else {
+            known_hosts::append_known_host(&state.path(), &state.host(), &pin.certificate)
+                .map_err(Ssh3ClientError::KnownHosts)?;
+        }
     }
 
     let (mut driver, mut send_request) = new_client(connection.clone()).await?;
@@ -2202,12 +2225,6 @@ async fn connect_direct_with_browser_opener(
         config.default_datagrams_queue_size,
     )
     .await?;
-    // SSHFP (VerifyHostKeyDNS) is checked on the very same certificate the
-    // handshake verified: the known_hosts check answers "is this the key we
-    // saw last time?", SSHFP answers "does the zone vouch for this key?".
-    // The bare hostname carries the DNS meaning; the port and the path do
-    // not.
-    run_sshfp_verification(&connection, config).await?;
     // The HTTP/3 driver stays alive for the whole session: its control
     // stream carries the SETTINGS frame, and a peer that sees it closed
     // treats the connection as broken (H3_CLOSED_CRITICAL_STREAM). The
@@ -8618,11 +8635,16 @@ mod tests {
             .expect("the self-signed certificate of an unknown host is accepted");
 
         // The certificate the server presented is the one that is pinned.
-        let pinned = state
+        let pin = state
             .as_ref()
             .expect("the known_hosts check is active")
             .take_to_pin()
             .expect("the certificate is pinned");
+        assert!(
+            !pin.replaces,
+            "a first contact appends, it does not replace"
+        );
+        let pinned = pin.certificate;
         assert_eq!(pinned.as_ref(), server_certificate.as_ref());
 
         let host = format!("127.0.0.1:{}/ssh3-term", server_addr.port());

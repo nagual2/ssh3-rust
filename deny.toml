@@ -115,6 +115,23 @@ ignore = [
     # and drop the `rustls-pemfile` dependency in favour of
     # `rustls-pki-types` (>= 1.9, already in the graph).
     { id = "RUSTSEC-2025-0134", reason = "Informational advisory: the crate is not vulnerable. Migration to `rustls-pki-types` (`PemObject`) is prepared, see SECURITY.md." },
+    # ACCEPTED RISK - chrono is unmaintained (RUSTSEC-2026-0543).
+    #
+    # The advisory is informational: the crate is not vulnerable, it is
+    # simply no longer maintained. It is pulled in transitively by
+    #  (the SFTP protocol layer of the client and the server),
+    # and no fixed release exists: every  version is affected.
+    #
+    # Why the risk is acceptable here:
+    #   * The workspace itself never touches : the timestamps of the
+    #     SFTP protocol ride the raw seconds of the wire format, and the
+    #     logging of the server formats its own RFC3339 stamps.
+    #   *  uses the crate for the conversion of the SFTP time
+    #     fields on the boundary of the wire format, not for any security
+    #     decision.
+    # Removal condition: `russh-sftp` migrates to `jiff`/`time`, or the
+    # workspace replaces the crate.
+    { id = "RUSTSEC-2026-0543", reason = "Informational advisory: the crate is unmaintained, not vulnerable. It is transitive through `russh-sftp`; the workspace never touches `chrono` itself. See SECURITY.md." },
 ]
 # A stale entry in the ignore list must not fail the build, but it has to
 # stay visible.

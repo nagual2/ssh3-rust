@@ -60,6 +60,18 @@ impl fmt::Display for Ssh3HostKeyPromptError {
 
 impl std::error::Error for Ssh3HostKeyPromptError {}
 
+/// The pin request the handshake accepted: the certificate to record in the
+/// known_hosts file, and whether it replaces the old pins of the host (the
+/// rotation of a legitimate certificate) instead of appending (a first
+/// contact).
+#[derive(Clone, Debug)]
+pub(crate) struct PinRequest {
+    /// The certificate the handshake accepted.
+    pub certificate: CertificateDer<'static>,
+    /// Whether the certificate replaces the old pins of the host.
+    pub replaces: bool,
+}
+
 /// The state the host key verification shares with the client.
 ///
 /// The verification runs inside the TLS handshake, so the outcome of the
@@ -75,7 +87,7 @@ struct HostKeyStateInner {
     path: PathBuf,
     known_hosts: KnownHosts,
     refusal: Option<String>,
-    to_pin: Option<CertificateDer<'static>>,
+    to_pin: Option<PinRequest>,
 }
 
 impl HostKeyState {
@@ -103,13 +115,20 @@ impl HostKeyState {
     }
 
     /// The certificate the handshake accepted and that must be pinned.
-    pub(crate) fn take_to_pin(&self) -> Option<CertificateDer<'static>> {
+    pub(crate) fn take_to_pin(&self) -> Option<PinRequest> {
         self.lock().to_pin.take()
     }
 
     /// Records the certificate the handshake accepted.
-    fn set_to_pin(&self, certificate: CertificateDer<'static>) {
-        self.lock().to_pin = Some(certificate);
+    ///
+    /// The `replaces` flag marks a legitimate rotation: the certificate
+    /// replaces the old pins of the host instead of appending to them
+    /// (CERT-VERIFICATION-CANON.md 2.4).
+    fn set_to_pin(&self, certificate: CertificateDer<'static>, replaces: bool) {
+        self.lock().to_pin = Some(PinRequest {
+            certificate,
+            replaces,
+        });
     }
 
     /// Records the refusal of the certificate.
@@ -211,7 +230,8 @@ impl ServerCertVerifier for KnownHostsVerifier {
         match decision.outcome {
             HostKeyOutcome::Accept => {
                 if decision.pin {
-                    self.state.set_to_pin(end_entity.clone().into_owned());
+                    self.state
+                        .set_to_pin(end_entity.clone().into_owned(), decision.replace);
                 }
                 Ok(ServerCertVerified::assertion())
             }
@@ -220,13 +240,15 @@ impl ServerCertVerifier for KnownHostsVerifier {
                     eprintln!("ssh3: {message}");
                 }
                 if decision.pin {
-                    self.state.set_to_pin(end_entity.clone().into_owned());
+                    self.state
+                        .set_to_pin(end_entity.clone().into_owned(), decision.replace);
                 }
                 Ok(ServerCertVerified::assertion())
             }
             HostKeyOutcome::Ask => match prompt_host_key_confirmation(&fingerprint, &path) {
                 Ok(true) => {
-                    self.state.set_to_pin(end_entity.clone().into_owned());
+                    self.state
+                        .set_to_pin(end_entity.clone().into_owned(), decision.replace);
                     Ok(ServerCertVerified::assertion())
                 }
                 Ok(false) => {
@@ -436,4 +458,289 @@ fn prompt_host_key_confirmation(
     _path: &Path,
 ) -> Result<bool, Ssh3HostKeyPromptError> {
     Err(Ssh3HostKeyPromptError::NotInteractive)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HostKeyState, KnownHostsVerifier};
+    use crate::known_hosts::{KnownHosts, append_known_host, replace_known_host};
+    use crate::strict_host_key::Ssh3StrictHostKeyChecking;
+    use rustls::client::WebPkiServerVerifier;
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use std::sync::Arc;
+
+    /// A certificate authority and two leaves signed by it, all three in
+    /// the DER form. The two leaves carry the same SANs but ride different
+    /// keys: the pinned certificate and the rotated one of the tests.
+    fn certificate_authority_and_leaves(
+        san: &str,
+    ) -> (
+        CertificateDer<'static>,
+        CertificateDer<'static>,
+        CertificateDer<'static>,
+    ) {
+        let issuer_key = rcgen::KeyPair::generate().expect("a key pair can be generated");
+        let mut issuer_params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("the parameters are valid");
+        issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let issuer_certificate = issuer_params
+            .self_signed(&issuer_key)
+            .expect("the certificate authority can be signed");
+        let issuer = rcgen::Issuer::new(issuer_params, &issuer_key);
+
+        let leaf_der = || {
+            let leaf_key = rcgen::KeyPair::generate().expect("a key pair can be generated");
+            let leaf_params = rcgen::CertificateParams::new(vec![san.to_string()])
+                .expect("the parameters are valid");
+            let leaf = leaf_params
+                .signed_by(&leaf_key, &issuer)
+                .expect("the leaf can be signed by the authority");
+            CertificateDer::from(leaf.der().to_vec())
+        };
+        let pinned = leaf_der();
+        let rotated = leaf_der();
+
+        (
+            CertificateDer::from(issuer_certificate.der().to_vec()),
+            pinned,
+            rotated,
+        )
+    }
+
+    /// The verifier of a trust whose roots hold exactly the given
+    /// authorities: the production construction of the inner verifier.
+    fn verifier_with_authorities(
+        authorities: &[CertificateDer<'static>],
+        policy: Ssh3StrictHostKeyChecking,
+        state: Arc<HostKeyState>,
+    ) -> KnownHostsVerifier {
+        let roots = crate::host_key::known_hosts_roots(authorities)
+            .expect("the trust anchors can be built");
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+            .build()
+            .expect("the inner verifier can be built");
+        KnownHostsVerifier {
+            inner,
+            policy,
+            state,
+            interactive: false,
+        }
+    }
+
+    /// The renewal of a CA signed certificate is a legitimate rotation: the
+    /// pinned certificate is the old leaf, the server presents a new leaf
+    /// signed by the very same authority, and the chain verifies against it
+    /// (CERT-VERIFICATION-CANON.md 2.4). The rotated certificate replaces
+    /// the old pins instead of refusing the session.
+    #[tokio::test]
+    async fn a_ca_valid_rotation_repins_instead_of_refusing() {
+        let (authority, pinned_leaf, rotated_leaf) = certificate_authority_and_leaves("localhost");
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("known_hosts");
+        let host = "127.0.0.1:4433/ssh3-term";
+        append_known_host(&path, host, &pinned_leaf).unwrap();
+
+        let (known_hosts, _) = KnownHosts::load(&path).unwrap();
+        let state = Arc::new(HostKeyState::new(
+            host.to_string(),
+            path.clone(),
+            known_hosts,
+        ));
+        let verifier =
+            verifier_with_authorities(&[authority], Ssh3StrictHostKeyChecking::Yes, state.clone());
+
+        let verdict = verifier.verify_server_cert(
+            &rotated_leaf,
+            &[],
+            &ServerName::try_from("localhost").unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(
+            verdict.is_ok(),
+            "the rotation of a CA valid certificate is legitimate: {verdict:?}"
+        );
+
+        let pin = state
+            .take_to_pin()
+            .expect("the rotated certificate is pinned");
+        assert_eq!(pin.certificate.as_ref(), rotated_leaf.as_ref());
+        assert!(
+            pin.replaces,
+            "the rotation replaces the old pins instead of appending"
+        );
+
+        replace_known_host(&path, host, &pin.certificate).unwrap();
+        let (known_hosts, _) = KnownHosts::load(&path).unwrap();
+        assert_eq!(
+            known_hosts.check_certificate(host, &rotated_leaf),
+            crate::known_hosts::HostCertificateStatus::Matches
+        );
+        assert_eq!(
+            known_hosts.check_certificate(host, &pinned_leaf),
+            crate::known_hosts::HostCertificateStatus::Changed,
+            "the old pin is gone"
+        );
+    }
+
+    /// The first contact of a host whose certificate is signed by a known
+    /// authority rides the CA anchor: the host is accepted, and only the
+    /// `accept-new` policy records the pin.
+    #[tokio::test]
+    async fn a_first_contact_of_a_ca_valid_host_is_accepted_without_a_pin() {
+        let (authority, leaf, _second_leaf) = certificate_authority_and_leaves("localhost");
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("known_hosts");
+        let host = "127.0.0.1:4433/ssh3-term";
+        let (known_hosts, _) = KnownHosts::load(&path).unwrap();
+        let state = Arc::new(HostKeyState::new(
+            host.to_string(),
+            path.clone(),
+            known_hosts,
+        ));
+        let verifier =
+            verifier_with_authorities(&[authority], Ssh3StrictHostKeyChecking::Yes, state.clone());
+
+        let verdict = verifier.verify_server_cert(
+            &leaf,
+            &[],
+            &ServerName::try_from("localhost").unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(
+            verdict.is_ok(),
+            "a CA valid first contact is accepted under the yes policy: {verdict:?}"
+        );
+        assert!(
+            state.take_to_pin().is_none(),
+            "the yes policy never pins a first contact"
+        );
+    }
+
+    /// A host pinned under one certificate that presents a self-signed
+    /// certificate is refused: the rotation of a self-signed certificate has
+    /// no proof (CERT-VERIFICATION-CANON.md 2.4: the SSHFP re-pin rides an
+    /// out-of-band unpinned first contact, not a Changed leaf).
+    #[tokio::test]
+    async fn a_self_signed_rotation_stays_a_refusal() {
+        let (_authority, pinned_leaf, _second_leaf) = certificate_authority_and_leaves("localhost");
+        let rotated_key = rcgen::KeyPair::generate().expect("a key pair can be generated");
+        let rotated_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("the parameters are valid");
+        let rotated = rotated_params
+            .self_signed(&rotated_key)
+            .expect("the rotated certificate can be signed");
+        let rotated = CertificateDer::from(rotated.der().to_vec());
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("known_hosts");
+        let host = "127.0.0.1:4433/ssh3-term";
+        append_known_host(&path, host, &pinned_leaf).unwrap();
+
+        let (known_hosts, _) = KnownHosts::load(&path).unwrap();
+        let state = Arc::new(HostKeyState::new(
+            host.to_string(),
+            path.clone(),
+            known_hosts,
+        ));
+        let verifier =
+            verifier_with_authorities(&[], Ssh3StrictHostKeyChecking::Yes, state.clone());
+
+        let verdict = verifier.verify_server_cert(
+            &rotated,
+            &[],
+            &ServerName::try_from("localhost").unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(
+            verdict.is_err(),
+            "a self-signed rotation is refused: {verdict:?}"
+        );
+        assert!(state.take_to_pin().is_none());
+    }
+
+    /// The pinned certificate rides the chain check untouched: a pinned
+    /// leaf is its own trust anchor, so the session continues without a new
+    /// pin (the byte-exact semantics of the pins).
+    #[tokio::test]
+    async fn the_pinned_certificate_is_its_own_trust_anchor() {
+        let (_authority, leaf, _second_leaf) = certificate_authority_and_leaves("localhost");
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("known_hosts");
+        let host = "127.0.0.1:4433/ssh3-term";
+        append_known_host(&path, host, &leaf).unwrap();
+
+        let (known_hosts, _) = KnownHosts::load(&path).unwrap();
+        let state = Arc::new(HostKeyState::new(
+            host.to_string(),
+            path.clone(),
+            known_hosts,
+        ));
+        // No authority at all: the pin is the only anchor of the session.
+        let verifier =
+            verifier_with_authorities(&[], Ssh3StrictHostKeyChecking::Yes, state.clone());
+
+        let verdict = verifier.verify_server_cert(
+            &leaf,
+            &[],
+            &ServerName::try_from("localhost").unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(
+            verdict.is_ok(),
+            "the pinned certificate is the trust anchor: {verdict:?}"
+        );
+        assert!(state.take_to_pin().is_none(), "no new pin is recorded");
+    }
+
+    /// The state hands the pinned certificate over exactly once: the
+    /// `take` clears the request, a rotation keeps its `replaces` flag.
+    #[test]
+    fn the_pin_request_is_taken_exactly_once() {
+        let (_, leaf, _second_leaf) = certificate_authority_and_leaves("localhost");
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("known_hosts");
+        let (known_hosts, _) = KnownHosts::load(&path).unwrap();
+        let state = HostKeyState::new("127.0.0.1:4433/ssh3-term".to_string(), path, known_hosts);
+
+        state.set_to_pin(leaf, true);
+        let pin = state.take_to_pin().expect("the request rides once");
+        assert!(pin.replaces);
+        assert!(state.take_to_pin().is_none(), "the second take is empty");
+    }
+
+    /// A poisoned lock of the shared state never wedges the client: the
+    /// recovery reads through the poisoned guard, like the production
+    /// callers do.
+    #[test]
+    fn a_poisoned_lock_releases_the_state() {
+        let (_, leaf, _second_leaf) = certificate_authority_and_leaves("localhost");
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("known_hosts");
+        let (known_hosts, _) = KnownHosts::load(&path).unwrap();
+        let state = Arc::new(HostKeyState::new(
+            "127.0.0.1:4433/ssh3-term".to_string(),
+            path,
+            known_hosts,
+        ));
+
+        let breaker = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = breaker.inner.lock();
+            panic!("the lock is poisoned on purpose");
+        })
+        .join();
+
+        state.set_to_pin(leaf, false);
+        let pin = state.take_to_pin().expect("the poisoned lock recovers");
+        assert!(!pin.replaces);
+    }
 }

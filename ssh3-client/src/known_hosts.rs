@@ -223,13 +223,78 @@ pub fn append_known_host(
     Ok(())
 }
 
+/// Replaces the certificates pinned for a host with the presented one.
+///
+/// The rotation path of CERT-VERIFICATION-CANON.md 2.4: the chain of the
+/// presented certificate verified against a certificate authority and the
+/// SAN covered the target, so the rotated certificate is the legitimate
+/// successor of the pinned one. The old certificate lines of the host drop
+/// — a stolen retired certificate must not keep matching — and the pins of
+/// the other hosts are preserved. A missing file rides the plain append,
+/// and the rewrite is atomic-ish (the temp file plus the rename), the
+/// private permissions preserved.
+pub fn replace_known_host(
+    path: &Path,
+    host: &str,
+    certificate: &CertificateDer<'_>,
+) -> Result<(), Ssh3KnownHostsError> {
+    if host.trim().is_empty() {
+        return Err(Ssh3KnownHostsError::InvalidHost(host.to_string()));
+    }
+    if !path.exists() {
+        return append_known_host(path, host, certificate);
+    }
+
+    let content = fs::read_to_string(path)?;
+    let encoded = BASE64_STANDARD.encode(certificate.as_ref());
+    let new_line = format!("{host} {CERTIFICATE_KEY_TYPE} {encoded}");
+
+    let mut kept = String::with_capacity(content.len() + new_line.len() + 1);
+    for line in content.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() == 3 && fields[0] == host && fields[1] == CERTIFICATE_KEY_TYPE {
+            continue; // the rotated certificate replaces the old pins
+        }
+        if !line.trim().is_empty() {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    kept.push_str(&new_line);
+    kept.push('\n');
+
+    let temp = path.with_extension("tmp");
+    write_private_file(&temp, kept.as_bytes())?;
+    fs::rename(&temp, path)?;
+    Ok(())
+}
+
+/// Writes a payload to a file that only the user reads: the state files of
+/// the client hold the pinned certificates.
+fn write_private_file(path: &Path, payload: &[u8]) -> Result<(), Ssh3KnownHostsError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(payload)?;
+    Ok(())
+}
+
 /// The canonical host key of a target URL.
 ///
 /// The key is the part of the URL the client connects to: the host, the port
 /// and the path. It is the key the known_hosts file pins the certificates
-/// under.
+/// under. The brackets of an IPv6 literal are stripped, like the `Hostname`
+/// of the Go reference does: the pins of the two implementations must find
+/// each other's files (CERT-VERIFICATION-CANON.md, the target is the
+/// `CanonicalHostFormat` key).
 pub fn canonical_host_key(uri: &Uri) -> Option<String> {
     let host = uri.host()?;
+    let host = host.trim_matches(|c| c == '[' || c == ']');
     let port = uri.port_u16().unwrap_or(DEFAULT_PORT);
     Some(format!("{host}:{port}{}", uri.path()))
 }
@@ -328,6 +393,26 @@ mod tests {
         );
     }
 
+    /// The canonical host key of an IPv6 target strips the brackets, like
+    /// the `Hostname()` of the Go reference does: the pin of a target written
+    /// by the reference client must be found by this client and the other
+    /// way around (CERT-VERIFICATION-CANON.md, the target is the
+    /// `CanonicalHostFormat` key).
+    #[test]
+    fn the_canonical_host_key_of_an_ipv6_target_strips_the_brackets() {
+        let uri = Uri::try_from("https://[2001:db8::1]:8443/ssh3-term").unwrap();
+        assert_eq!(
+            canonical_host_key(&uri).as_deref(),
+            Some("2001:db8::1:8443/ssh3-term")
+        );
+
+        let uri = Uri::try_from("https://[2001:db8::1]/ssh3-term").unwrap();
+        assert_eq!(
+            canonical_host_key(&uri).as_deref(),
+            Some("2001:db8::1:443/ssh3-term")
+        );
+    }
+
     #[test]
     fn a_pinned_certificate_is_written_and_read_back() {
         let directory = tempfile::TempDir::new().unwrap();
@@ -404,6 +489,102 @@ mod tests {
         let (known_hosts, invalid_lines) = KnownHosts::load(&path).unwrap();
         assert!(invalid_lines.is_empty());
         assert!(!known_hosts.knows("example.org:443/"));
+    }
+
+    /// The rotation of a certificate replaces the pins of the host: the old
+    /// certificate lines drop, the presented certificate rides alone, and
+    /// the pins of the other hosts are preserved (CERT-VERIFICATION-CANON.md
+    /// 2.4, `ReplaceKnownHost` of the reference).
+    #[test]
+    fn the_rotated_certificate_replaces_the_old_pins_of_the_host() {
+        use super::replace_known_host;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("known_hosts");
+        let old = self_signed_certificate("servera.ssh3");
+        let older = self_signed_certificate("serverb.ssh3");
+        let rotated = self_signed_certificate("rotated.ssh3");
+        let untouched = self_signed_certificate("untouched.ssh3");
+
+        append_known_host(&path, "example.org:443/", &old).unwrap();
+        append_known_host(&path, "example.org:443/", &older).unwrap();
+        append_known_host(&path, "other.example.org:443/", &untouched).unwrap();
+
+        replace_known_host(&path, "example.org:443/", &rotated).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "the old pins of the host drop: {content}");
+        assert!(
+            lines.contains(
+                &&format!(
+                    "example.org:443/ x509-certificate {}",
+                    BASE64_STANDARD.encode(rotated.as_ref())
+                )[..]
+            ),
+            "the rotated certificate rides alone: {content}"
+        );
+        assert!(
+            lines.contains(
+                &&format!(
+                    "other.example.org:443/ x509-certificate {}",
+                    BASE64_STANDARD.encode(untouched.as_ref())
+                )[..]
+            ),
+            "the pins of the other hosts are preserved: {content}"
+        );
+
+        let (known_hosts, invalid_lines) = KnownHosts::load(&path).unwrap();
+        assert!(invalid_lines.is_empty());
+        assert_eq!(
+            known_hosts.check_certificate("example.org:443/", &rotated),
+            HostCertificateStatus::Matches
+        );
+        assert_eq!(
+            known_hosts.check_certificate("example.org:443/", &old),
+            HostCertificateStatus::Changed
+        );
+    }
+
+    /// A rotation on a host that is not pinned yet rides the plain append:
+    /// a missing known_hosts file is not a rotation failure.
+    #[test]
+    fn the_rotation_of_an_unpinned_host_appends_the_certificate() {
+        use super::replace_known_host;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("known_hosts");
+        let certificate = self_signed_certificate("servera.ssh3");
+
+        replace_known_host(&path, "example.org:443/", &certificate).unwrap();
+
+        let (known_hosts, invalid_lines) = KnownHosts::load(&path).unwrap();
+        assert!(invalid_lines.is_empty());
+        assert_eq!(
+            known_hosts.check_certificate("example.org:443/", &certificate),
+            HostCertificateStatus::Matches
+        );
+    }
+
+    /// The rewritten known_hosts file keeps the private permissions of the
+    /// state file: the rotation must not widen them.
+    #[cfg(unix)]
+    #[test]
+    fn the_rewritten_known_hosts_file_stays_private() {
+        use super::replace_known_host;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("known_hosts");
+        let certificate = self_signed_certificate("servera.ssh3");
+        append_known_host(&path, "example.org:443/", &certificate).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let rotated = self_signed_certificate("rotated.ssh3");
+        replace_known_host(&path, "example.org:443/", &rotated).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the rotation keeps the file private");
     }
 
     #[test]
