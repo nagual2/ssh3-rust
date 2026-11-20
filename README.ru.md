@@ -1,8 +1,15 @@
 # SSH3 поверх HTTP/3 — реализация на Rust
 
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Status: active](https://img.shields.io/badge/status-active-brightgreen.svg)](FROZEN.md)
+[![CI](https://github.com/nagual2/ssh3-rust/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/nagual2/ssh3-rust/actions/workflows/ci.yml)
+[![SSH3](https://img.shields.io/badge/SSH3-HTTP%2F3%20over%20QUIC-8250df?style=flat-square)](https://github.com/nagual2/ssh3-rust)
+[![Rust](https://img.shields.io/badge/Rust-SSH3%20impl-dea584?style=flat-square&logo=rust&logoColor=black)](https://www.rust-lang.org)
+[![quinn](https://img.shields.io/badge/quinn-QUIC%20transport-8250df?style=flat-square)](https://quinn-rs.org)
+[![rustls](https://img.shields.io/badge/rustls-TLS%201.3-b31b1b?style=flat-square)](https://rustls.org)
+[![Linux](https://img.shields.io/badge/Linux-native-f0883e?style=flat-square&logo=linux&logoColor=black)](#)
+[![Windows](https://img.shields.io/badge/Windows-native-2f81f7?style=flat-square&logo=windows&logoColor=white)](#)
+[![macOS](https://img.shields.io/badge/macOS-cross--built-a37170?style=flat-square&logo=apple&logoColor=black)](#)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue?style=flat-square)](https://www.apache.org/licenses/LICENSE-2.0)
+[![Status: active](https://img.shields.io/badge/status-active-brightgreen?style=flat-square)](FROZEN.md)
 
 [English](README.md) | **Русский** | [Deutsch](README.de.md)
 
