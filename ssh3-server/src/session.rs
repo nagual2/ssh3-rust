@@ -458,17 +458,21 @@ pub(crate) async fn handle_session_channel(
                 Ssh3ChannelRequest::Shell => {
                     if session.is_none() {
                         let agent_socket_path = agent_forwarding.socket_path();
-                        session = Some(
-                            spawn_session_process(
-                                channel.clone(),
-                                &config,
-                                &session_user,
-                                pending_pty.clone(),
-                                agent_socket_path.as_deref(),
-                                SessionCommand::Shell,
-                            )
-                            .await?,
-                        );
+                        let Some(spawned) = spawn_reported(
+                            &channel,
+                            &config,
+                            &session_user,
+                            pending_pty.clone(),
+                            agent_socket_path.as_deref(),
+                            SessionCommand::Shell,
+                        )
+                        .await
+                        else {
+                            // The verdict rode the stderr of the channel and the
+                            // channel is closed: the loop ends.
+                            return Ok(());
+                        };
+                        session = Some(spawned);
                     } else {
                         write_stderr(channel.as_ref(), b"session is already running\n").await?;
                     }
@@ -476,19 +480,23 @@ pub(crate) async fn handle_session_channel(
                 Ssh3ChannelRequest::Exec(exec) => {
                     if session.is_none() {
                         let agent_socket_path = agent_forwarding.socket_path();
-                        session = Some(
-                            spawn_session_process(
-                                channel.clone(),
-                                &config,
-                                &session_user,
-                                pending_pty.clone(),
-                                agent_socket_path.as_deref(),
-                                SessionCommand::Exec(
-                                    ssh_bytes_to_string(&exec.command).unwrap_or_default(),
-                                ),
-                            )
-                            .await?,
-                        );
+                        let Some(spawned) = spawn_reported(
+                            &channel,
+                            &config,
+                            &session_user,
+                            pending_pty.clone(),
+                            agent_socket_path.as_deref(),
+                            SessionCommand::Exec(
+                                ssh_bytes_to_string(&exec.command).unwrap_or_default(),
+                            ),
+                        )
+                        .await
+                        else {
+                            // The verdict rode the stderr of the channel and the
+                            // channel is closed: the loop ends.
+                            return Ok(());
+                        };
+                        session = Some(spawned);
                     } else {
                         write_stderr(channel.as_ref(), b"session is already running\n").await?;
                     }
@@ -555,6 +563,41 @@ pub(crate) async fn handle_session_channel(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Spawns the session process and reports a spawn failure to the peer.
+///
+/// A failed spawn must not ride the `?` of the request loop: the error would
+/// drop the channel silently, the streams of the peer would stay open, and
+/// the client would wait for an exit status that never comes — the live run
+/// of the T10.1 (2026-11-20) hung exactly there. The verdict rides the
+/// stderr of the channel and the explicit close; `None` means the channel
+/// ended and the loop of the caller is over.
+async fn spawn_reported(
+    channel: &Arc<Ssh3Channel>,
+    config: &Ssh3ServerConfig,
+    session_user: &SessionUser,
+    pending_pty: Option<PendingPty>,
+    agent_socket_path: Option<&Path>,
+    command: SessionCommand,
+) -> Option<RunningSession> {
+    match spawn_session_process(
+        channel.clone(),
+        config,
+        session_user,
+        pending_pty,
+        agent_socket_path,
+        command,
+    )
+    .await
+    {
+        Ok(session) => Some(session),
+        Err(err) => {
+            let _ = write_stderr(channel.as_ref(), format!("ssh3: {err}\n").as_bytes()).await;
+            let _ = channel.close().await;
+            None
         }
     }
 }
