@@ -124,7 +124,7 @@
 | 7.1 | `.deb`-пакет для `ssh3-rust-server` (systemd-юнит уже есть в `packaging/`) | `packaging\ssh3-server.service` | `dpkg -i` ставит и запускает |
 | 7.2 | Релиз-пайплайн: тег → архивы (linux/win/mac), checksums, SBOM, подпись | F-18 чек-лист из аудита Go | Тег создаёт релиз автоматически |
 | 7.3 | `-trimpath`, воспроизводимость | — | Два билда из одного коммита дают один артефакт |
-| 7.4 | Ресурсы Windows-сборки клиента: иконка + versioninfo (найдено живой приёмкой 2026-11-20 — exe без иконки, эталонный Go-клиент несёт ресурсы) | Go `.syso`/goversioninfo эталона | embed-resource + `.ico`, поля версии в свойствах exe |
+| 7.4 | Ресурсы Windows-сборки клиента: иконка + versioninfo (найдено живой приёмкой 2026-11-20 — exe без иконки, эталонный Go-клиент несёт ресурсы) | Go `.syso`/goversioninfo эталона | embed-resource + `.ico`, поля версии в свойствах exe — ✅ закрыт (2026-11-20, волна `wave/t74-icon`): `winresource` в `build.rs` вшивает иконку (конвертирована из `icon.png` эталона, 16–256 px) и поля FileDescription/ProductName/FileVersion/ProductVersion/OriginalFilename; компиляция ресурсов деградирует мягко на хосте без rc.exe/windres (warning, сборка без ресурсов); верифицировано: gnu-сборка несёт ресурсы, `VersionInfo` читается, иконка извлекается |
 
 ### T8 — Свежий аудит · L · ~1–2 недели · ✅ закрыт (2026-10-27: 8.1/8.2 — аудит `docs/audit-2026-10-27.md`; 8.3 — находки A1–A4 закрыты волной `wave/t8-hardening`, тег `v0.2.0`)
 
