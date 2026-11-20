@@ -60,6 +60,9 @@ url = "2.5.8"
 webpki-roots = "1.0.10"
 x509-parser = { version = "0.18.1", features = ["verify"] }
 
+[build-dependencies]
+winresource = "0.1.20"
+
 [dev-dependencies]
 p256 = { version = "0.13.2", features = ["ecdsa"] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
