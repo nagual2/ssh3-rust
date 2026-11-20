@@ -87,7 +87,6 @@ impl BrokenShellServer {
 /// and the explicit close: the client prints the verdict of the server and
 /// exits non-zero instead of waiting forever.
 #[tokio::test]
-#[cfg(unix)]
 async fn a_spawn_failure_of_the_server_ends_the_client_with_an_error() {
     let server = BrokenShellServer::start();
 
